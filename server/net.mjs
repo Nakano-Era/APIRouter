@@ -78,7 +78,58 @@ function raceAbort(promise, signal) {
   });
 }
 
-export async function openUpstream(provider, endpoint, { signal, body, query, timeoutMs } = {}) {
+// Only fixed administrator probes opt in. Never collect arbitrary chat error bodies.
+async function adminErrorDetail(response, apiKey, signal) {
+  if (!/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')) return;
+  const limit = 64 * 1024;
+  if (Number(response.headers.get('content-length')) > limit || !response.body) return;
+  const budget = new AbortController();
+  const timer = setTimeout(() => budget.abort(), 2000);
+  timer.unref?.();
+  const readSignal = AbortSignal.any([signal, budget.signal]);
+  const reader = response.body.getReader();
+  try {
+    let length = 0;
+    const chunks = [];
+    while (true) {
+      const { done, value } = await raceAbort(reader.read(), readSignal);
+      if (done) break;
+      length += value.byteLength;
+      if (length > limit) return;
+      chunks.push(value);
+    }
+    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    const error = parsed.error;
+    const fields = error && typeof error === 'object' && !Array.isArray(error)
+      ? [error.type, error.code, error.message]
+      : [parsed.type, parsed.code, typeof error === 'string' ? error : parsed.message];
+    let detail = [...new Set(fields.filter(value => typeof value === 'string' && value.trim()))].join(' · ');
+    // Do not echo error pages or stack traces, even when mislabeled as JSON.
+    if (!detail || /<\/?[a-z!][^>]*>|\b(?:stack\s*trace|traceback)\b|\n\s*at\s+\S+/i.test(detail)) return;
+    const secrets = [apiKey, encodeURIComponent(apiKey), JSON.stringify(apiKey).slice(1, -1), Buffer.from(apiKey).toString('base64')];
+    for (const secret of secrets.sort((a, b) => b.length - a.length)) if (secret) detail = detail.split(secret).join('[已隐藏]');
+    detail = detail
+      .replace(/\b(?:Bearer|Basic)\s+[^\s,;"']+/gi, '[认证信息已隐藏]')
+      .replace(/\b(?:sk|rk|pk|whsec|sess)[-_][\w.-]+/gi, '[密钥已隐藏]')
+      .replace(/\b(?:authorization|x-api-key|api[_ -]?key|token|password|secret)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '[凭据已隐藏]')
+      .replace(/https?:\/\/[^\s<>"']+/gi, '[地址已隐藏]')
+      .replace(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi, '[邮箱已隐藏]')
+      .replace(/[A-Za-z0-9_+\/=.-]{40,}/g, '[长标识已隐藏]')
+      .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    return detail.length > 600 ? `${detail.slice(0, 600)}…` : detail || undefined;
+  } catch {
+    // Diagnostics are best effort; the original HTTP error must keep its routing semantics.
+    return;
+  } finally {
+    clearTimeout(timer);
+    try { await reader.cancel(); } catch { /* The connection may already be closed. */ }
+    reader.releaseLock();
+  }
+}
+
+export async function openUpstream(provider, endpoint, { signal, body, query, timeoutMs, diagnostics = false } = {}) {
   if (!['openai-chat', 'openai-responses', 'anthropic'].includes(provider.protocol)) {
     throw new UpstreamError('请选择受支持的 API 协议。', 'INVALID_PROTOCOL', 400);
   }
@@ -144,10 +195,13 @@ export async function openUpstream(provider, endpoint, { signal, body, query, ti
       throw new UpstreamError('上游返回重定向；为保护 API Key，已停止请求。请填写最终 API 地址。', 'UPSTREAM_REDIRECT', 502, response.status);
     }
     if (!response.ok) {
-      const detail = response.status === 401 || response.status === 403 ? '请检查 API Key、账号权限和协议。'
+      const detail = response.status === 400 || response.status === 422 ? '请求参数被上游拒绝，请检查模型 ID、接口协议及参数；管理员可在“模型”页测试以查看具体原因。'
+        : response.status === 401 || response.status === 403 ? '请检查 API Key、账号权限和协议。'
         : response.status === 404 ? '请检查 API 基础地址、协议和模型名称。'
           : response.status === 429 ? '额度不足或请求过多，请稍后重试。' : '请稍后重试或检查服务商状态。';
-      throw new UpstreamError(`上游请求失败（HTTP ${response.status}）。${detail}`, 'UPSTREAM_HTTP_ERROR', 502, response.status);
+      const error = new UpstreamError(`上游请求失败（HTTP ${response.status}）。${detail}`, 'UPSTREAM_HTTP_ERROR', 502, response.status);
+      if (diagnostics) error.adminDetail = await adminErrorDetail(response, provider.apiKey, effectiveSignal);
+      throw error;
     }
     return { response, signal: effectiveSignal, cleanup };
   } catch (error) {

@@ -205,6 +205,98 @@ test('upstream HTTP and stream errors never expose raw provider messages or secr
   assert.ok(!sanitizeUpstreamError(new Error('secret-test-key')).includes('secret-test-key'));
 });
 
+test('fixed admin probes get bounded redacted JSON diagnostics without changing public errors', async t => {
+  const provider = await mock(t, (_req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: {
+      type: 'invalid_request_error', code: 'model_not_found',
+      message: 'Model is unavailable. secret-test-key Bearer another-token sk-upstream-secret https://provider.example/path?token=private user@example.com',
+      stack: 'private stack must never appear',
+    }, debug: 'private debug must never appear' }));
+  });
+  const check = diagnostics => assert.rejects(collect({ ...options(provider), diagnostics }), error => {
+    assert.equal(error.code, 'UPSTREAM_HTTP_ERROR');
+    assert.equal(error.status, 502);
+    assert.equal(error.upstreamStatus, 400);
+    assert.match(sanitizeUpstreamError(error), /请求参数被上游拒绝/);
+    assert.doesNotMatch(sanitizeUpstreamError(error), /Model is unavailable|model_not_found/);
+    if (diagnostics) {
+      assert.match(error.adminDetail, /model_not_found.*Model is unavailable/);
+      assert.doesNotMatch(error.adminDetail, /secret-test-key|another-token|sk-upstream-secret|provider\.example|user@example\.com|private/);
+    } else assert.equal(error.adminDetail, undefined);
+    return true;
+  });
+  await check(false);
+  await check(true);
+});
+
+test('diagnostics discard HTML, malformed or oversized JSON and stack traces', async t => {
+  const cases = [
+    ['text/html', '<html>private server error</html>'],
+    ['application/json', '{invalid JSON'],
+    ['application/json', JSON.stringify({ error: { message: '<html>private server error</html>' } })],
+    ['application/json', JSON.stringify({ error: { message: 'Error\n    at handler (/private/app.mjs:2)' } })],
+    ['application/json', JSON.stringify({ error: { message: 'x'.repeat(70_000) } })],
+  ];
+  for (const [contentType, responseBody] of cases) {
+    const provider = await mock(t, (_req, res) => { res.writeHead(400, { 'content-type': contentType }); res.end(responseBody); });
+    await assert.rejects(collect({ ...options(provider), diagnostics: true }), error => {
+      assert.equal(error.code, 'UPSTREAM_HTTP_ERROR');
+      assert.equal(error.upstreamStatus, 400);
+      assert.equal(error.adminDetail, undefined);
+      return true;
+    });
+  }
+});
+
+test('encoded keys are redacted before diagnostic text is truncated', async t => {
+  const key = 'secret/key+with=symbols';
+  const provider = await mock(t, (_req, res) => {
+    res.writeHead(400, { 'content-type': 'application/problem+json' });
+    res.end(JSON.stringify({ message: `Invalid model. ${encodeURIComponent(key)} ${Buffer.from(key).toString('base64')} ${'Please verify model. '.repeat(100)}` }));
+  });
+  await assert.rejects(collect({ ...options({ ...provider, apiKey: key }), diagnostics: true }), error => {
+    assert.match(error.adminDetail, /Invalid model/);
+    assert.ok(error.adminDetail.length <= 601);
+    assert.doesNotMatch(error.adminDetail, /secret|symbols/);
+    assert.ok(!error.adminDetail.includes(Buffer.from(key).toString('base64')));
+    return true;
+  });
+});
+
+test('stalled diagnostic bodies preserve the HTTP error and release the connection', async t => {
+  let closed;
+  const closePromise = new Promise(resolve => { closed = resolve; });
+  const provider = await mock(t, (_req, res) => {
+    res.on('close', closed);
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.write('{"error":');
+  });
+  const start = Date.now();
+  await assert.rejects(collect({ ...options(provider), diagnostics: true }), error => {
+    assert.equal(error.code, 'UPSTREAM_HTTP_ERROR');
+    assert.equal(error.upstreamStatus, 400);
+    assert.equal(error.adminDetail, undefined);
+    return true;
+  });
+  assert.ok(Date.now() - start < 5000);
+  let guard;
+  try { await Promise.race([closePromise, new Promise((_, reject) => { guard = setTimeout(() => reject(new Error('diagnostic connection remained open')), 1000); })]); }
+  finally { clearTimeout(guard); }
+});
+
+test('caller cancellation during diagnostic reading still returns AbortError', async t => {
+  let started;
+  const startPromise = new Promise(resolve => { started = resolve; });
+  const provider = await mock(t, (_req, res) => { res.writeHead(400, { 'content-type': 'application/json' }); res.write('{'); started(); });
+  const controller = new AbortController();
+  const result = collect({ ...options(provider), diagnostics: true, signal: controller.signal });
+  const rejected = assert.rejects(result, { name: 'AbortError' });
+  await startPromise;
+  controller.abort();
+  await rejected;
+});
+
 test('early EOF never marks an unfinished stream complete', async t => {
   const provider = await mock(t, (_req, res) => { res.setHeader('content-type', 'text/event-stream'); res.end(frame({ choices: [{ delta: { content: 'partial' } }] })); });
   await assert.rejects(collect(options(provider)), { code: 'UPSTREAM_TRUNCATED_STREAM' });

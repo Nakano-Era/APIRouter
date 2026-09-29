@@ -211,7 +211,7 @@ export async function* streamReply(options) {
   const { provider, signal } = options;
   const body = requestBody(options);
   const endpoint = provider.protocol === 'anthropic' ? 'messages' : provider.protocol === 'openai-responses' ? 'responses' : 'chat/completions';
-  const request = await openUpstream(provider, endpoint, { signal, body });
+  const request = await openUpstream(provider, endpoint, { signal, body, diagnostics: options.diagnostics === true });
   let finished = false;
   let emittedText = false;
   let usage;

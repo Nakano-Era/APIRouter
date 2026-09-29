@@ -201,10 +201,10 @@ API 来源、模型、套餐和支付密钥通过管理后台配置。以下环�
 ```text
 src/            聊天界面、设置面板与会员页面
 server/         鉴权、聊天、协议适配、路由、附件与支付
- tests/         本地自动化测试
- docs/          部署、会员与接口文档
- deploy/        Caddy 配置
- scripts/       开发启动、备份与恢复脚本
+tests/          本地自动化测试
+docs/           部署、会员与接口文档
+deploy/         Caddy 配置
+scripts/        开发启动、备份与恢复脚本
 compose.yaml    容器部署配置
 deploy.sh       VPS 部署入口
 ```

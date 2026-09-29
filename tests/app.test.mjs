@@ -12,6 +12,8 @@ let admin, member, providerId, modelId, chatId, attachmentId;
 let listedModels = ['test-chat', 'test-vision'];
 const captured = [];
 const secret = 'sk-test-DO-NOT-EXPOSE-123456';
+const diagnosticModelId = 'diagnostic-rejection';
+const diagnosticMarker = 'unique-parameter-error';
 const setupToken = 'test-admin-bootstrap-token';
 const password = 'an-example-test-password-2026';
 
@@ -39,6 +41,10 @@ before(async () => {
     if (req.url === '/v1/models') { res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify({ data: listedModels.map(id => ({ id })) })); }
     let raw = ''; for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw); captured.push({ body, auth: req.headers.authorization });
+    if (body.model === diagnosticModelId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `${diagnosticMarker}: unsupported parameter; Authorization: Bearer ${secret}` } }));
+    }
     res.setHeader('Content-Type', 'text/event-stream');
     res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '测试回答：' } }] })}\n\n`);
     if (JSON.stringify(body.messages.at(-1)).includes('WAIT_FOR_STOP')) { const interval = setInterval(() => res.write(': waiting\n\n'), 100); res.on('close', () => clearInterval(interval)); return; }
@@ -105,6 +111,51 @@ test('invites are single-use and ordinary members cannot access admin configurat
   assert.equal((await request('/api/admin/providers', { session: member })).status, 403);
   assert.equal((await request('/api/admin/users', { session: member })).status, 403);
   assert.equal((await request('/api/settings', { session: member })).data.settings.systemPrompt, undefined);
+});
+test('upstream diagnostics are available only in the administrator probe response', async t => {
+  const created = await request('/api/admin/models', { session: admin, method: 'POST', body: { providerId, modelId: diagnosticModelId } });
+  assert.equal(created.status, 201);
+  const diagnosticId = created.data.model.id;
+  let diagnosticChatId;
+  t.after(async () => {
+    if (diagnosticChatId) await request(`/api/chats/${diagnosticChatId}`, { session: member, method: 'DELETE' });
+    await request(`/api/admin/models/${diagnosticId}`, { session: admin, method: 'DELETE' });
+  });
+  assert.equal((await request(`/api/admin/models/${diagnosticId}`, { session: admin, method: 'PATCH', body: { enabled: true } })).status, 200);
+
+  const attemptsBeforeMemberProbe = captured.length;
+  assert.equal((await request(`/api/admin/models/${diagnosticId}/test`, { session: member, method: 'POST' })).status, 403);
+  assert.equal(captured.length, attemptsBeforeMemberProbe, 'unauthorized probes never reach the upstream');
+  const probe = await request(`/api/admin/models/${diagnosticId}/test`, { session: admin, method: 'POST' });
+  assert.equal(probe.status, 200);
+  assert.deepEqual(Object.keys(probe.data).sort(), ['error', 'latencyMs', 'ok']);
+  assert.equal(probe.data.ok, false);
+  assert.ok(probe.data.error.includes(diagnosticMarker));
+  assert.ok(!probe.data.error.includes(secret));
+  assert.equal(typeof probe.data.latencyMs, 'number');
+
+  const storedError = instance.store.get('SELECT error FROM models WHERE id=?', diagnosticId).error;
+  assert.match(storedError, /HTTP 400/);
+  const adminModels = (await request('/api/admin/models', { session: admin })).data;
+  const publicModels = (await request('/api/models', { session: member })).data;
+  assert.ok(publicModels.models.some(model => model.modelId === diagnosticModelId), 'public model listing includes the probed model');
+  for (const value of [storedError, adminModels, publicModels]) {
+    assert.ok(!JSON.stringify(value).includes(diagnosticMarker));
+    assert.ok(!JSON.stringify(value).includes(secret));
+  }
+
+  const chat = await request('/api/chats', { session: member, method: 'POST', body: { modelId: diagnosticId } });
+  assert.equal(chat.status, 201);
+  diagnosticChatId = chat.data.chat.id;
+  const reply = await streamChat(`/api/chats/${diagnosticChatId}/messages`, member, { content: 'An ordinary private message.', modelId: diagnosticId });
+  assert.equal(reply.events.at(-1).type, 'error');
+  assert.match(reply.events.at(-1).data.error, /HTTP 400/);
+  const logs = (await request('/api/admin/routing-logs', { session: admin })).data;
+  assert.ok(logs.attempts.some(attempt => attempt.modelId === diagnosticModelId), 'the failed ordinary request was audited');
+  for (const value of [reply.text, logs]) {
+    assert.ok(!JSON.stringify(value).includes(diagnosticMarker));
+    assert.ok(!JSON.stringify(value).includes(secret));
+  }
 });
 test('file ownership and chat ownership hold across upload, read, stream and deletion', async () => {
   const form = new FormData(); form.append('files', new Blob(['机密资料：收入 42。'], { type: 'text/plain' }), '报表.txt');

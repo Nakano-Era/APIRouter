@@ -324,8 +324,13 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   app.post('/api/admin/models/:id/test', async (req, res) => {
     const row = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (!row) throw fail(404, '模型不存在。'); if (testing.has(row.id) || testing.size >= 2) throw fail(429, '模型测试正在进行，请稍后重试。'); testing.set(row.id, row.provider_id);
     const start = Date.now();
-    try { let text = ''; for await (const event of streamReply({ provider: providerForModel(row), model: modelJSON(row), messages: [{ role: 'user', content: 'Reply with OK.', attachments: [] }], maxOutputTokens: 256, systemPrompt: '', signal: AbortSignal.timeout(45_000) })) if (event.type === 'delta') text += event.text; if (!text.trim()) throw fail(502, '上游没有返回文字。'); store.run("UPDATE models SET status='ok',last_checked_at=?,error=NULL,failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1 WHERE id=?", now(), row.id); res.json({ ok: true, latencyMs: Date.now() - start }); }
-    catch (error) { const message = sanitizeUpstreamError(error); store.run("UPDATE models SET status='error',last_checked_at=?,error=? WHERE id=?", now(), message, row.id); res.json({ ok: false, error: message, latencyMs: Date.now() - start }); }
+    try { let text = ''; for await (const event of streamReply({ provider: providerForModel(row), model: modelJSON(row), messages: [{ role: 'user', content: 'Reply with OK.', attachments: [] }], maxOutputTokens: 256, systemPrompt: '', diagnostics: true, signal: AbortSignal.timeout(45_000) })) if (event.type === 'delta') text += event.text; if (!text.trim()) throw fail(502, '上游没有返回文字。'); store.run("UPDATE models SET status='ok',last_checked_at=?,error=NULL,failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1 WHERE id=?", now(), row.id); res.json({ ok: true, latencyMs: Date.now() - start }); }
+    catch (error) {
+      const message = sanitizeUpstreamError(error);
+      store.run("UPDATE models SET status='error',last_checked_at=?,error=? WHERE id=?", now(), message, row.id);
+      // Only this administrator response includes probe diagnostics; never persist them.
+      res.json({ ok: false, error: error.adminDetail ? `${message} 上游说明（已脱敏）：${error.adminDetail}` : message, latencyMs: Date.now() - start });
+    }
     finally { testing.delete(row.id); }
   });
   app.get('/api/admin/users', (_req, res) => res.json({ users: store.all('SELECT * FROM users ORDER BY created_at').map(userJSON) }));
