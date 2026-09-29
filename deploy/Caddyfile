@@ -1,0 +1,12 @@
+{$DOMAIN} {
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+    reverse_proxy app:3001 {
+        # Send SSE output as it arrives so chat responses remain streamed.
+        flush_interval -1
+    }
+}

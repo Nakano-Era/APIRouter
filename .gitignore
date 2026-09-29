@@ -1,0 +1,11 @@
+node_modules/
+.npm-cache/
+dist/
+data/
+.env
+*.log
+*.tsbuildinfo
+test-results/
+backups/
+*.tar.gz
+deliverables/
