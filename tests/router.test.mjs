@@ -35,6 +35,14 @@ const selected = output => output.filter(item => item.type === 'selected').map(i
 const model = (store, id) => store.get('SELECT * FROM models WHERE id=?', id);
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 
+test('reasoning already shown is forwarded without splicing a second channel after failure', async t => {
+  const store = fixture(t), output = [];
+  const router = createRouter({ store, stream: async function* () { yield { type: 'reasoning', text: 'work in progress' }; throw failure(503); } });
+  await assert.rejects(() => collect(router.run(input({})), output));
+  assert.deepEqual(selected(output), ['a']);
+  assert.equal(output.find(event => event.type === 'reasoning').text, 'work in progress');
+});
+
 test('routes only enabled equivalent models in priority order, preserving protocol and upstream identity', async t => {
   const store = fixture(t, [
     { id: 'disabled', priority: 100, enabled: 0 },

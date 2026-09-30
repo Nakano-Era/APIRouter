@@ -155,7 +155,7 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
           const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
           if (!line.trim()) continue;
           let event; try { event = JSON.parse(line); } catch { throw new UpstreamError('工作执行器返回格式无效。', 'INVALID_WORK_RESPONSE', 502); }
-          if (event.type === 'delta' && typeof event.text === 'string') yield { type: 'delta', text: event.text };
+          if ((event.type === 'delta' || event.type === 'reasoning') && typeof event.text === 'string') yield { type: event.type, text: event.text };
           else if (event.type === 'activity') yield { type: 'activity', label: String(event.label ?? '正在执行').slice(0, 160), committed: !!event.committed };
           else if (event.type === 'usage') yield { type: 'usage', inputTokens: tokens(event.inputTokens), outputTokens: tokens(event.outputTokens) };
           else if (event.type === 'error') {

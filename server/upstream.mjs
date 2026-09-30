@@ -1,5 +1,6 @@
 import { openUpstream, readJson, UpstreamError, redactRawError, redactDiagnosticObject } from './net.mjs';
 import { modelCapacities } from './continuation.mjs';
+import { responsesProfile } from './responses-compat.mjs';
 export { validateBaseUrl, sanitizeUpstreamError, UpstreamError } from './net.mjs';
 
 const invalid = () => new UpstreamError('上游响应格式不符合所选协议，请检查 API 配置。', 'INVALID_UPSTREAM_RESPONSE');
@@ -146,30 +147,150 @@ async function* sseEvents(body, touch = () => {}) {
   if (final) yield final;
 }
 
-function chatText(content) {
-  if (typeof content === 'string') return content;
-  if (content == null) return '';
+const outputEvent = (type, text) => {
+  if (text == null) return [];
+  if (typeof text !== 'string') throw invalid();
+  return text ? [{ type, text }] : [];
+};
+
+function chatContent(content) {
+  if (typeof content === 'string') return outputEvent('delta', content);
+  if (content == null) return [];
   if (!Array.isArray(content)) throw invalid();
-  return content.map(part => {
-    if (part.type === 'text' && typeof part.text === 'string') return part.text;
-    if (part.type === 'refusal' && typeof part.refusal === 'string') return part.refusal;
+  return content.flatMap(part => {
+    if (part?.type === 'text') return outputEvent('delta', part.text);
+    if (part?.type === 'refusal') return outputEvent('delta', part.refusal);
+    if (part?.type === 'thinking') return outputEvent('reasoning', part.thinking ?? part.text);
+    if (['reasoning', 'reasoning_text', 'reasoning_content'].includes(part?.type)) return outputEvent('reasoning', part.text ?? part.reasoning);
+    if (['redacted_thinking', 'encrypted_reasoning', 'signature'].includes(part?.type)) return [];
     throw new UpstreamError('上游返回了当前界面不支持的非文本内容。', 'UNSUPPORTED_OUTPUT');
-  }).join('');
+  });
 }
 
-function responseText(output) {
-  if (!Array.isArray(output)) return '';
-  return output.map(item => {
-    if (hasToolType(item.type)) throw toolError();
-    if (item.type === 'reasoning') return '';
-    if (item.type !== 'message') throw new UpstreamError('上游返回了当前界面不支持的输出类型。', 'UNSUPPORTED_OUTPUT');
-    if (!Array.isArray(item.content)) throw invalid();
-    return item.content.map(part => {
-      if (part.type === 'output_text' && typeof part.text === 'string') return part.text;
-      if (part.type === 'refusal' && typeof part.refusal === 'string') return part.refusal;
+function chatOutput(message = {}) {
+  // These are provider extensions, not text inferred from the answer itself.
+  const reasoning = message.reasoning_content ?? message.reasoning;
+  const events = outputEvent('reasoning', reasoning);
+  const content = chatContent(message.content);
+  events.push(...content);
+  if (!content.some(event => event.type === 'delta')) events.push(...outputEvent('delta', message.refusal));
+  return events;
+}
+
+function anthropicContent(content) {
+  if (!Array.isArray(content)) throw invalid();
+  return content.flatMap(part => {
+    if (hasToolType(part?.type)) throw toolError();
+    if (part?.type === 'text') return outputEvent('delta', part.text);
+    if (part?.type === 'thinking') return outputEvent('reasoning', part.thinking);
+    if (part?.type === 'redacted_thinking') return [];
+    throw new UpstreamError('上游返回了当前界面不支持的非文本内容。', 'UNSUPPORTED_OUTPUT');
+  });
+}
+
+function responsesOutput({ deferPhase = false } = {}) {
+  const states = new Set(), byId = new Map(), byIndex = new Map(), anonymous = new Map();
+  const stateFor = (data = {}, item = {}, kind = item.type ?? 'message') => {
+    const id = item.id ?? data.item_id;
+    const index = Number.isInteger(data.output_index) ? data.output_index : undefined;
+    let state = (id ? byId.get(id) : undefined) ?? (index !== undefined ? byIndex.get(index) : undefined);
+    if (!state) {
+      state = anonymous.get(kind);
+      if (state && (id || index !== undefined)) anonymous.delete(kind);
+    }
+    if (!state) { state = { parts: new Map(), phase: undefined, settled: false }; states.add(state); }
+    if (id) byId.set(id, state);
+    if (index !== undefined) byIndex.set(index, state);
+    if (!id && index === undefined) anonymous.set(kind, state);
+    const phase = item.phase ?? data.phase;
+    if (phase === 'commentary' || phase === 'final_answer') state.phase = phase;
+    return state;
+  };
+  const write = (state, key, text, kind, snapshot = false) => {
+    if (text == null) return;
+    if (typeof text !== 'string') throw invalid();
+    let part = state.parts.get(key);
+    if (!part) { part = { text: '', emitted: 0, kind }; state.parts.set(key, part); }
+    // done/completed carry complete snapshots. Only their unseen suffix is new.
+    if (!snapshot) part.text += text;
+    else if (text.startsWith(part.text)) part.text = text;
+  };
+  const drain = state => {
+    const events = [];
+    for (const part of state.parts.values()) {
+      if (deferPhase && part.kind === 'message' && !state.phase && !state.settled) continue;
+      const type = part.kind === 'reasoning' || state.phase === 'commentary' ? 'reasoning' : 'delta';
+      events.push(...outputEvent(type, part.text.slice(part.emitted)));
+      part.emitted = part.text.length;
+    }
+    return events;
+  };
+  const messagePart = (state, part, index) => {
+    if (part?.type === 'output_text') write(state, `message:${index}`, part.text, 'message', true);
+    else if (part?.type === 'refusal') write(state, `message:${index}`, part.refusal, 'message', true);
+    else throw new UpstreamError('上游返回了当前界面不支持的非文本内容。', 'UNSUPPORTED_OUTPUT');
+  };
+  const itemSnapshot = (item, data, settled) => {
+    if (hasToolType(item?.type)) throw toolError();
+    const state = stateFor(data, item);
+    if (settled) state.settled = true;
+    if (item?.type === 'reasoning') {
+      if ((item.summary != null && !Array.isArray(item.summary)) || (item.content != null && !Array.isArray(item.content))) throw invalid();
+      for (const [index, part] of (item.summary ?? []).entries()) {
+        if (part?.type === 'summary_text') write(state, `summary:${index}`, part.text, 'reasoning', true);
+      }
+      for (const [index, part] of (item.content ?? []).entries()) {
+        if (part?.type === 'reasoning_text' || part?.type === 'text') write(state, `reasoning:${index}`, part.text, 'reasoning', true);
+      }
+      // encrypted_content and signatures are deliberately never rendered.
+    } else if (item?.type === 'message') {
+      if (!Array.isArray(item.content)) throw invalid();
+      item.content.forEach((part, index) => messagePart(state, part, index));
+    } else {
       throw new UpstreamError('上游返回了当前界面不支持的非文本内容。', 'UNSUPPORTED_OUTPUT');
-    }).join('');
-  }).join('');
+    }
+    return drain(state);
+  };
+  const flush = () => [...states].flatMap(state => { state.settled = true; return drain(state); });
+  return {
+    flush,
+    complete(output) {
+      const events = Array.isArray(output)
+        ? output.flatMap((item, index) => itemSnapshot(item, { output_index: index }, true)) : [];
+      return [...events, ...flush()];
+    },
+    event(type, data) {
+      if (hasToolType(type) || hasToolType(data.item?.type)) throw toolError();
+      if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+        return itemSnapshot(data.item, data, type.endsWith('.done'));
+      }
+      if (/^response\.reasoning_(summary_text|text)\.(delta|done)$/.test(type)) {
+        const state = stateFor(data, {}, 'reasoning');
+        const summary = type.includes('summary_text');
+        write(state, `${summary ? 'summary' : 'reasoning'}:${(summary ? data.summary_index : data.content_index) ?? 0}`,
+          type.endsWith('.delta') ? data.delta : data.text, 'reasoning', type.endsWith('.done'));
+        return drain(state);
+      }
+      if (type === 'response.reasoning_summary_part.added' || type === 'response.reasoning_summary_part.done') {
+        const state = stateFor(data, {}, 'reasoning');
+        if (data.part?.type === 'summary_text') write(state, `summary:${data.summary_index ?? 0}`, data.part.text, 'reasoning', true);
+        return drain(state);
+      }
+      if (/^response\.(output_text|refusal)\.(delta|done)$/.test(type)) {
+        const state = stateFor(data);
+        write(state, `message:${data.content_index ?? 0}`, type.endsWith('.delta') ? data.delta : data.text ?? data.refusal,
+          'message', type.endsWith('.done'));
+        // Codex phase may first appear on output_item.done. Standard streams stay live.
+        return drain(state);
+      }
+      if (type === 'response.content_part.added' || type === 'response.content_part.done') {
+        const state = stateFor(data);
+        messagePart(state, data.part, data.content_index ?? 0);
+        return drain(state);
+      }
+      return [];
+    },
+  };
 }
 
 function checkStop(reason) {
@@ -178,9 +299,9 @@ function checkStop(reason) {
   if (reason === 'content_filter') throw new UpstreamError('上游内容过滤中断了回复。', 'UPSTREAM_CONTENT_FILTER');
 }
 
-function extractJson(result, protocol) {
+function extractJson(result, protocol, responses = responsesOutput()) {
   if (!result || (result.error && !(protocol === 'openai-responses' && Array.isArray(result.output)))) throw new UpstreamError('上游返回了错误响应，请检查 API 配置或稍后重试。', 'UPSTREAM_RESPONSE_ERROR');
-  let text = '', error;
+  let events = [], error;
   const stop = reason => { try { checkStop(reason); } catch (caught) { error = caught; } };
   let usage = result.usage;
   if (protocol === 'openai-chat') {
@@ -188,25 +309,20 @@ function extractJson(result, protocol) {
     if (!choice?.message) throw invalid();
     if (choice.message.tool_calls?.length || choice.message.function_call) throw toolError();
     stop(choice.finish_reason);
-    text = chatText(choice.message.content) || choice.message.refusal || '';
+    events = chatOutput(choice.message);
   } else if (protocol === 'openai-responses') {
     if (result.error || result.status === 'failed' || result.status === 'cancelled') error = new UpstreamError('上游未完成回复。', 'UPSTREAM_RESPONSE_ERROR');
     if (result.status === 'incomplete') {
       stop(result.incomplete_details?.reason);
       error ||= new UpstreamError('上游回复未完成，可继续生成。', 'UPSTREAM_INCOMPLETE');
     }
-    text = responseText(result.output);
+    events = responses.complete(result.output);
   } else {
     if (!Array.isArray(result.content)) throw invalid();
     stop(result.stop_reason);
-    text = result.content.map(part => {
-      if (hasToolType(part.type)) throw toolError();
-      if (part.type === 'text') return part.text ?? '';
-      if (part.type === 'thinking' || part.type === 'redacted_thinking') return '';
-      throw new UpstreamError('上游返回了当前界面不支持的非文本内容。', 'UNSUPPORTED_OUTPUT');
-    }).join('');
+    events = anthropicContent(result.content);
   }
-  return { text, usage, error };
+  return { events, usage, error };
 }
 
 function normalizedUsage(usage, protocol) {
@@ -227,14 +343,20 @@ export async function* streamReply(options) {
   let emittedText = false;
   let usage;
   let lastPayload;
+  const responses = responsesOutput({ deferPhase: responsesProfile(provider) === 'codex' });
+  const redactedBlocks = new Set();
+  const chatEmitted = { delta: '', reasoning: '' };
   try {
     if (!(request.response.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
       lastPayload = await readJson(request.response, 16 * 1024 * 1024);
       const result = extractJson(lastPayload, provider.protocol);
-      if (result.text) yield { type: 'delta', text: result.text };
+      for (const event of result.events) {
+        if (event.type === 'delta') emittedText = true;
+        yield event;
+      }
       if (result.usage) yield normalizedUsage(result.usage, provider.protocol);
       if (result.error) throw result.error;
-      if (!result.text) throw new UpstreamError('模型没有返回可显示的文本；可能仅返回推理或不支持的内容。', 'EMPTY_UPSTREAM_OUTPUT');
+      if (!emittedText) throw new UpstreamError('模型没有返回可显示的文本；可能仅返回推理或不支持的内容。', 'EMPTY_UPSTREAM_OUTPUT');
       return;
     }
     for await (const event of sseEvents(request.response.body, request.touch)) {
@@ -249,50 +371,62 @@ export async function* streamReply(options) {
       if (data.error || data.type === 'error' || event.event === 'error') {
         throw new UpstreamError('上游在生成过程中返回错误，回复可能不完整。', 'UPSTREAM_STREAM_ERROR');
       }
-      let text = '', terminalError;
+      let outputs = [], terminalError;
       if (provider.protocol === 'openai-chat') {
         if (data.usage) usage = data.usage;
         const choice = data.choices?.find(choice => choice.index === 0) ?? data.choices?.[0];
         if (choice) {
-          if (choice.delta?.tool_calls?.length || choice.delta?.function_call || choice.message?.tool_calls?.length) throw toolError();
+          if (choice.delta?.tool_calls?.length || choice.delta?.function_call || choice.message?.tool_calls?.length || choice.message?.function_call) throw toolError();
           try { checkStop(choice.finish_reason); } catch (error) { terminalError = error; }
           if (choice.finish_reason) finished = true;
-          text = chatText(choice.delta?.content ?? choice.message?.content) || choice.delta?.refusal || '';
+          const isSnapshot = !choice.delta && choice.message;
+          const extracted = chatOutput(choice.delta ?? choice.message);
+          if (isSnapshot) {
+            for (const type of ['reasoning', 'delta']) {
+              const text = extracted.filter(event => event.type === type).map(event => event.text).join('');
+              if (text.startsWith(chatEmitted[type])) outputs.push(...outputEvent(type, text.slice(chatEmitted[type].length)));
+            }
+          } else outputs = extracted;
+          for (const output of outputs) chatEmitted[output.type] += output.text;
         }
       } else if (provider.protocol === 'openai-responses') {
         const type = data.type ?? event.event;
-        if (hasToolType(type) || hasToolType(data.item?.type)) throw toolError();
-        if (type === 'response.output_text.delta') text = data.delta ?? '';
-        if (type === 'response.refusal.delta') text = data.delta ?? '';
+        outputs = responses.event(type, data);
         if (type === 'response.failed') {
-          const final = extractJson(data.response || { status: 'failed' }, provider.protocol);
-          if (!emittedText) text = final.text;
+          const final = extractJson(data.response || { status: 'failed' }, provider.protocol, responses);
+          outputs.push(...final.events);
           usage = final.usage;
           terminalError = new UpstreamError('上游生成失败，已保存的内容可以继续生成。', 'UPSTREAM_STREAM_ERROR');
         }
         if (type === 'response.incomplete') {
-          const final = extractJson(data.response || { status: 'incomplete' }, provider.protocol);
-          if (!emittedText) text = final.text;
+          const final = extractJson(data.response || { status: 'incomplete' }, provider.protocol, responses);
+          outputs.push(...final.events);
           usage = final.usage;
           terminalError = final.error || new UpstreamError('上游回复未完成，可以继续生成。', 'UPSTREAM_INCOMPLETE');
         }
         if (type === 'response.completed') {
-          const final = extractJson(data.response, provider.protocol);
+          const final = extractJson(data.response, provider.protocol, responses);
           terminalError = final.error;
-          if (!emittedText) text = final.text;
+          outputs.push(...final.events);
           usage = final.usage;
           finished = true;
         }
       } else {
         const type = data.type ?? event.event;
-        if (type === 'message_start') usage = data.message?.usage;
+        if (type === 'message_start') {
+          usage = data.message?.usage;
+          if (Array.isArray(data.message?.content)) outputs.push(...anthropicContent(data.message.content));
+        }
         if (type === 'content_block_start') {
           if (hasToolType(data.content_block?.type)) throw toolError();
-          if (data.content_block?.type === 'text') text = data.content_block.text ?? '';
+          if (data.content_block?.type === 'redacted_thinking') redactedBlocks.add(data.index);
+          if (data.content_block?.type === 'text') outputs.push(...outputEvent('delta', data.content_block.text));
+          if (data.content_block?.type === 'thinking') outputs.push(...outputEvent('reasoning', data.content_block.thinking));
         }
         if (type === 'content_block_delta') {
           if (data.delta?.type === 'input_json_delta') throw toolError();
-          if (data.delta?.type === 'text_delta') text = data.delta.text ?? '';
+          if (data.delta?.type === 'text_delta') outputs.push(...outputEvent('delta', data.delta.text));
+          if (data.delta?.type === 'thinking_delta' && !redactedBlocks.has(data.index)) outputs.push(...outputEvent('reasoning', data.delta.thinking));
         }
         if (type === 'message_delta') {
           if (data.usage) usage = { ...usage, ...data.usage };
@@ -300,15 +434,24 @@ export async function* streamReply(options) {
         }
         if (type === 'message_stop') finished = true;
       }
-      if (typeof text !== 'string') throw invalid();
-      if (text) { emittedText = true; yield { type: 'delta', text }; }
+      for (const output of outputs) {
+        if (output.type === 'delta') emittedText = true;
+        yield output;
+      }
       if (terminalError) throw terminalError;
       if (finished && provider.protocol !== 'openai-chat') break;
+    }
+    for (const output of responses.flush()) {
+      if (output.type === 'delta') emittedText = true;
+      yield output;
     }
     if (!finished) throw new UpstreamError('上游连接提前结束，已保存的内容可以继续生成。', 'UPSTREAM_TRUNCATED_STREAM');
     if (!emittedText) throw new UpstreamError('模型没有返回可显示的文本；可能仅返回推理或不支持的内容。', 'EMPTY_UPSTREAM_OUTPUT');
     if (usage) yield normalizedUsage(usage, provider.protocol);
   } catch (error) {
+    // A dropped Codex stream can leave a message waiting for its phase metadata.
+    // Preserve it as ordinary text instead of discarding already received output.
+    yield* responses.flush();
     if (usage) yield normalizedUsage(usage, provider.protocol);
     if (request.signal.aborted) throw request.signal.reason;
     if (error instanceof UpstreamError) {

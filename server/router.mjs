@@ -125,6 +125,11 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
               if (event.type === 'delta' && typeof event.text === 'string' && event.text.length) {
                 attemptText = true; emittedText = true;
                 yield event;
+              } else if (event.type === 'reasoning' && typeof event.text === 'string' && event.text.length) {
+                // A visible reasoning segment belongs to this attempt. Do not
+                // splice another channel's output onto it after an interruption.
+                committed = true;
+                yield event;
               } else if (event.type === 'usage') pendingUsage = event;
               else if (event.type === 'activity' || event.type === 'artifact') {
                 if (event.committed || event.type === 'artifact') committed = true;

@@ -51,3 +51,33 @@ test('message updates leave unrelated chat snapshots untouched', () => {
   assert.equal(first[0].content, '对话 A');
   assert.equal(second[0].content, '对话 B');
 });
+
+test('reasoning and answer independently retain their received suffix across recovery', () => {
+  const current = [{ ...message('answer', '已收到的正文'), reasoning: '已收到的完整思考' }];
+  const snapshot = mergeSnapshot(current, [{ ...message('answer', '已收到', 'error'), reasoning: '已收到的' }]);
+  assert.equal(snapshot[0].content, '已收到的正文');
+  assert.equal(snapshot[0].reasoning, '已收到的完整思考');
+  assert.equal(snapshot[0].status, 'error');
+  const recovered = mergeSnapshot(snapshot, [{ ...message('answer', '已收到的正文与结尾', 'complete'), reasoning: '已收到的完整思考' }]);
+  assert.equal(recovered[0].content, '已收到的正文与结尾');
+  assert.equal(recovered[0].reasoning, '已收到的完整思考');
+});
+
+test('reasoning-only interrupted responses remain resumable without becoming answer text', () => {
+  const initial = [{ ...message('answer', ''), reasoning: '准备分析问题' }];
+  const stopped = interrupted(initial);
+  assert.equal(stopped[0].content, '');
+  assert.equal(stopped[0].reasoning, '准备分析问题');
+  assert.equal(stopped[0].canContinue, true);
+  const continued = upsertMessage(stopped, { ...message('answer', ''), reasoning: '准备分析问题' });
+  assert.equal(continued.length, 1);
+  assert.equal(continued[0].reasoning, '准备分析问题');
+  assert.equal(continued[0].content, '');
+});
+
+test('a newer reasoning snapshot can grow while a stale answer snapshot stays shorter', () => {
+  const current = [{ ...message('answer', '完整正文'), reasoning: '思考' }];
+  const next = upsertMessage(current, { ...message('answer', '完整'), reasoning: '思考与补充' });
+  assert.equal(next[0].content, '完整正文');
+  assert.equal(next[0].reasoning, '思考与补充');
+});

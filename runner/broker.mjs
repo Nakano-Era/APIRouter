@@ -8,7 +8,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { apiUrl, validateBaseUrl } from '../server/net.mjs';
 import { validateJob, dockerArguments, fault, validateCheckpoint } from './protocol.mjs';
 import { safePublicRequest, redactCredentials } from './network.mjs';
-import { prepareResponsesRequest, responseRequestShape } from '../server/responses-compat.mjs';
+import { prepareResponsesRequest, responseRequestShape, responsesProfile } from '../server/responses-compat.mjs';
 
 const execute = promisify(execFile);
 const same = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -152,7 +152,7 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
       const exited = new Promise(resolveExit => { child.once('error', error => resolveExit({ error })); child.once('close', code => resolveExit({ code })); });
       // Explicit allowlist: provider credentials never enter the worker, its
       // process environment, the Docker command line or the model context.
-      const workerInput = { engine: config.engine, protocol: config.protocol, maxOutputTokens: config.maxOutputTokens, contextWindow: config.contextWindow, resumeState: config.resumeState, resumeText: config.resumeText, continuation: !!config.continuation, mode: config.mode, model: config.model, effort: config.effort, prompt: config.prompt, systemPrompt: config.systemPrompt, skills: config.skills, files: config.files, images: config.images ?? [], webSearch: config.webSearch, limits: config.limits, gateway: `http://gateway:3210/proxy/${id}`, jobToken: job.jobToken };
+      const workerInput = { engine: config.engine, protocol: config.protocol, responsesProfile: responsesProfile(provider), maxOutputTokens: config.maxOutputTokens, contextWindow: config.contextWindow, resumeState: config.resumeState, resumeText: config.resumeText, continuation: !!config.continuation, mode: config.mode, model: config.model, effort: config.effort, prompt: config.prompt, systemPrompt: config.systemPrompt, skills: config.skills, files: config.files, images: config.images ?? [], webSearch: config.webSearch, limits: config.limits, gateway: `http://gateway:3210/proxy/${id}`, jobToken: job.jobToken };
       child.stdin.on('error', () => {});
       child.stdin.end(JSON.stringify(workerInput));
       let buffer = '', stderr = '', done = false, outputBytes = 0;
@@ -166,10 +166,10 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
         while ((end = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
           let event; try { event = JSON.parse(line); } catch { continue; }
-          if (!['delta', 'activity', 'usage', 'checkpoint', 'file', 'error', 'done'].includes(event.type)) continue;
+          if (!['delta', 'reasoning', 'activity', 'usage', 'checkpoint', 'file', 'error', 'done'].includes(event.type)) continue;
           if (event.type === 'checkpoint') validateCheckpoint(event.state, { model: config.model, protocol: config.protocol });
           if (event.type === 'error') event = { type: 'error', code: event.code, error: event.error, rawDiagnostic: job.lastDiagnostic ?? { status: null, protocol: 'claude-code', modelId: config.model, body: redactCredentials(event.diagnostic?.rawBody || event.error, [job.provider.apiKey, job.jobToken]), truncated: false } };
-          if (event.type === 'delta') event.text = redactCredentials(event.text, [job.provider.apiKey, job.jobToken]);
+          if (event.type === 'delta' || event.type === 'reasoning') event.text = redactCredentials(event.text, [job.provider.apiKey, job.jobToken]);
           if (event.type === 'done') done = true;
           send(event);
         }

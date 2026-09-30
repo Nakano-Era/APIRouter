@@ -12,6 +12,7 @@ import { createBilling } from './billing.mjs';
 import { createWorkService } from './work.mjs';
 import { createProviderTools } from './provider-tools.mjs';
 import { continuationInstruction, continuationAppender, isContinuationRequest, checkContext } from './continuation.mjs';
+import { reasoningSplitter } from './reasoning.mjs';
 import { responseProfiles } from './responses-compat.mjs';
 
 const protocols = new Set(['openai-chat', 'openai-responses', 'anthropic']);
@@ -181,7 +182,10 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   app.get('/api/settings', (req, res) => { const settings = store.settings(); if (req.user.role !== 'admin') delete settings.systemPrompt; res.json({ settings }); });
   function attachmentJSON(row) { return { id: row.id, name: row.name, mime: row.mime, size: row.size, kind: row.kind, url: `/api/files/${row.id}/download` }; }
   function chatJSON(row) { return { id: row.id, title: row.title, modelId: row.model_id, generating: active.has(row.id), mode: row.mode || 'chat', effort: row.effort || 'auto', skillIds: JSON.parse(row.skill_ids || '[]'), webSearch: !!row.web_search, pinned: !!row.pinned, archived: !!row.archived, createdAt: row.created_at, updatedAt: row.updated_at }; }
-  function messageJSON(row) { return { id: row.id, role: row.role, content: row.content + store.all('SELECT content FROM message_chunks WHERE message_id=? ORDER BY seq', row.id).map(chunk => chunk.content).join(''), modelId: row.model_id, status: row.status, canContinue: row.role === 'assistant' && ['error','stopped'].includes(row.status), error: row.error, createdAt: row.created_at, attachments: JSON.parse(row.attachment_ids).map(fileId => store.get('SELECT * FROM files WHERE id=?', fileId)).filter(Boolean).map(attachmentJSON) }; }
+  function messageJSON(row) {
+    const chunks = store.all('SELECT content,kind FROM message_chunks WHERE message_id=? ORDER BY seq', row.id);
+    return { id: row.id, role: row.role, content: row.content + chunks.filter(chunk => chunk.kind === 'content').map(chunk => chunk.content).join(''), reasoning: (row.reasoning || '') + chunks.filter(chunk => chunk.kind === 'reasoning').map(chunk => chunk.content).join(''), modelId: row.model_id, status: row.status, canContinue: row.role === 'assistant' && ['error','stopped'].includes(row.status), error: row.error, createdAt: row.created_at, attachments: JSON.parse(row.attachment_ids).map(fileId => store.get('SELECT * FROM files WHERE id=?', fileId)).filter(Boolean).map(attachmentJSON) };
+  }
   function executionOptions(body, row = {}) {
     const mode = body.mode ?? row.mode ?? 'chat', effort = body.effort ?? row.effort ?? 'auto';
     if (!['chat','work'].includes(mode)) throw fail(400, '请选择 Chat 或 Work 模式。');
@@ -305,36 +309,43 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     const taskSeconds = usesRunner ? Math.min(1800, Math.max(30, Number(settings.workSettings?.timeoutSeconds) || 600)) + 60 : Math.min(21600, Math.max(60, Number(process.env.CHAT_TIMEOUT_SECONDS) || 3600));
     const timeout = setTimeout(() => controller.abort(), taskSeconds * 1000);
     send('meta', { ...(userMessage ? { userMessage: messageJSON(userMessage) } : {}), assistantMessage: messageJSON(store.get('SELECT * FROM messages WHERE id=?', assistantId)), chat: chatJSON(store.get('SELECT * FROM chats WHERE id=?', chat.id)) });
-    let content = priorContent, contentBytes = Buffer.byteLength(priorContent);
+    let content = priorContent, reasoning = continuing ? tail.reasoning || '' : '';
+    let contentBytes = Buffer.byteLength(content) + Buffer.byteLength(reasoning);
     const appender = continuationAppender(priorContent);
-    function append(text) {
+    const splitter = reasoningSplitter();
+    let reasoningStarted = false;
+    function append(text, kind = 'content') {
       if (!text) return;
+      if (kind === 'reasoning' && !reasoningStarted && reasoning) text = `\n\n${text}`;
       const deltaBytes = Buffer.byteLength(text);
-      if (contentBytes + deltaBytes > 32 * 1024 * 1024) throw fail(413, '已保存的回答达到 32 MB 安全上限。');
+      if (contentBytes + deltaBytes > 32 * 1024 * 1024) throw fail(413, '已保存的回答与思考过程达到 32 MB 安全上限。');
       // Append-only chunks make every displayed byte durable without rewriting
       // a growing multi-megabyte answer on every token.
-      store.run('INSERT INTO message_chunks(message_id,content) VALUES (?,?)', assistantId, text);
-      content += text;
+      store.run('INSERT INTO message_chunks(message_id,content,kind) VALUES (?,?,?)', assistantId, text, kind);
+      if (kind === 'reasoning') { reasoning += text; reasoningStarted = true; }
+      else content += text;
       contentBytes += deltaBytes;
-      send('delta', { text });
+      send(kind === 'reasoning' ? 'reasoning' : 'delta', { text });
     }
-    function finishMessage(status, error = null) { store.transaction(() => { store.run('UPDATE messages SET content=?,status=?,error=? WHERE id=?', content, status, error, assistantId); store.run('DELETE FROM message_chunks WHERE message_id=?', assistantId); }); }
+    function separate(events) { for (const event of events) append(event.type === 'reasoning' ? event.text : appender.push(event.text), event.type === 'reasoning' ? 'reasoning' : 'content'); }
+    function finishMessage(status, error = null) { store.transaction(() => { store.run('UPDATE messages SET content=?,reasoning=?,status=?,error=? WHERE id=?', content, reasoning, status, error, assistantId); store.run('DELETE FROM message_chunks WHERE message_id=?', assistantId); }); }
     try {
       for await (const event of router.run({ routeKey: modelRow.route_key, candidateIds, messages: input, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal: controller.signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...execution, context: { userId: req.user.id, chatId: chat.id, assistantId, continuation: continuing, resumeText: priorContent } })) {
         if (event.type === 'routing') send('routing', { message: '正在重新连接，请稍候…' });
         if (event.type === 'activity') send('activity', { label: event.label });
         if (event.type === 'artifact') send('artifact', { artifact: event.artifact });
         if (event.type === 'selected') store.run('UPDATE messages SET source_provider=?,source_model=? WHERE id=?', event.providerName, event.upstreamModelId, assistantId);
-        if (event.type === 'delta') append(appender.push(event.text));
+        if (event.type === 'delta') separate(splitter.push(event.text));
+        if (event.type === 'reasoning') append(event.text, 'reasoning');
         if (event.type === 'usage') store.run('UPDATE requests SET input_tokens=?,output_tokens=? WHERE id=?', event.inputTokens || 0, event.outputTokens || 0, requestId);
       }
-      append(appender.finish());
+      separate(splitter.finish()); append(appender.finish());
       if (!content.trim() || content === priorContent) throw fail(502, '上游没有返回新的可显示文字，已保留原内容，可以继续生成。');
       finishMessage('complete');
       store.run("UPDATE requests SET status='complete' WHERE id=?", requestId);
       send('done', { message: messageJSON(store.get('SELECT * FROM messages WHERE id=?', assistantId)) });
     } catch (error) {
-      try { append(appender.finish()); } catch { /* Preserve committed text when the safety ceiling was reached. */ }
+      try { separate(splitter.finish()); append(appender.finish()); } catch { /* Preserve committed text when the safety ceiling was reached. */ }
       const stopped = controller.signal.aborted || error.name === 'AbortError';
       const errorText = stopped ? null : req.user.role === 'admin' ? sanitizeUpstreamError(error) : '本次回答未完成，请稍后重试或联系管理员。';
       finishMessage(stopped ? 'stopped' : 'error', errorText);

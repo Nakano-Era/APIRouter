@@ -220,3 +220,149 @@ test('empty success and duplicate tool ids are rejected rather than completing o
   await assert.rejects(nativeResponse(chatText(''), 'openai-chat'), { code: 'EMPTY_UPSTREAM_OUTPUT' });
   await assert.rejects(nativeResponse(sse([{ choices: [{ delta: { tool_calls: [0, 1].map(index => ({ index, id: 'same-id', function: { name: 'write_file', arguments: '{}' } })) }, finish_reason: 'tool_calls' }] }, '[DONE]']), 'openai-chat'), { code: 'INVALID_TOOL_CALL' });
 });
+
+test('Chat reasoning is emitted separately and remains in tool history without entering saved answer text', async t => {
+  const cwd = await workspace(t), events = [], requests = [];
+  await runNativeAgent(jobFor('openai-chat'), { cwd, emit: event => events.push(event), fetcher: async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    if (requests.length === 1) return sse([
+      { choices: [{ delta: { reasoning_content: '先检查工作区。' } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'inspect', function: { name: 'list_files', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] },
+      '[DONE]',
+    ], true);
+    return sse([{ choices: [{ delta: { reasoning: '检查完成。', content: '这是正文。' }, finish_reason: 'stop' }] }, '[DONE]']);
+  } });
+  assert.equal(requests[1].messages.find(message => message.tool_calls)?.reasoning_content, '先检查工作区。');
+  assert.equal(events.filter(event => event.type === 'reasoning').map(event => event.text).join(''), '先检查工作区。检查完成。');
+  assert.equal(events.filter(event => event.type === 'delta').map(event => event.text).join(''), '这是正文。');
+  assert.equal(events.filter(event => event.type === 'checkpoint').at(-1).state.visibleText, '这是正文。');
+});
+
+test('Anthropic thinking is separated while signed blocks survive native tool history', async t => {
+  const cwd = await workspace(t), events = [], requests = [];
+  await runNativeAgent(jobFor('anthropic'), { cwd, emit: event => events.push(event), fetcher: async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    if (requests.length === 1) return sse([
+      { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '计划：', signature: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '读取文件。' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'signed-content-retained' } },
+      { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'inspect', name: 'list_files', input: {} } },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      { type: 'message_stop' },
+    ]);
+    return new Response(JSON.stringify({ content: [{ type: 'thinking', thinking: '完成检查。', signature: 'final-signature' }, { type: 'redacted_thinking', data: 'opaque-never-display' }, { type: 'text', text: '最终回答。' }], stop_reason: 'end_turn' }), { headers: { 'Content-Type': 'application/json' } });
+  } });
+  assert.deepEqual(requests[1].messages.at(-2).content[0], { type: 'thinking', thinking: '计划：读取文件。', signature: 'signed-content-retained' });
+  assert.equal(events.filter(event => event.type === 'reasoning').map(event => event.text).join(''), '计划：读取文件。完成检查。');
+  assert.equal(events.filter(event => event.type === 'delta').map(event => event.text).join(''), '最终回答。');
+  const state = events.filter(event => event.type === 'checkpoint').at(-1).state;
+  assert.equal(state.visibleText, '最终回答。');
+  assert.equal(state.history.at(-1).content[0].signature, 'final-signature');
+});
+
+test('Responses reasoning summaries and explicit commentary are folded once while final_answer remains正文', async t => {
+  const cwd = await workspace(t), events = [];
+  const reasoning = { type: 'reasoning', id: 'r1', summary: [{ type: 'summary_text', text: '推理摘要。' }], encrypted_content: 'opaque-never-display' };
+  const commentary = { type: 'message', id: 'm1', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: '正在准备文件。' }] };
+  const final = { type: 'message', id: 'm2', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: '最终结论。' }] };
+  await runNativeAgent(jobFor('openai-responses'), { cwd, emit: event => events.push(event), fetcher: async () => sse([
+    { type: 'response.output_item.added', output_index: 0, item: { ...reasoning, summary: [] } },
+    { type: 'response.reasoning_summary_text.delta', item_id: 'r1', output_index: 0, summary_index: 0, delta: '推理' },
+    { type: 'response.reasoning_summary_text.delta', item_id: 'r1', output_index: 0, summary_index: 0, delta: '摘要。' },
+    { type: 'response.reasoning_summary_text.done', output_index: 0, summary_index: 0, text: '推理摘要。' },
+    { type: 'response.output_item.done', output_index: 0, item: reasoning },
+    { type: 'response.output_item.added', output_index: 1, item: { ...commentary, content: [] } },
+    { type: 'response.output_text.delta', output_index: 1, content_index: 0, delta: '正在准备文件。' },
+    { type: 'response.output_item.done', output_index: 1, item: commentary },
+    { type: 'response.output_item.added', output_index: 2, item: { ...final, content: [] } },
+    { type: 'response.output_text.delta', output_index: 2, content_index: 0, delta: '最终结论。' },
+    { type: 'response.output_text.done', output_index: 2, content_index: 0, text: '最终结论。' },
+    { type: 'response.output_item.done', output_index: 2, item: final },
+    { type: 'response.completed', response: { output: [reasoning, commentary, final] } },
+  ], true) });
+  assert.equal(events.filter(event => event.type === 'reasoning').map(event => event.text).join(''), '推理摘要。正在准备文件。');
+  assert.equal(events.filter(event => event.type === 'delta').map(event => event.text).join(''), '最终结论。');
+  const state = events.filter(event => event.type === 'checkpoint').at(-1).state;
+  assert.equal(state.visibleText, '最终结论。');
+  assert.deepEqual(state.history.slice(-3), [reasoning, commentary, final]);
+});
+
+test('complete Responses output separates commentary, reasoning summaries, and unmarked final prose', async () => {
+  const thoughts = [], answer = [];
+  await nativeResponse(new Response(JSON.stringify({ status: 'completed', output: [
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: 'Summary.' }] },
+    { type: 'message', phase: 'commentary', content: [{ type: 'output_text', text: 'Working.' }] },
+    { type: 'message', content: [{ type: 'output_text', text: '先思考这个问题，答案是 42。' }] },
+  ] }), { headers: { 'Content-Type': 'application/json' } }), 'openai-responses', { onReasoning: value => thoughts.push(value), onText: value => answer.push(value) });
+  assert.equal(thoughts.join(''), 'Summary.Working.');
+  assert.equal(answer.join(''), '先思考这个问题，答案是 42。');
+});
+
+test('interrupted reasoning never becomes resumable assistant answer text', async t => {
+  const cwd = await workspace(t), events = [];
+  await assert.rejects(runNativeAgent(jobFor('anthropic'), { cwd, emit: event => events.push(event), fetcher: async () => sse([
+    { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Only partial thinking' } },
+  ]) }), { code: 'UPSTREAM_STREAM_INTERRUPTED' });
+  const state = events.filter(event => event.type === 'checkpoint').at(-1).state;
+  assert.equal(state.visibleText, ''); assert.equal(state.partial.text, '');
+  let resumed;
+  await runNativeAgent({ ...jobFor('anthropic'), resumeState: state, resumeText: '' }, { cwd, fetcher: async (_url, options) => { resumed = JSON.parse(options.body); return new Response(JSON.stringify({ content: [{ type: 'text', text: 'Final answer' }], stop_reason: 'end_turn' }), { headers: { 'Content-Type': 'application/json' } }); } });
+  assert.ok(!JSON.stringify(resumed.messages).includes('Only partial thinking'));
+});
+
+test('Codex late commentary phase is separated and late final_answer stays visible', async t => {
+  const cwd = await workspace(t), events = [];
+  const commentary = { type: 'message', id: 'c1', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: '处理中。' }] };
+  const final = { type: 'message', id: 'f1', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: '答案。' }] };
+  await runNativeAgent({ ...jobFor('openai-responses'), responsesProfile: 'codex' }, { cwd, emit: event => events.push(event), fetcher: async () => sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'c1', role: 'assistant', content: [] } },
+    { type: 'response.output_text.delta', output_index: 0, delta: '处理中。' },
+    { type: 'response.output_item.done', output_index: 0, item: commentary },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'message', id: 'f1', role: 'assistant', content: [] } },
+    { type: 'response.output_text.delta', output_index: 1, delta: '答案。' },
+    { type: 'response.output_item.done', output_index: 1, item: final },
+    { type: 'response.completed', response: { output: [commentary, final] } },
+  ]) });
+  assert.equal(events.filter(event => event.type === 'reasoning').map(event => event.text).join(''), '处理中。');
+  assert.equal(events.filter(event => event.type === 'delta').map(event => event.text).join(''), '答案。');
+  assert.equal(events.filter(event => event.type === 'checkpoint').at(-1).state.visibleText, '答案。');
+});
+
+test('Codex failure before phase flushes unclassified output into resumable visible text', async t => {
+  const cwd = await workspace(t), events = [];
+  await assert.rejects(runNativeAgent({ ...jobFor('openai-responses'), responsesProfile: 'codex' }, { cwd, emit: event => events.push(event), fetcher: async () => sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'm', role: 'assistant', content: [] } },
+    { type: 'response.output_text.delta', output_index: 0, delta: '未确定phase的保留正文' },
+  ]) }), { code: 'UPSTREAM_STREAM_INTERRUPTED' });
+  assert.equal(events.filter(event => event.type === 'reasoning').length, 0);
+  assert.equal(events.filter(event => event.type === 'delta').map(event => event.text).join(''), '未确定phase的保留正文');
+  const state = events.filter(event => event.type === 'checkpoint').at(-1).state;
+  assert.equal(state.visibleText, '未确定phase的保留正文'); assert.equal(state.partial.text, '未确定phase的保留正文');
+});
+
+test('shortened terminal snapshots cannot rewind reasoning de-duplication', async () => {
+  const reasoning = [];
+  await nativeResponse(sse([
+    { type: 'response.reasoning_summary_text.delta', output_index: 0, summary_index: 0, delta: 'Complete summary.' },
+    { type: 'response.reasoning_summary_text.done', output_index: 0, summary_index: 0, text: 'Complete' },
+    { type: 'response.completed', response: { output: [{ type: 'reasoning', summary: [{ type: 'summary_text', text: 'Complete summary.' }] }, { type: 'message', content: [{ type: 'output_text', text: 'Final' }] }] } },
+  ]), 'openai-responses', { onReasoning: text => reasoning.push(text) });
+  assert.equal(reasoning.join(''), 'Complete summary.');
+});
+
+test('Anthropic redacted thinking cannot leak through later mixed delta types', async () => {
+  const reasoning = [], answer = [];
+  const result = await nativeResponse(sse([
+    { type: 'content_block_start', index: 0, content_block: { type: 'redacted_thinking', data: 'encrypted-redaction' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'must-not-display-thought' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'must-not-display-answer' } },
+    { type: 'content_block_start', index: 1, content_block: { type: 'thinking', thinking: 'Visible summary.' } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'signature_delta', signature: 'sig' } },
+    { type: 'content_block_start', index: 2, content_block: { type: 'text', text: 'Final answer.' } },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+    { type: 'message_stop' },
+  ]), 'anthropic', { onReasoning: text => reasoning.push(text), onText: text => answer.push(text) });
+  assert.equal(reasoning.join(''), 'Visible summary.'); assert.equal(answer.join(''), 'Final answer.');
+  assert.deepEqual(result.output[0], { type: 'redacted_thinking', data: 'encrypted-redaction' });
+});

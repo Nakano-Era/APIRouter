@@ -121,7 +121,27 @@ export function dockerArguments({ id, network, image, limits }) {
 
 export function parseClaudeEvent(row, state) {
   const events = [];
-  if (row.type === 'stream_event' && !row.parent_tool_use_id && row.event?.delta?.type === 'text_delta') {
+  state.thinkingBlocks ??= new Map();
+  state.redactedThinking ??= new Set();
+  if (row.type === 'stream_event' && !row.parent_tool_use_id && row.event?.type === 'message_start') state.messageId = row.event.message?.id ?? `message-${(state.messageNumber = (state.messageNumber ?? 0) + 1)}`;
+  const currentBlockKey = `${state.messageId ?? ''}:${row.event?.index ?? 0}`;
+  const thought = (index, value, complete = false, messageId = state.messageId ?? '') => {
+    if (typeof value !== 'string' || !value) return;
+    const key = `${messageId}:${index}`, previous = state.thinkingBlocks.get(key) ?? '';
+    if (state.redactedThinking.has(key)) return;
+    const suffix = complete ? value.startsWith(previous) ? value.slice(previous.length) : previous ? '' : value : value;
+    state.thinkingBlocks.set(key, complete ? value.startsWith(previous) ? value : previous || value : previous + value);
+    if (suffix) events.push({ type: 'reasoning', text: suffix });
+  };
+  if (row.type === 'stream_event' && !row.parent_tool_use_id) {
+    if (row.event?.type === 'content_block_start' && row.event.content_block?.type === 'redacted_thinking') state.redactedThinking.add(currentBlockKey);
+    if (row.event?.type === 'content_block_start' && row.event.content_block?.type === 'thinking') thought(row.event.index ?? 0, row.event.content_block.thinking, true);
+    if (row.event?.delta?.type === 'thinking_delta' && !state.redactedThinking.has(currentBlockKey)) thought(row.event.index ?? 0, row.event.delta.thinking);
+  }
+  if (row.type === 'assistant' && !row.parent_tool_use_id) {
+    for (const [index, item] of (row.message?.content ?? []).entries()) if (item.type === 'thinking') thought(index, item.thinking, true, row.message?.id ?? state.messageId ?? '');
+  }
+  if (row.type === 'stream_event' && !row.parent_tool_use_id && row.event?.delta?.type === 'text_delta' && !state.redactedThinking.has(currentBlockKey)) {
     state.streamed = true;
     events.push({ type: 'delta', text: String(row.event.delta.text ?? '') });
   }

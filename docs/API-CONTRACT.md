@@ -60,7 +60,7 @@ Capacity metadata can be null when unknown; it is not inferred from a display na
 ```text
 Chat = {id,title,modelId,mode:'chat'|'work',effort,skillIds:string[],
         webSearch:boolean,pinned:boolean,archived:boolean,createdAt,updatedAt}
-Message = {id,role:'user'|'assistant',content,modelId,createdAt,
+Message = {id,role:'user'|'assistant',content,reasoning:string,modelId,createdAt,
            status:'complete'|'streaming'|'error'|'stopped',
            attachments:Attachment[],error:string|null}
 Attachment = {id,name,mime,size,kind:'image'|'text',url}
@@ -109,6 +109,7 @@ A streaming request may first fail with ordinary JSON before SSE headers are sen
 | --- | --- | --- |
 | `meta` | `{userMessage?:Message,assistantMessage:Message,chat:Chat}` | Saved conversation and initial reply |
 | `delta` | `{text:string}` | Append visible assistant text |
+| `reasoning` | `{text:string}` | Append provider-marked reasoning/summary or commentary to the separate, collapsed process panel |
 | `routing` | `{message:string}` | Generic reconnect/retry notice, without channel identity |
 | `activity` | `{label:string}` | Work tool activity such as writing a file or delegating a task |
 | `artifact` | `{artifact:WorkArtifact}` | A file was actually saved and is available to download |
@@ -116,6 +117,10 @@ A streaming request may first fail with ordinary JSON before SSE headers are sen
 | `error` | `{error:string,message?:Message}` | Failed reply with any partial content |
 
 SSE comment heartbeats are sent while waiting. Browser disconnects abort generation; explicit stop is also supported. Activity labels do not contain tool arguments, credential values, or private chain-of-thought. Ordinary users receive generic generation errors; administrators inspect detailed failures through the administrator endpoints below.
+
+`content` and `reasoning` are journaled separately before emission and recovered independently after interruption or restart. Existing messages receive an empty `reasoning` field; old unmarked text is not reclassified. Clients default the process panel to collapsed. Copying/exporting an answer uses `content` only. Ordinary conversation history excludes the display-only reasoning field; native Work checkpoints retain protocol-required signed blocks separately.
+
+Recognized process output includes Chat `reasoning_content`/`reasoning`, Anthropic thinking, Responses reasoning summaries and explicit `phase:commentary`, and Claude Code thinking events. Opaque signatures, redacted thinking and encrypted content are not displayed. A leading `<think>` or `<thinking>` block is also recognized across text chunk boundaries; quoted code examples and unmarked prose are left intact. Codex-compatible Responses may wait for an item's phase before displaying that item; ordinary Responses without phases continue to stream. Unclassified text is preserved as answer text if a stream ends before declaring a phase. The combined persisted answer and process have a 32 MB safety limit.
 
 Chat with a direct API channel calls its selected protocol. Chat with a `claude-code` channel uses the optional CLI runner with tools disabled. Work with `runtime:'api'` uses the native API tool engine inside Docker; Work with `runtime:'claude-code'` uses the separately installed optional CLI image and requires Anthropic protocol. Work artifacts and activities have their own events; writing code in a text reply alone does not create a downloadable file.
 

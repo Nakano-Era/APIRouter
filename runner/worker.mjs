@@ -120,7 +120,7 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
     }
   } } catch (error) { killGroup(); await exit; throw error; }
   buffer += decoder.end();
-  if (buffer.trim()) { try { for (const event of parseClaudeEvent(JSON.parse(buffer), state)) emit(event); } catch {} }
+  if (buffer.trim()) { try { for (const event of parseClaudeEvent(JSON.parse(buffer), state)) await emit(event); } catch {} }
   const result = await exit;
   // A task cannot leave a background child running while the file snapshot is read.
   killGroup();

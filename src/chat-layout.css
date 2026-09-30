@@ -177,6 +177,18 @@
 .message-user .message-actions { margin-top: 5px; margin-bottom: -16px; }
 .message-source { color: var(--faint); font-size: 12px; margin-left: 8px; max-width: 240px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: help; }
 .message-status { font-size: 12px; }
+.message-reasoning { margin: 0 0 15px; color: var(--muted); }
+.message-reasoning summary { display: flex; width: fit-content; align-items: center; gap: 7px; padding: 5px 0; cursor: pointer; list-style: none; font-size: 13px; line-height: 1.6; user-select: none; }
+.message-reasoning summary::-webkit-details-marker { display: none; }
+.message-reasoning summary:hover { color: var(--text); }
+.message-reasoning summary:focus-visible { outline: 2px solid var(--muted); outline-offset: 4px; border-radius: 3px; }
+.message-reasoning[open] .reasoning-chevron { transform: rotate(90deg); }
+.reasoning-content { margin: 9px 0 5px 6px; padding: 2px 0 2px 16px; border-left: 1px solid var(--border); font-size: 13px; line-height: 1.75; overflow-wrap: anywhere; }
+.reasoning-content p { font-size: 13px; line-height: 1.75; margin-bottom: 12px; }
+.reasoning-content > :last-child { margin-bottom: 0; }
+.reasoning-content h1, .reasoning-content h2, .reasoning-content h3, .reasoning-content h4 { font-size: 14px; line-height: 1.6; margin: 14px 0 8px; }
+.reasoning-content pre { overflow-x: auto; white-space: pre; padding: 12px; border-radius: 8px; background: var(--panel); font-size: 12px; }
+.reasoning-content table { font-size: 12px; }
 .scroll-bottom { bottom: 155px; width: 33px; height: 33px; }
 .workspace-alert { bottom: 58px; font-size: 13px; }
 .auth-page { background: var(--bg); }

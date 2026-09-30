@@ -121,6 +121,69 @@ test('continuation overlap filter preserves short new suffixes and removes exact
   const short = continuationAppender(old); assert.equal(short.push('。') + short.finish(), '。');
 });
 
+test('reasoning is streamed and saved separately, while continuation context contains only the answer', async t => {
+  const f = await fixture(t, async function* (args, number) {
+    if (number === 1) {
+      yield { type: 'reasoning', text: '单独的过程说明。' };
+      yield { type: 'delta', text: '<thi' };
+      yield { type: 'delta', text: 'nk>标签中的过程</th' };
+      yield { type: 'delta', text: 'ink>已保存的正文。' };
+      throw new UpstreamError('timeout', 'UPSTREAM_TIMEOUT');
+    }
+    assert.ok(args.messages.some(message => message.role === 'assistant' && message.content === '已保存的正文。'));
+    assert.ok(!JSON.stringify(args.messages).includes('过程'));
+    yield { type: 'reasoning', text: '续写的过程。' };
+    yield { type: 'delta', text: '后续正文。' };
+  });
+  try {
+    const first = await f.request(`/api/chats/${f.chat.id}/messages`, 'POST', { content: '测试分离' });
+    assert.match(first.text, /event: reasoning/);
+    const deltas = [...first.text.matchAll(/event: delta\ndata: ([^\n]+)/g)].map(match => JSON.parse(match[1]).text).join('');
+    assert.equal(deltas, '已保存的正文。');
+    let saved = (await f.request(`/api/chats/${f.chat.id}`)).data.messages.at(-1);
+    assert.equal(saved.reasoning, '单独的过程说明。标签中的过程');
+    assert.equal(saved.content, '已保存的正文。');
+    assert.equal(saved.canContinue, true);
+    await f.request(`/api/chats/${f.chat.id}/continue`, 'POST', {});
+    saved = (await f.request(`/api/chats/${f.chat.id}`)).data.messages.at(-1);
+    assert.equal(saved.reasoning, '单独的过程说明。标签中的过程\n\n续写的过程。');
+    assert.equal(saved.content, '已保存的正文。后续正文。');
+    assert.equal(saved.status, 'complete');
+  } finally { await f.close(); }
+});
+
+test('reasoning-only interrupted output survives live snapshots and stopping', async t => {
+  const f = await fixture(t, async function* ({ signal }) {
+    yield { type: 'reasoning', text: '只有独立过程，没有正文。' };
+    await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  });
+  try {
+    const response = await f.request(`/api/chats/${f.chat.id}/messages`, 'POST', { content: 'wait' }, true);
+    const reader = response.body.getReader(); let streamed = '';
+    while (!streamed.includes('event: reasoning')) { const part = await reader.read(); assert.equal(part.done, false); streamed += new TextDecoder().decode(part.value); }
+    const live = (await f.request(`/api/chats/${f.chat.id}`)).data.messages.at(-1);
+    assert.equal(live.content, ''); assert.equal(live.reasoning, '只有独立过程，没有正文。');
+    await f.request(`/api/chats/${f.chat.id}/stop`, 'POST', {});
+    while (!(await reader.read()).done) { /* consume terminal event */ }
+    const saved = (await f.request(`/api/chats/${f.chat.id}`)).data.messages.at(-1);
+    assert.equal(saved.content, ''); assert.equal(saved.reasoning, live.reasoning); assert.equal(saved.canContinue, true);
+  } finally { await f.close(); }
+});
+
+test('reasoning chunks recover independently from answer chunks after restart', t => {
+  const dataDir = directory(t); let store = createStore(dataDir);
+  store.run("INSERT INTO users(id,name,email,password,role,created_at) VALUES ('u','u','u@e.test','x','admin','now')");
+  store.run("INSERT INTO chats(id,user_id,title,created_at,updated_at) VALUES ('c','u','test','now','now')");
+  store.run("INSERT INTO messages(id,chat_id,role,content,reasoning,status,created_at) VALUES ('m','c','assistant','answer','process','streaming','now')");
+  store.run("INSERT INTO message_chunks(message_id,content,kind) VALUES ('m',' A','reasoning'),('m',' B','content'),('m',' C','reasoning')");
+  store.close(); store = createStore(dataDir);
+  try {
+    const row = store.get("SELECT * FROM messages WHERE id='m'");
+    assert.equal(row.content, 'answer B'); assert.equal(row.reasoning, 'process A C'); assert.equal(row.status, 'error');
+    assert.equal(store.get('SELECT COUNT(*) AS n FROM message_chunks').n, 0);
+  } finally { store.close(); }
+});
+
 for (const protocol of ['openai-chat', 'openai-responses', 'anthropic']) test(`${protocol} JSON output limit preserves text before reporting incomplete`, async t => {
   const oldPrivate = process.env.ALLOW_PRIVATE_UPSTREAM; process.env.ALLOW_PRIVATE_UPSTREAM = 'true';
   const body = protocol === 'openai-chat' ? { choices: [{ message: { content: 'partial result' }, finish_reason: 'length' }] } : protocol === 'anthropic' ? { content: [{ type: 'text', text: 'partial result' }], stop_reason: 'max_tokens' } : { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [{ type: 'message', content: [{ type: 'output_text', text: 'partial result' }] }] };

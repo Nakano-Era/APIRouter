@@ -67,11 +67,43 @@ function responseFailure(row) {
 
 // A response is successful only after the protocol's explicit terminal event.
 // EOF is never interpreted as successful completion, even after text arrived.
-export async function nativeResponse(response, protocol, { onText, signal } = {}) {
-  const result = { text: '', output: [], calls: [], inputTokens: 0, outputTokens: 0, finish: null };
-  const calls = new Map(), blocks = [], items = new Map();
+export async function nativeResponse(response, protocol, { onText, onReasoning, signal, deferUnclassified = false } = {}) {
+  const result = { text: '', reasoning: '', output: [], calls: [], inputTokens: 0, outputTokens: 0, finish: null };
+  const calls = new Map(), blocks = [], items = new Map(), fragments = new Map(), pendingText = new Map(), chatReasoning = {};
   let finished = false;
   const text = async value => { if (typeof value === 'string' && value) { result.text += value; await onText?.(value); } };
+  const reasoning = async value => { if (typeof value === 'string' && value) { result.reasoning += value; await onReasoning?.(value); } };
+  const fragment = async (kind, key, value, complete = false) => {
+    if (typeof value !== 'string' || !value) return;
+    const previous = fragments.get(key) ?? '';
+    // Responses commonly repeats streamed text in *.done and response.completed.
+    // Only emit a missing suffix; never show that full snapshot a second time.
+    const suffix = complete ? value.startsWith(previous) ? value.slice(previous.length) : previous ? '' : value : value;
+    fragments.set(key, complete ? value.startsWith(previous) ? value : previous || value : previous + value);
+    if (suffix) await (kind === 'reasoning' ? reasoning : text)(suffix);
+  };
+  const outputIndex = row => row.output_index ?? [...items].find(([, item]) => item.id === row.item_id)?.[0] ?? 0;
+  const holdText = (index, partIndex, value, complete = false) => {
+    if (typeof value !== 'string' || !value) return;
+    const key = `text:${index}:${partIndex}`, previous = pendingText.get(key)?.text ?? '';
+    pendingText.set(key, { index, text: complete ? previous.startsWith(value) ? previous : value : previous + value });
+  };
+  const flushText = async (index, kind) => {
+    for (const [key, pending] of pendingText) if (index === null || pending.index === index) { await fragment(kind, key, pending.text, true); pendingText.delete(key); }
+  };
+  const responseItem = async (item, index, complete = true) => {
+    if (item?.type === 'message') {
+      const classified = !deferUnclassified || item.phase || complete;
+      if (classified) await flushText(index, item.phase === 'commentary' ? 'reasoning' : 'text');
+      for (const [partIndex, part] of (item.content ?? []).entries()) if (part.type === 'output_text' || part.type === 'text') {
+        if (classified) await fragment(item.phase === 'commentary' ? 'reasoning' : 'text', `text:${index}:${partIndex}`, part.text, true);
+        else holdText(index, partIndex, part.text, true);
+      }
+    } else if (item?.type === 'reasoning') {
+      for (const [partIndex, part] of (item.summary ?? []).entries()) if (part.type === 'summary_text') await fragment('reasoning', `summary:${index}:${partIndex}`, part.text, true);
+      for (const [partIndex, part] of (item.content ?? []).entries()) if (part.type === 'reasoning_text' || part.type === 'text') await fragment('reasoning', `reasoning:${index}:${partIndex}`, part.text, true);
+    }
+  };
   const usage = value => {
     result.inputTokens = Math.max(result.inputTokens, safeTokens(protocol === 'openai-chat' ? value?.prompt_tokens : value?.input_tokens) + (protocol === 'anthropic' ? safeTokens(value?.cache_read_input_tokens) + safeTokens(value?.cache_creation_input_tokens) : 0));
     result.outputTokens = Math.max(result.outputTokens, safeTokens(protocol === 'openai-chat' ? value?.completion_tokens : value?.output_tokens));
@@ -80,17 +112,19 @@ export async function nativeResponse(response, protocol, { onText, signal } = {}
     if (row.error || row.type === 'error' || ['failed', 'cancelled'].includes(row.status)) throw responseFailure(row);
     if (protocol === 'anthropic') {
       result.output = row.content ?? []; result.finish = row.stop_reason; usage(row.usage);
+      for (const item of result.output) if (item.type === 'thinking') await reasoning(item.thinking);
       await text(textOf(result.output));
       result.calls = result.output.filter(item => item.type === 'tool_use').map(item => ({ id: item.id, name: item.name, arguments: JSON.stringify(item.input ?? {}) }));
     } else if (protocol === 'openai-responses') {
       result.output = row.output ?? []; result.finish = row.status === 'incomplete' ? row.incomplete_details?.reason || 'incomplete' : row.status; usage(row.usage);
-      await text(textOf(result.output));
+      for (const [index, item] of result.output.entries()) await responseItem(item, index);
       result.calls = result.output.filter(item => item.type === 'function_call').map(item => ({ id: item.call_id, name: item.name, arguments: item.arguments }));
     } else {
       const choice = row.choices?.[0]; result.finish = choice?.finish_reason; usage(row.usage);
       const message = choice?.message;
       if (!message) throw fault('上游响应没有消息。', 'INVALID_UPSTREAM_RESPONSE');
-      result.output = [{ role: 'assistant', content: message.content ?? null, ...(message.tool_calls?.length ? { tool_calls: message.tool_calls } : {}) }];
+      result.output = [{ role: 'assistant', content: message.content ?? null, ...(message.tool_calls?.length ? { tool_calls: message.tool_calls } : {}), ...(typeof message.reasoning_content === 'string' ? { reasoning_content: message.reasoning_content } : {}), ...(typeof message.reasoning === 'string' ? { reasoning: message.reasoning } : {}) }];
+      await reasoning(message.reasoning_content || message.reasoning);
       await text(typeof message.content === 'string' ? message.content : '');
       result.calls = (message.tool_calls ?? []).map(item => ({ id: item.id, name: item.function?.name, arguments: item.function?.arguments }));
     }
@@ -109,6 +143,8 @@ export async function nativeResponse(response, protocol, { onText, signal } = {}
       if (protocol === 'openai-chat') {
         usage(row.usage);
         const choice = row.choices?.[0], delta = choice?.delta;
+        for (const field of ['reasoning_content', 'reasoning']) if (typeof delta?.[field] === 'string') chatReasoning[field] = (chatReasoning[field] ?? '') + delta[field];
+        await reasoning(delta?.reasoning_content || delta?.reasoning);
         await text(delta?.content);
         for (const item of delta?.tool_calls ?? []) {
           const key = item.index ?? 0, call = calls.get(key) ?? { id: '', name: '', arguments: '' };
@@ -119,35 +155,42 @@ export async function nativeResponse(response, protocol, { onText, signal } = {}
         if (row.type === '__done') break;
       } else if (protocol === 'anthropic') {
         if (row.type === 'message_start') usage(row.message?.usage);
-        if (row.type === 'content_block_start') { blocks[row.index] = clone(row.content_block); if (row.content_block?.type === 'text') await text(row.content_block.text); }
+        if (row.type === 'content_block_start') { blocks[row.index] = clone(row.content_block); if (row.content_block?.type === 'text') await text(row.content_block.text); else if (row.content_block?.type === 'thinking') await reasoning(row.content_block.thinking); }
         if (row.type === 'content_block_delta') {
           const block = blocks[row.index];
           if (!block) throw fault('上游流缺少内容块。', 'INVALID_UPSTREAM_RESPONSE');
-          if (row.delta?.type === 'text_delta') { block.text = (block.text ?? '') + row.delta.text; await text(row.delta.text); }
+          if (row.delta?.type === 'text_delta' && block.type === 'text') { block.text = (block.text ?? '') + row.delta.text; await text(row.delta.text); }
           else if (row.delta?.type === 'input_json_delta') block._json = (block._json ?? '') + row.delta.partial_json;
-          else if (row.delta?.type === 'thinking_delta') block.thinking = (block.thinking ?? '') + row.delta.thinking;
+          else if (row.delta?.type === 'thinking_delta' && block.type === 'thinking') { block.thinking = (block.thinking ?? '') + row.delta.thinking; await reasoning(row.delta.thinking); }
           else if (row.delta?.type === 'signature_delta') block.signature = (block.signature ?? '') + row.delta.signature;
         }
         if (row.type === 'message_delta') { result.finish = row.delta?.stop_reason ?? result.finish; usage(row.usage); }
         if (row.type === 'message_stop') { finished = true; break; }
       } else {
-        if (row.type === 'response.output_text.delta') await text(row.delta);
-        if (row.type === 'response.output_item.added') items.set(row.output_index, clone(row.item));
+        const index = outputIndex(row);
+        if (row.type === 'response.output_text.delta' || row.type === 'response.output_text.done') {
+          if (deferUnclassified && !items.get(index)?.phase) holdText(index, row.content_index ?? 0, row.delta ?? row.text, row.type.endsWith('.done'));
+          else await fragment(items.get(index)?.phase === 'commentary' ? 'reasoning' : 'text', `text:${index}:${row.content_index ?? 0}`, row.delta ?? row.text, row.type.endsWith('.done'));
+        }
+        if (row.type === 'response.reasoning_summary_text.delta' || row.type === 'response.reasoning_summary_text.done') await fragment('reasoning', `summary:${index}:${row.summary_index ?? 0}`, row.delta ?? row.text, row.type.endsWith('.done'));
+        if (row.type === 'response.reasoning_text.delta' || row.type === 'response.reasoning_text.done') await fragment('reasoning', `reasoning:${index}:${row.content_index ?? 0}`, row.delta ?? row.text, row.type.endsWith('.done'));
+        if (row.type === 'response.output_item.added') { items.set(index, clone(row.item)); await responseItem(row.item, index, false); }
         if (row.type === 'response.function_call_arguments.delta') {
           const item = items.get(row.output_index); if (item) item.arguments = (item.arguments ?? '') + row.delta;
         }
-        if (row.type === 'response.output_item.done') items.set(row.output_index, clone(row.item));
+        if (row.type === 'response.output_item.done') { items.set(index, clone(row.item)); await responseItem(row.item, index); }
         if (row.type === 'response.completed' || row.type === 'response.incomplete') {
           result.output = row.response?.output ?? [...items.entries()].sort((a, b) => a[0] - b[0]).map(([, item]) => item);
           result.finish = row.type === 'response.incomplete' ? row.response?.incomplete_details?.reason || 'incomplete' : 'completed'; usage(row.response?.usage);
-          if (!result.text) await text(textOf(result.output));
+          for (const [outputIndex, item] of result.output.entries()) await responseItem(item, outputIndex);
+          await flushText(null, 'text');
           finished = true; break;
         }
       }
     }
     if (protocol === 'openai-chat') {
       result.calls = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, item]) => item);
-      result.output = [{ role: 'assistant', content: result.text || null, ...(result.calls.length ? { tool_calls: result.calls.map(item => ({ id: item.id, type: 'function', function: { name: item.name, arguments: item.arguments } })) } : {}) }];
+      result.output = [{ role: 'assistant', content: result.text || null, ...chatReasoning, ...(result.calls.length ? { tool_calls: result.calls.map(item => ({ id: item.id, type: 'function', function: { name: item.name, arguments: item.arguments } })) } : {}) }];
     } else if (protocol === 'anthropic') {
       result.output = blocks.filter(Boolean).map(block => { const copy = { ...block }; if ('_json' in copy) { try { copy.input = JSON.parse(copy._json); } catch { copy.input = null; } delete copy._json; } return copy; });
       result.calls = result.output.filter(item => item.type === 'tool_use').map(item => ({ id: item.id, name: item.name, arguments: item.input === null ? '' : JSON.stringify(item.input ?? {}) }));
@@ -160,6 +203,9 @@ export async function nativeResponse(response, protocol, { onText, signal } = {}
   if (!result.calls.length && !result.text) throw fault('上游没有返回可显示的文本。', 'EMPTY_UPSTREAM_OUTPUT');
   return result;
   } catch (error) {
+    // An interrupted Codex stream may never declare its phase. Without an
+    // explicit reasoning marker preserve it as visible, resumable answer text.
+    await flushText(null, 'text');
     // Providers can report prompt/output usage before the stream is interrupted.
     // Preserve those known costs even when no final response can be assembled.
     error.usage = { inputTokens: result.inputTokens, outputTokens: result.outputTokens };
@@ -261,7 +307,7 @@ export async function runNativeAgent(job, { cwd, emit = () => {}, fetcher = fetc
           record.result = await executeNativeTool(call.name, args, { cwd, signal, skills: job.skills, delegate: delegated ? null : async task => {
             let answer = '', childTurns = 0;
             const childBudget = { get remaining() { return Math.min(4 - childTurns, shared.remaining); }, set remaining(value) { const consumed = this.remaining - value; childTurns += consumed; shared.remaining -= consumed; } };
-            await runNativeAgent({ ...job, prompt: task, images: [], resumeState: undefined, resumeText: undefined, continuation: false, systemPrompt: `${job.systemPrompt || ''}\nComplete only the assigned subtask. Report files you actually created.`, limits: { ...job.limits, maxTurns: 4 } }, { cwd, fetcher, signal, budget: childBudget, delegated: true, usageTracker: totals, emit: async event => { if (event.type === 'delta') answer += event.text; else if (event.type === 'usage' || event.type === 'activity') await emit(event); } });
+            await runNativeAgent({ ...job, prompt: task, images: [], resumeState: undefined, resumeText: undefined, continuation: false, systemPrompt: `${job.systemPrompt || ''}\nComplete only the assigned subtask. Report files you actually created.`, limits: { ...job.limits, maxTurns: 4 } }, { cwd, fetcher, signal, budget: childBudget, delegated: true, usageTracker: totals, emit: async event => { if (event.type === 'delta') answer += event.text; else if (event.type === 'usage' || event.type === 'activity' || event.type === 'reasoning') await emit(event); } });
             return { result: answer.slice(-65536) };
           } });
           record.status = 'completed';
@@ -289,7 +335,7 @@ export async function runNativeAgent(job, { cwd, emit = () => {}, fetcher = fetc
         throw fault(`上游请求失败（HTTP ${response.status}），已保留进度。`, 'UPSTREAM_HTTP_ERROR', { status: response.status, rawDiagnostic: { source: 'native-agent', status: response.status, body: diagnostic } });
       }
       let result;
-      try { result = await nativeResponse(response, job.protocol, { signal, onText: async text => { state.partial.text += text; state.visibleText += text; await emit({ type: 'delta', text }); } }); }
+      try { result = await nativeResponse(response, job.protocol, { signal, deferUnclassified: job.responsesProfile === 'codex', onText: async text => { state.partial.text += text; state.visibleText += text; await emit({ type: 'delta', text }); }, onReasoning: async text => emit({ type: 'reasoning', text }) }); }
       catch (error) { if (error.usage) await accountUsage(error.usage); throw error; }
       await accountUsage(result);
       addAssistant(state, result); state.partial = null; state.pendingCalls = result.calls;

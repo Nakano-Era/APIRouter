@@ -87,6 +87,39 @@ test('work parser avoids duplicate text and marks tool calls committed', () => {
   assert.equal(parseClaudeEvent({ type: 'result', subtype: 'error_max_turns', is_error: true }, state)[0].type, 'error');
 });
 
+test('Claude thinking stream and assistant snapshots emit folded reasoning once, excluding signatures', () => {
+  const state = { tools: new Set(), streamed: false, finished: false }, events = [];
+  for (const row of [
+    { type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } },
+    { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '先' } } },
+    { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '检查。' } } },
+    { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'hidden-signature' } } },
+    { type: 'assistant', message: { id: 'm1', content: [{ type: 'thinking', thinking: '先检查。', signature: 'hidden-signature' }] } },
+    { type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '结果正文。' } } },
+    { type: 'result', subtype: 'success', result: '结果正文。' },
+  ]) events.push(...parseClaudeEvent(row, state));
+  assert.equal(events.filter(event => event.type === 'reasoning').map(event => event.text).join(''), '先检查。');
+  assert.equal(events.filter(event => event.type === 'delta').map(event => event.text).join(''), '结果正文。');
+  assert.ok(!JSON.stringify(events).includes('hidden-signature'));
+  assert.deepEqual(parseClaudeEvent({ type: 'assistant', message: { id: 'm2', content: [{ type: 'thinking', thinking: '仅完整消息。', signature: 'sig' }] } }, state), [{ type: 'reasoning', text: '仅完整消息。' }]);
+});
+
+test('Claude redacted block suppresses mixed deltas without suppressing the next message same index', () => {
+  const state = { tools: new Set(), streamed: false, finished: false }, events = [];
+  for (const row of [
+    { type: 'stream_event', event: { type: 'message_start', message: { id: 'redacted-message' } } },
+    { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'redacted_thinking', data: 'encrypted' } } },
+    { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'never-render-thinking' } } },
+    { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'never-render-text' } } },
+    { type: 'assistant', message: { id: 'redacted-message', content: [{ type: 'thinking', thinking: 'never-render-snapshot' }] } },
+    { type: 'stream_event', event: { type: 'message_start', message: { id: 'normal-message' } } },
+    { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } } },
+    { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Visible thinking.' } } },
+    { type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Visible answer.' } } },
+  ]) events.push(...parseClaudeEvent(row, state));
+  assert.deepEqual(events, [{ type: 'reasoning', text: 'Visible thinking.' }, { type: 'delta', text: 'Visible answer.' }]);
+});
+
 test('work exports only bounded regular files, excludes links and hidden metadata', async t => {
   const directory = temp(t), output = join(directory, 'output'); mkdirSync(output);
   writeFileSync(join(output, 'a.svg'), '<svg/>'); writeFileSync(join(output, '.secret'), 'private'); writeFileSync(join(output, 'huge.bin'), 'x'.repeat(40));
@@ -103,13 +136,14 @@ test('work worker uses only short-lived gateway token and decodes split Chinese 
     captured = { command, args, spawnOptions };
     const child = new EventEmitter(); child.pid = 99999999; child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kill = () => {};
     child.stdin = new Writable({ write(_chunk, _encoding, callback) { callback(); }, final(callback) { callback(); queueMicrotask(() => {
-      const text = Buffer.from(JSON.stringify({ type: 'stream_event', event: { delta: { type: 'text_delta', text: '中文测试' } } }) + '\n');
+      const text = Buffer.from(JSON.stringify({ type: 'stream_event', event: { delta: { type: 'thinking_delta', thinking: '独立思考' } } }) + '\n' + JSON.stringify({ type: 'stream_event', event: { delta: { type: 'text_delta', text: '中文测试' } } }) + '\n');
       for (const byte of text) child.stdout.write(Buffer.from([byte]));
       child.stdout.end(JSON.stringify({ type: 'result', subtype: 'success', result: '中文测试' }) + '\n'); child.stderr.end(); child.emit('close', 0, null);
     }); } }); return child;
   };
   await runWorker({ ...job({ engine: 'claude-code', mode: 'chat' }), gateway: `http://gateway:3210/proxy/${jobId}`, jobToken: token, provider }, { cwd: directory, spawnProcess, emit: event => events.push(event) });
   assert.equal(events.find(event => event.type === 'delta').text, '中文测试');
+  assert.equal(events.find(event => event.type === 'reasoning').text, '独立思考');
   assert.equal(captured.command, 'claude'); assert.equal(captured.spawnOptions.env.ANTHROPIC_AUTH_TOKEN, token);
   assert.ok(!JSON.stringify(captured).includes(provider.apiKey)); assert.ok(events.some(event => event.type === 'done'));
 });
@@ -148,6 +182,13 @@ test('work service persists real files, rehydrates workspace, handles partial fa
   const partialEvents = [];
   await assert.rejects(async () => { for await (const event of failing.service.stream(options())) partialEvents.push(event); }, error => { assert.equal(error.rawDiagnostic.status, 400); assert.ok(!error.rawDiagnostic.body.includes(provider.apiKey)); assert.equal(error.rawDiagnostic.headers.authorization, '[REDACTED]'); return true; });
   assert.equal(partialEvents[0].artifact.name, 'partial.txt');
+});
+
+test('work service forwards reasoning separately from final answer text', async t => {
+  const { service } = fixture(t, { fetcher: async () => eventsResponse([{ type: 'reasoning', text: '任务进展思考。' }, { type: 'delta', text: '最终回答。' }, { type: 'done' }]) });
+  const events = await collect(service.stream(options()));
+  assert.deepEqual(events.filter(event => event.type === 'reasoning'), [{ type: 'reasoning', text: '任务进展思考。' }]);
+  assert.deepEqual(events.filter(event => event.type === 'delta'), [{ type: 'delta', text: '最终回答。' }]);
 });
 
 for (const scenario of [
@@ -200,12 +241,15 @@ test('work broker never exposes master runner token or API key to worker stdin a
   const commands = []; let workerInput;
   const broker = createBroker({ token, self: 'broker-container', docker: async args => { commands.push(args); return ''; }, spawnDocker: args => {
     commands.push(args); const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
-    child.stdin = new Writable({ write(chunk, _enc, callback) { workerInput = JSON.parse(chunk.toString()); callback(); }, final(callback) { callback(); queueMicrotask(() => { child.stdout.end(JSON.stringify({ type: 'delta', text: '工作完成' }) + '\n' + JSON.stringify({ type: 'done' }) + '\n'); child.stderr.end(); child.emit('close', 0); }); } }); return child;
+    child.stdin = new Writable({ write(chunk, _enc, callback) { workerInput = JSON.parse(chunk.toString()); callback(); }, final(callback) { callback(); queueMicrotask(() => { child.stdout.end(JSON.stringify({ type: 'reasoning', text: `工作推理 ${provider.apiKey} ${workerInput.jobToken}` }) + '\n' + JSON.stringify({ type: 'delta', text: '工作完成' }) + '\n' + JSON.stringify({ type: 'done' }) + '\n'); child.stderr.end(); child.emit('close', 0); }); } }); return child;
   } });
   const base = await listen(broker.server); t.after(() => broker.close());
   assert.equal((await fetch(base + '/health')).status, 401);
   const response = await fetch(base + '/jobs', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ ...job(), provider }) });
   const output = await response.text(); assert.match(output, /工作完成/);
+  const reasoning = output.split('\n').filter(Boolean).map(line => JSON.parse(line)).find(event => event.type === 'reasoning');
+  assert.match(reasoning.text, /工作推理/); assert.ok(!reasoning.text.includes(provider.apiKey)); assert.ok(!reasoning.text.includes(workerInput.jobToken));
+  assert.equal(workerInput.responsesProfile, 'standard');
   assert.ok(!JSON.stringify(workerInput).includes(provider.apiKey)); assert.notEqual(workerInput.jobToken, token); assert.equal(workerInput.provider, undefined);
   assert.ok(commands.some(args => args[0] === 'network' && args[1] === 'create' && args.includes('--internal')));
   assert.ok(commands.some(args => args[0] === 'rm')); assert.ok(commands.some(args => args[0] === 'network' && args[1] === 'rm'));

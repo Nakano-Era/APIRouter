@@ -2,7 +2,12 @@ import type { Message } from '../types';
 
 // A continuation keeps its message ID. Delayed snapshots must not erase a suffix.
 export function mergeMessage(current: Message | undefined, incoming: Message): Message {
-  return incoming.role === 'assistant' && current?.role === 'assistant' && current.content.length > incoming.content.length ? { ...incoming, content: current.content } : incoming;
+  if (incoming.role !== 'assistant' || current?.role !== 'assistant') return incoming;
+  return {
+    ...incoming,
+    content: current.content.length > incoming.content.length ? current.content : incoming.content,
+    reasoning: (current.reasoning?.length || 0) > (incoming.reasoning?.length || 0) ? current.reasoning : incoming.reasoning,
+  };
 }
 export function upsertMessage(messages: Message[], incoming: Message): Message[] {
   const index = messages.findIndex(message => message.id === incoming.id);

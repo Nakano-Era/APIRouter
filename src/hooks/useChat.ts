@@ -5,7 +5,7 @@ import { interrupted, mergeSnapshot, upsertMessage } from './chat-state';
 
 interface ChatView { messages: Message[]; artifacts: WorkArtifact[]; activity: string[]; error: string; routingNotice: string; generating: boolean }
 interface ChatResponse { chat: Chat; messages: Message[]; generating?: boolean }
-interface RunningTask { controller: AbortController; assistantId?: string; text: string; stopping: boolean }
+interface RunningTask { controller: AbortController; assistantId?: string; text: string; reasoning: string; stopping: boolean }
 const emptyView = (): ChatView => ({ messages: [], artifacts: [], activity: [], error: '', routingNotice: '', generating: false });
 
 export function useChat() {
@@ -153,7 +153,7 @@ export function useChat() {
     if (mode === 'work' && !capabilities?.available) { setError(capabilities?.reason || 'Work 暂时不可用。'); return false; }
     const options = { modelId, mode, effort, skillIds: mode === 'work' ? skillIds : [], webSearch: mode === 'work' && webSearch };
     const sequence = loadSequence.current;
-    const task: RunningTask = { controller: new AbortController(), text: '', stopping: false };
+    const task: RunningTask = { controller: new AbortController(), text: '', reasoning: '', stopping: false };
     let accepted = false;
     updateView(chatId, current => ({ ...current, generating: true, error: '', routingNotice: '', activity: [] }));
     if (!chatId) creating.current = true;
@@ -172,7 +172,7 @@ export function useChat() {
         if (event === 'meta') {
           accepted = true;
           if (data.chat) setChats(current => [data.chat!, ...current.filter(chat => chat.id !== data.chat!.id)]);
-          if (data.assistantMessage) { task.assistantId = data.assistantMessage.id; task.text = data.assistantMessage.content; }
+          if (data.assistantMessage) { task.assistantId = data.assistantMessage.id; task.text = data.assistantMessage.content; task.reasoning = data.assistantMessage.reasoning || ''; }
           updateView(id, current => {
             let previous = current.messages;
             if (action === 'edit') { const index = previous.findIndex(message => message.id === messageId); if (index >= 0) previous = previous.slice(0, index); }
@@ -185,6 +185,10 @@ export function useChat() {
         if (event === 'delta') {
           task.text += data.text || '';
           updateView(id, current => ({ ...current, routingNotice: '', messages: current.messages.map(message => message.id === task.assistantId && task.text.length >= message.content.length ? { ...message, content: task.text } : message) }));
+        }
+        if (event === 'reasoning') {
+          task.reasoning += data.text || '';
+          updateView(id, current => ({ ...current, routingNotice: '', messages: current.messages.map(message => message.id === task.assistantId && task.reasoning.length >= (message.reasoning?.length || 0) ? { ...message, reasoning: task.reasoning } : message) }));
         }
         if (event === 'routing') updateView(id, current => ({ ...current, routingNotice: '正在连接模型，请稍候…' }));
         if (event === 'activity' && data.label) updateView(id, current => ({ ...current, activity: current.activity.at(-1) === data.label ? current.activity : [...current.activity.slice(-19), data.label!] }));
