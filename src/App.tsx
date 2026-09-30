@@ -8,6 +8,7 @@ import Brand from './components/Brand';
 import Sidebar from './components/Sidebar';
 import Composer from './components/Composer';
 import ModelPicker from './components/ModelPicker';
+import ChatControls from './components/ChatControls';
 const MessageList = lazy(() => import('./components/MessageList'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
 const BillingModal = lazy(() => import('./components/BillingModal'));
@@ -46,7 +47,7 @@ function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: (
       <header className="topbar"><div className="topbar-left">
         <button className="icon-button sidebar-open-button" onClick={showSidebar} aria-label="打开侧栏" title="打开侧栏"><PanelLeft size={21}/></button>
         <button className="icon-button collapsed-new-chat" onClick={newChat} disabled={chat.generating} aria-label="新聊天" title="新聊天"><SquarePen size={21}/></button>
-        <ModelPicker models={chat.models} value={chat.modelId} onChange={chat.setModelId} disabled={chat.generating} isAdmin={user.role === 'admin'} onSettings={() => setSettingsOpen(true)}/>
+        <ModelPicker models={chat.availableModels} value={chat.modelId} onChange={chat.setModelId} disabled={chat.generating || chat.chatLoading} isAdmin={user.role === 'admin'} onSettings={() => setSettingsOpen(true)}/>
       </div><div className="topbar-right">
         <button className="upgrade-button" onClick={() => setBillingOpen(true)}><Sparkles size={15}/><span>{membership ? '管理套餐' : '升级套餐'}</span></button>
         {currentChat && <button className="icon-button export-button" onClick={exportChat} aria-label="导出对话" title="导出 Markdown">{exported ? <Check size={18}/> : <ArrowDownToLine size={18}/>}</button>}
@@ -55,13 +56,17 @@ function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: (
       {chat.loading ? <div className="app-loading"><LoaderCircle size={26} className="spin"/><p>正在打开工作空间…</p></div> : <>
         <div className={`chat-layout ${empty ? 'empty-layout' : ''}`}>
           {empty && <div className="welcome-content"><div className="welcome-intro">
-            <h1>有什么可以帮忙的？</h1>
+            <h1>{chat.mode === 'work' ? '今天想完成什么？' : '有什么可以帮忙的？'}</h1>
+            {chat.mode === 'work' && <p className="work-welcome-subtitle">将任务交给 Work，在独立工作区中使用工具完成。</p>}
           </div></div>}
           {!empty && <Suspense fallback={<div className="app-loading"><LoaderCircle size={23} className="spin"/></div>}><MessageList messages={chat.messages} models={chat.models} generating={chat.generating} onRegenerate={() => void chat.generate('',[],'regenerate')}
-            onEdit={(message,content) => chat.generate(content,message.attachments,'edit',message.id)} loading={chat.chatLoading}/></Suspense>}
+            onEdit={(message,content) => chat.generate(content,message.attachments,'edit',message.id)} loading={chat.chatLoading} activity={chat.activity} artifacts={chat.artifacts}/></Suspense>}
           <div className="composer-zone">{chat.routingNotice && <div className="routing-progress" role="status"><LoaderCircle size={14} className="spin"/>{chat.routingNotice}</div>}<Composer key={composerVersion} onSend={(content,files) => chat.generate(content,files)} onStop={() => void chat.stop()}
-            generating={chat.generating} model={chat.chatLoading ? undefined : selected} draft={draft} draftKey={draftKey} onError={chat.setError}/></div>
-          {empty && chat.models.length === 0 && <div className="configuration-hint">{user.role === 'admin' ? <><span>连接 API 后即可开始聊天。</span><button onClick={() => setSettingsOpen(true)}>配置 API</button></> : <span>暂时没有可用模型，请联系管理员。</span>}</div>}
+            generating={chat.generating} model={chat.chatLoading ? undefined : selected} draft={draft} draftKey={draftKey} onError={chat.setError} work={chat.mode === 'work'} disabled={chat.mode === 'work' && !chat.capabilities?.available}
+            tools={<ChatControls mode={chat.mode} onMode={chat.setMode} model={selected} effort={chat.effort} onEffort={chat.setEffort} capabilities={chat.capabilities} skillIds={chat.skillIds} onSkills={chat.setSkillIds} webSearch={chat.webSearch} onWebSearch={chat.setWebSearch} disabled={chat.generating || chat.chatLoading}/>}/>
+            {chat.mode === 'work' && !chat.capabilities?.available && <div className="work-availability" role="status"><span>{chat.capabilities?.reason || '正在检查 Work 服务…'}</span>{user.role === 'admin' && <button onClick={() => setSettingsOpen(true)}>打开设置</button>}</div>}
+          </div>
+          {empty && chat.availableModels.length === 0 && <div className="configuration-hint">{user.role === 'admin' ? <><span>{chat.mode === 'work' ? '请配置支持 Work 的模型。' : '连接 API 后即可开始聊天。'}</span><button onClick={() => setSettingsOpen(true)}>配置模型</button></> : <span>当前模式暂时没有可用模型，请联系管理员。</span>}</div>}
         </div>
         {chat.error && <div className="workspace-alert" role="alert"><span>{chat.error}</span><button className="icon-button" aria-label="关闭提示" onClick={() => chat.setError('')}><X size={15}/></button></div>}
         <footer className="workspace-footer">AI 也可能会犯错，请核查重要信息。</footer>

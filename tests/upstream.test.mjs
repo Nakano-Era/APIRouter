@@ -223,20 +223,67 @@ test('fixed admin probes get bounded redacted JSON diagnostics without changing 
     if (diagnostics) {
       assert.match(error.adminDetail, /model_not_found.*Model is unavailable/);
       assert.doesNotMatch(error.adminDetail, /secret-test-key|another-token|sk-upstream-secret|provider\.example|user@example\.com|private/);
-    } else assert.equal(error.adminDetail, undefined);
+      assert.equal(error.adminDiagnostic.version, 2);
+      assert.equal(error.adminDiagnostic.protocol, 'openai-chat');
+      assert.equal(error.adminDiagnostic.method, 'POST');
+      assert.equal(error.adminDiagnostic.path, '/v1/chat/completions');
+      assert.equal(error.adminDiagnostic.modelId, 'test-model');
+      assert.equal(error.adminDiagnostic.upstreamStatus, 400);
+      assert.equal(typeof error.adminDiagnostic.authMode, 'string');
+      assert.ok(error.adminDiagnostic.authMode.length > 0);
+      assert.equal(error.adminDiagnostic.detail, error.adminDetail);
+      assert.equal(typeof error.adminDiagnostic.responseFormat, 'string');
+      assert.ok(error.adminDiagnostic.responseFormat.length > 0);
+      assert.equal(typeof error.adminDiagnostic.note, 'string');
+      assert.ok(error.adminDiagnostic.note.length > 0);
+      assert.doesNotMatch(JSON.stringify(error.adminDiagnostic), /secret-test-key|another-token|sk-upstream-secret|provider\.example|user@example\.com|private/);
+    } else {
+      assert.equal(error.adminDetail, undefined);
+      assert.equal(error.adminDiagnostic, undefined);
+    }
     return true;
   });
   await check(false);
   await check(true);
 });
 
-test('diagnostics discard HTML, malformed or oversized JSON and stack traces', async t => {
+test('admin diagnostics extract safe explanations from common upstream error formats', async t => {
+  const cases = [
+    ['text/plain', JSON.stringify({ error: { message: 'mislabeled-json: secret-test-key' } }), 'mislabeled-json'],
+    ['application/json', JSON.stringify({ msg: 'root-msg: secret-test-key' }), 'root-msg'],
+    ['application/json', JSON.stringify({ error: { msg: 'nested-msg: secret-test-key' } }), 'nested-msg'],
+    ['application/problem+json', JSON.stringify({ detail: 'problem-detail: secret-test-key' }), 'problem-detail'],
+    ['application/json', JSON.stringify({ error_description: 'oauth-description: secret-test-key' }), 'oauth-description'],
+    ['text/event-stream', `event: error\n${frame({ type: 'error', error: { type: 'invalid_request_error', message: 'sse-rejection: secret-test-key' } })}`, 'sse-rejection'],
+    ['text/plain', 'plain-rejection: this model is unavailable. secret-test-key Bearer private-token', 'plain-rejection'],
+  ];
+  for (const [contentType, responseBody, marker] of cases) {
+    const provider = await mock(t, (_req, res) => { res.writeHead(400, { 'content-type': contentType }); res.end(responseBody); });
+    await assert.rejects(collect({ ...options(provider), diagnostics: true }), error => {
+      assert.equal(error.code, 'UPSTREAM_HTTP_ERROR');
+      assert.equal(error.upstreamStatus, 400);
+      assert.ok(error.adminDetail?.includes(marker), `${marker} should be readable by the administrator`);
+      assert.equal(error.adminDiagnostic.detail, error.adminDetail);
+      assert.ok(error.adminDiagnostic.note?.trim(), `${marker} should include a diagnostic note`);
+      assert.ok(error.adminDiagnostic.responseFormat?.trim());
+      assert.doesNotMatch(JSON.stringify(error.adminDiagnostic), /secret-test-key|private-token/);
+      assert.ok(!sanitizeUpstreamError(error).includes(marker), 'public errors remain generic');
+      return true;
+    });
+  }
+});
+
+test('diagnostic fallbacks explain missing detail without exposing HTML, malformed data or stack traces', async t => {
   const cases = [
     ['text/html', '<html>private server error</html>'],
+    ['text/html', '<!doctype html><html><title>Just a moment...</title><script>window._cf_chl_opt={secret:"private-challenge-token"}</script><body>Verify you are human</body></html>'],
     ['application/json', '{invalid JSON'],
     ['application/json', JSON.stringify({ error: { message: '<html>private server error</html>' } })],
     ['application/json', JSON.stringify({ error: { message: 'Error\n    at handler (/private/app.mjs:2)' } })],
     ['application/json', JSON.stringify({ error: { message: 'x'.repeat(70_000) } })],
+    ['application/json', JSON.stringify({ unknown: 'private unrecognized diagnostic' })],
+    ['application/octet-stream', '\u0000\u0001\u0002private binary data'],
+    ['application/json', ''],
   ];
   for (const [contentType, responseBody] of cases) {
     const provider = await mock(t, (_req, res) => { res.writeHead(400, { 'content-type': contentType }); res.end(responseBody); });
@@ -244,6 +291,11 @@ test('diagnostics discard HTML, malformed or oversized JSON and stack traces', a
       assert.equal(error.code, 'UPSTREAM_HTTP_ERROR');
       assert.equal(error.upstreamStatus, 400);
       assert.equal(error.adminDetail, undefined);
+      assert.equal(error.adminDiagnostic.detail, undefined);
+      assert.ok(error.adminDiagnostic.note?.trim(), `${contentType} fallback must explain why no detail is available`);
+      assert.ok(error.adminDiagnostic.responseFormat?.trim());
+      assert.doesNotMatch(JSON.stringify(error.adminDiagnostic), /private|invalid JSON|<html>|<script>|Just a moment|Verify you are human/);
+      if (contentType === 'text/html') assert.match(`${error.adminDiagnostic.responseFormat} ${error.adminDiagnostic.note}`, /html|浏览器|验证|网页/i);
       return true;
     });
   }
@@ -277,6 +329,9 @@ test('stalled diagnostic bodies preserve the HTTP error and release the connecti
     assert.equal(error.code, 'UPSTREAM_HTTP_ERROR');
     assert.equal(error.upstreamStatus, 400);
     assert.equal(error.adminDetail, undefined);
+    assert.equal(error.adminDiagnostic.detail, undefined);
+    assert.ok(error.adminDiagnostic.note?.trim());
+    assert.match(error.adminDiagnostic.note, /超时|时间|timeout/i);
     return true;
   });
   assert.ok(Date.now() - start < 5000);
@@ -340,3 +395,19 @@ test('a stalled stream expires with a safe timeout error', async t => {
     else process.env.UPSTREAM_TIMEOUT_MS = original;
   }
 });
+
+
+for (const protocol of ['openai-chat','openai-responses','anthropic']) {
+  test(protocol + ' maps explicit effort and leaves automatic requests unchanged', async t => {
+    const bodies=[];
+    const provider=await mock(t,(_req,res,body)=>{bodies.push(body);res.writeHead(400,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:'full original reason',detail:{unexpected:'preserved'},key:'secret-test-key'}}));});
+    for (const effort of ['auto','high']) await assert.rejects(collect({...options({...provider,protocol}),effort}), error=>{
+      assert.ok(error.rawDiagnostic.body.includes('unexpected'));
+      assert.ok(!error.rawDiagnostic.body.includes('secret-test-key'));
+      assert.equal(error.rawDiagnostic.truncated,false);
+      return true;
+    });
+    assert.equal(bodies[0].reasoning_effort,undefined);assert.equal(bodies[0].reasoning,undefined);assert.equal(bodies[0].output_config,undefined);
+    assert.equal(protocol==='openai-chat'?bodies[1].reasoning_effort:protocol==='openai-responses'?bodies[1].reasoning.effort:bodies[1].output_config.effort,'high');
+  });
+}

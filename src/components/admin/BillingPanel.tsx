@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { Check, CheckCircle2, CreditCard, Layers3, LoaderCircle, Pencil, Plus, RefreshCw, ReceiptText, X } from 'lucide-react';
 import { api, errorText, patch, post } from '../../api';
 import { billingDate, formatPrice, intervalLabel, type BillingPlan, type BillingRequest, type BillingSettings } from '../../billingTypes';
-import type { Model } from '../../types';
+import type { AdminModel } from '../../types';
 import '../../billing.css';
 
 type BillingTab = 'plans' | 'payments' | 'requests';
@@ -36,7 +36,7 @@ export default function BillingPanel({ onChanged }: { onChanged?: () => void | P
   const reload = useCallback(async () => {
     const [planResult, requestResult, settingResult, modelResult] = await Promise.all([
       api<{ plans: BillingPlan[] }>('/admin/plans'), api<{ requests: BillingRequest[] }>('/admin/billing/requests'),
-      api<BillingSettings>('/admin/billing/settings'), api<{ models: Model[] }>('/admin/models'),
+      api<BillingSettings>('/admin/billing/settings'), api<{ models: AdminModel[] }>('/admin/models'),
     ]);
     setPlans(planResult.plans); setRequests(requestResult.requests); setSettings(settingResult); setFreeRoutes(settingResult.freeAllowedRoutes);
     setRoutes([...new Set(modelResult.models.map(model => model.routeKey || model.modelId))].sort());

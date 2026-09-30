@@ -134,7 +134,9 @@ test('HTTP routing integrates equivalent models, retries, persisted cooldown, au
   const routeId = publicModels.models[0].id;
   assert.match(routeId, /^r_[a-f0-9]{32}$/);
   assert.equal(publicModels.defaultModelId, routeId);
-  assert.equal(publicModels.models[0].channelCount, 2);
+  assert.equal(publicModels.models[0].channelCount, undefined);
+  assert.equal(publicModels.models[0].providerName, undefined);
+  assert.equal(publicModels.models[0].providerId, undefined);
   assert.equal(publicModels.models[0].routeKey, routeKey);
   assert.equal(publicModels.models[0].modelId, routeKey);
   const chat = (await request('/api/chats', { method: 'POST', body: { modelId: routeId } })).data.chat;
@@ -146,11 +148,12 @@ test('HTTP routing integrates equivalent models, retries, persisted cooldown, au
   assert.equal(first.message.content, '备用渠道完成回答。');
   assert.equal(first.message.status, 'complete');
   assert.equal(first.message.modelId, routeId);
-  assert.equal(first.message.sourceProvider, '备用渠道');
-  assert.equal(first.message.sourceModel, backupWireId);
+  assert.equal(instance.store.get('SELECT source_provider FROM messages WHERE id=?', first.message.id).source_provider, '备用渠道');
+  assert.equal(first.message.sourceProvider, undefined);
+  assert.equal(first.message.sourceModel, undefined);
   const persistedMessage = (await request(`/api/chats/${chat.id}`)).data.messages.at(-1);
-  assert.equal(persistedMessage.sourceProvider, '备用渠道');
-  assert.equal(persistedMessage.sourceModel, backupWireId);
+  assert.equal(persistedMessage.sourceProvider, undefined);
+  assert.equal(persistedMessage.sourceModel, undefined);
   assert.equal((await request('/api/admin/stats')).data.requestsToday, 1, 'retries count as one user request');
   const health = (await request('/api/admin/models')).data.models.find(model => model.id === primaryModel.id);
   assert.equal(health.failureCount, 2);
@@ -172,7 +175,7 @@ test('HTTP routing integrates equivalent models, retries, persisted cooldown, au
   const second = await send(chat.id, routeId, '请接着回答第二个问题');
   assert.equal(primaryCalls, 2);
   assert.equal(backupCalls, 2);
-  assert.equal(second.message.sourceProvider, '备用渠道');
+  assert.equal(second.message.sourceProvider, undefined);
   assert.equal((await request('/api/models')).data.models[0].id, routeId);
   assert.equal((await request('/api/admin/stats')).data.requestsToday, 2);
 
@@ -185,8 +188,8 @@ test('HTTP routing integrates equivalent models, retries, persisted cooldown, au
   assert.equal(backupCalls, 2);
   assert.equal(third.events.filter(event => event.type === 'routing').length, 0);
   assert.equal(third.message.content, '主渠道已恢复。');
-  assert.equal(third.message.sourceProvider, '主渠道');
-  assert.equal(third.message.sourceModel, primaryWireId);
+  assert.equal(third.message.sourceProvider, undefined);
+  assert.equal(third.message.sourceModel, undefined);
   assert.equal((await request('/api/admin/stats')).data.requestsToday, 3);
   const finalHealth = (await request('/api/admin/models')).data.models.find(model => model.id === primaryModel.id);
   assert.equal(finalHealth.status, 'ok');

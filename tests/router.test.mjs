@@ -9,20 +9,21 @@ function fixture(t, channels = [{ id: 'a', priority: 10 }, { id: 'b', priority: 
   const db = new DatabaseSync(':memory:');
   t.after(() => db.close());
   db.exec(`CREATE TABLE providers (id TEXT PRIMARY KEY,name TEXT,base_url TEXT,protocol TEXT,encrypted_key TEXT,
-    enabled INTEGER,priority INTEGER,failure_threshold INTEGER,cooldown_seconds INTEGER,auth_mode TEXT);
+    enabled INTEGER,priority INTEGER,failure_threshold INTEGER,cooldown_seconds INTEGER,auth_mode TEXT,runtime TEXT DEFAULT 'api');
     CREATE TABLE models (id TEXT PRIMARY KEY,provider_id TEXT,model_id TEXT,route_key TEXT,enabled INTEGER,
     available INTEGER,vision INTEGER,failure_count INTEGER,cooldown_until TEXT,failure_epoch INTEGER,
-    status TEXT,error TEXT,last_checked_at TEXT);
-    CREATE TABLE route_attempts (id TEXT PRIMARY KEY,request_id TEXT,provider_id TEXT,model_id TEXT,outcome TEXT,error TEXT,created_at TEXT);`);
+    status TEXT,error TEXT,last_checked_at TEXT,reasoning_efforts TEXT DEFAULT '[]');
+    CREATE TABLE route_attempts (id TEXT PRIMARY KEY,request_id TEXT,provider_id TEXT,model_id TEXT,outcome TEXT,error TEXT,created_at TEXT,encrypted_detail TEXT);`);
   const store = {
     all: (sql, ...args) => db.prepare(sql).all(...args),
     get: (sql, ...args) => db.prepare(sql).get(...args),
     run: (sql, ...args) => db.prepare(sql).run(...args),
     decrypt: value => value,
+    encrypt: value => `encrypted:${value}`,
   };
   for (const c of channels) {
-    store.run('INSERT INTO providers VALUES (?,?,?,?,?,?,?,?,?,?)', c.id, `Provider ${c.id}`, `https://${c.id}.example.com/v1`, c.protocol ?? 'openai-chat', `secret-${c.id}`, c.providerEnabled ?? 1, c.priority ?? 0, c.threshold ?? 3, c.cooldownSeconds ?? 60, c.authMode ?? 'auto');
-    store.run('INSERT INTO models VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', c.id, c.id, c.upstreamModelId ?? `upstream-${c.id}`, c.routeKey ?? 'shared-model', c.enabled ?? 1, c.available ?? 1, c.vision ?? 0, c.failureCount ?? 0, c.cooldownUntil ?? null, 0, 'untested', null, null);
+    store.run('INSERT INTO providers VALUES (?,?,?,?,?,?,?,?,?,?,?)', c.id, `Provider ${c.id}`, `https://${c.id}.example.com/v1`, c.protocol ?? 'openai-chat', `secret-${c.id}`, c.providerEnabled ?? 1, c.priority ?? 0, c.threshold ?? 3, c.cooldownSeconds ?? 60, c.authMode ?? 'auto', c.runtime || 'api');
+    store.run('INSERT INTO models VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', c.id, c.id, c.upstreamModelId ?? `upstream-${c.id}`, c.routeKey ?? 'shared-model', c.enabled ?? 1, c.available ?? 1, c.vision ?? 0, c.failureCount ?? 0, c.cooldownUntil ?? null, 0, 'untested', null, null, JSON.stringify(c.efforts || []));
   }
   return store;
 }
@@ -108,7 +109,7 @@ test('threshold counts actual failures and opens a persistent per-model cooldown
 
 test('one broken model does not cool down other models on the same provider', async t => {
   const store = fixture(t, [{ id: 'a', threshold: 1 }]);
-  store.run("INSERT INTO models SELECT 'other',provider_id,'other-upstream','other-route',1,1,0,0,NULL,0,'untested',NULL,NULL FROM models WHERE id='a'");
+  store.run("INSERT INTO models SELECT 'other',provider_id,'other-upstream','other-route',1,1,0,0,NULL,0,'untested',NULL,NULL,'[]' FROM models WHERE id='a'");
   const router = createRouter({ store, stream: async function* ({ model: candidate }) {
     if (candidate.id === 'a') throw failure(404);
     yield { type: 'delta', text: 'Other model works' };
@@ -352,4 +353,29 @@ test('consumer stopping iteration releases a half-open probe without a health pe
   await iterator.return();
   assert.equal(model(store, 'a').failure_count, 3);
   assert.deepEqual(selected(await collect(router.run(input()))), ['a']);
+});
+
+
+test('Work tools commit the attempt before text and forbid failover on later outage', async t => {
+  const store = fixture(t, [{ id:'a', protocol:'anthropic' }, { id:'b', protocol:'anthropic' }]);
+  const called = [];
+  const router = createRouter({store,stream:async function* ({provider}) {
+    called.push(provider.id);
+    yield {type:'activity',label:'Writing file',committed:true};
+    throw failure(503);
+  }});
+  await assert.rejects(collect(router.run(input({mode:'work',requestId:'work-side-effect'}))), {upstreamStatus:503});
+  assert.deepEqual(called,['a']);
+});
+
+test('effort and Work mode filter eligible channels and reach the selected runtime', async t => {
+  const store=fixture(t,[{id:'a',protocol:'openai-chat',priority:100,efforts:['high']},{id:'b',protocol:'anthropic',priority:80,efforts:[]},{id:'c',protocol:'anthropic',runtime:'claude-code',efforts:['high']}]);
+  const calls=[];
+  const router=createRouter({store,stream:async function* (options) { calls.push(options); yield {type:'delta',text:'OK'}; }});
+  await collect(router.run(input({mode:'work',effort:'high',context:{userId:'owner',chatId:'chat'}})));
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].provider.id,'c');
+  assert.equal(calls[0].provider.runtime,'claude-code');
+  assert.equal(calls[0].effort,'high');
+  assert.equal(calls[0].context.userId,'owner');
 });

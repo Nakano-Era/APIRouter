@@ -128,11 +128,32 @@ test('upstream diagnostics are available only in the administrator probe respons
   assert.equal(captured.length, attemptsBeforeMemberProbe, 'unauthorized probes never reach the upstream');
   const probe = await request(`/api/admin/models/${diagnosticId}/test`, { session: admin, method: 'POST' });
   assert.equal(probe.status, 200);
-  assert.deepEqual(Object.keys(probe.data).sort(), ['error', 'latencyMs', 'ok']);
+  assert.deepEqual(Object.keys(probe.data).sort(), ['diagnostic', 'error', 'latencyMs', 'ok']);
   assert.equal(probe.data.ok, false);
   assert.ok(probe.data.error.includes(diagnosticMarker));
   assert.ok(!probe.data.error.includes(secret));
   assert.equal(typeof probe.data.latencyMs, 'number');
+  assert.equal(probe.data.diagnostic.version, 2);
+  assert.equal(probe.data.diagnostic.protocol, 'openai-chat');
+  assert.equal(probe.data.diagnostic.method, 'POST');
+  assert.equal(probe.data.diagnostic.path, '/v1/chat/completions');
+  assert.equal(probe.data.diagnostic.modelId, diagnosticModelId);
+  assert.equal(probe.data.diagnostic.upstreamStatus, 400);
+  assert.ok(probe.data.diagnostic.authMode?.trim());
+  assert.ok(probe.data.diagnostic.responseFormat?.trim());
+  assert.ok(probe.data.diagnostic.note?.trim());
+  assert.ok(probe.data.diagnostic.detail.includes(diagnosticMarker));
+  assert.ok(!JSON.stringify(probe.data.diagnostic).includes(secret));
+  assert.ok(probe.data.diagnostic.raw.body.includes(diagnosticMarker));
+  const rawLogs = (await request('/api/admin/routing-logs', { session: admin })).data.attempts;
+  const probeLog = rawLogs.find(log => log.modelId === diagnosticModelId && log.hasDetail);
+  assert.ok(probeLog);
+  assert.equal((await request('/api/admin/routing-logs/' + probeLog.id + '/detail', { session: member })).status, 403);
+  const rawDetail = (await request('/api/admin/routing-logs/' + probeLog.id + '/detail', { session: admin })).data.detail;
+  assert.ok(rawDetail.body.includes(diagnosticMarker));
+  assert.ok(!JSON.stringify(rawDetail).includes(secret));
+  const encrypted = instance.store.get('SELECT encrypted_detail FROM route_attempts WHERE id=?', probeLog.id).encrypted_detail;
+  assert.ok(!encrypted.includes(diagnosticMarker));
 
   const storedError = instance.store.get('SELECT error FROM models WHERE id=?', diagnosticId).error;
   assert.match(storedError, /HTTP 400/);
@@ -149,7 +170,7 @@ test('upstream diagnostics are available only in the administrator probe respons
   diagnosticChatId = chat.data.chat.id;
   const reply = await streamChat(`/api/chats/${diagnosticChatId}/messages`, member, { content: 'An ordinary private message.', modelId: diagnosticId });
   assert.equal(reply.events.at(-1).type, 'error');
-  assert.match(reply.events.at(-1).data.error, /HTTP 400/);
+  assert.match(reply.events.at(-1).data.error, /本次回答未完成/);
   const logs = (await request('/api/admin/routing-logs', { session: admin })).data;
   assert.ok(logs.attempts.some(attempt => attempt.modelId === diagnosticModelId), 'the failed ordinary request was audited');
   for (const value of [reply.text, logs]) {

@@ -1,0 +1,6 @@
+.model-test-result{margin-top:18px;scroll-margin:16px}
+.model-test-summary{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:12px 0;color:var(--muted);font-size:11px;overflow-wrap:anywhere}
+.model-test-summary .model-status{font-size:11px}
+.model-test-diagnostic{margin:14px 0 0;padding:13px;border:1px solid var(--border-subtle);border-radius:8px;background:var(--panel);white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;font:11px/1.8 Consolas,monospace;user-select:text}
+.model-test-copy-fallback p{margin:14px 0 9px}
+.model-test-copy-fallback textarea{font:11px/1.8 Consolas,monospace;resize:vertical}

@@ -215,7 +215,8 @@ test('HTTP membership enforces free routes, manual approval, paid quota and admi
     await expect(`/api/chats/${chat.id}`, { session: member, method: 'PATCH', body: { modelId: premium.id } });
     const first = await send(chat.id, premium.id, '会员第一次调用付费模型');
     assert.equal(first.content, '模型 premium-wire-model 已完成回答。');
-    assert.equal(first.sourceModel, 'premium-wire-model');
+    assert.equal(first.sourceModel, undefined);
+    assert.equal(captured.at(-1).body.model, 'premium-wire-model');
     const second = await send(chat.id, basic.id, '会员第二次调用基础模型');
     assert.equal(second.content, '模型 basic-wire-model 已完成回答。');
     assert.equal(captured.length, 2);
@@ -243,7 +244,8 @@ test('HTTP membership enforces free routes, manual approval, paid quota and admi
     await expect(path, { session: admin, method: 'PATCH', body: { dailyLimit: 3 } });
     assert.equal((await expect('/api/billing', { session: member })).effectiveDailyLimit, 3);
     const third = await send(chat.id, premium.id, '管理员增加额度后的第三次请求');
-    assert.equal(third.sourceModel, 'premium-wire-model');
+    assert.equal(third.sourceModel, undefined);
+    assert.equal(captured.at(-1).body.model, 'premium-wire-model');
     await expect(`/api/chats/${chat.id}/messages`, { session: member, method: 'POST', body: { modelId: premium.id, content: '第三次之后不能继续' } }, 429);
     const restored = await expect(path, { session: admin, method: 'PATCH', body: { dailyLimit: null } });
     assert.equal(restored.user.dailyLimit, null);

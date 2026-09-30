@@ -1,4 +1,4 @@
-import { openUpstream, readJson, UpstreamError } from './net.mjs';
+import { openUpstream, readJson, UpstreamError, redactRawError, redactDiagnosticObject } from './net.mjs';
 export { validateBaseUrl, sanitizeUpstreamError, UpstreamError } from './net.mjs';
 
 const invalid = () => new UpstreamError('上游响应格式不符合所选协议，请检查 API 配置。', 'INVALID_UPSTREAM_RESPONSE');
@@ -34,7 +34,10 @@ export async function listModels(provider, { signal } = {}) {
       seenCursors.add(cursor);
     } catch (error) {
       if (request.signal.aborted) throw request.signal.reason;
-      if (error instanceof UpstreamError) throw error;
+      if (error instanceof UpstreamError) {
+        if (error.rawDiagnostic) error.rawDiagnostic = redactDiagnosticObject(error.rawDiagnostic, provider.apiKey);
+        throw error;
+      }
       throw new UpstreamError('读取上游模型列表失败，请稍后重试。', 'UPSTREAM_CONNECTION_ERROR');
     } finally { await request.cleanup(); }
   }
@@ -72,22 +75,26 @@ function prepareMessages(messages, model, protocol) {
   });
 }
 
-function requestBody({ provider, model, messages, maxOutputTokens, systemPrompt }) {
+function requestBody({ provider, model, messages, maxOutputTokens, systemPrompt, effort = 'auto' }) {
   if (!model?.modelId || typeof model.modelId !== 'string') throw new UpstreamError('请选择有效模型。', 'INVALID_MODEL', 400);
   const limit = Number.isInteger(maxOutputTokens) && maxOutputTokens > 0 ? Math.min(maxOutputTokens, 128_000) : 4096;
   const input = prepareMessages(messages, model, provider.protocol);
+  if (!['auto', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) throw new UpstreamError('思考强度无效。', 'INVALID_EFFORT', 400);
   if (provider.protocol === 'anthropic') return {
     model: model.modelId, messages: input, max_tokens: limit, stream: true,
     ...(systemPrompt ? { system: systemPrompt } : {}),
+    ...(effort !== 'auto' ? { output_config: { effort } } : {}),
   };
   if (provider.protocol === 'openai-responses') return {
     model: model.modelId, input, max_output_tokens: limit, stream: true, store: false,
     ...(systemPrompt ? { instructions: systemPrompt } : {}),
+    ...(effort !== 'auto' ? { reasoning: { effort } } : {}),
   };
   return {
     model: model.modelId,
     messages: [...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []), ...input],
     max_completion_tokens: limit, stream: true, stream_options: { include_usage: true },
+    ...(effort !== 'auto' ? { reasoning_effort: effort } : {}),
   };
 }
 
@@ -215,15 +222,18 @@ export async function* streamReply(options) {
   let finished = false;
   let emittedText = false;
   let usage;
+  let lastPayload;
   try {
     if (!(request.response.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
-      const result = extractJson(await readJson(request.response, 16 * 1024 * 1024), provider.protocol);
+      lastPayload = await readJson(request.response, 16 * 1024 * 1024);
+      const result = extractJson(lastPayload, provider.protocol);
       if (!result.text) throw new UpstreamError('模型没有返回可显示的文本；可能仅返回推理或不支持的内容。', 'EMPTY_UPSTREAM_OUTPUT');
       yield { type: 'delta', text: result.text };
       if (result.usage) yield normalizedUsage(result.usage, provider.protocol);
       return;
     }
     for await (const event of sseEvents(request.response.body)) {
+      lastPayload = event.data;
       if (event.data.trim() === '[DONE]') {
         if (provider.protocol === 'openai-chat') { finished = true; break; }
         continue;
@@ -286,7 +296,17 @@ export async function* streamReply(options) {
     if (usage) yield normalizedUsage(usage, provider.protocol);
   } catch (error) {
     if (request.signal.aborted) throw request.signal.reason;
-    if (error instanceof UpstreamError) throw error;
+    if (error instanceof UpstreamError) {
+      if (error.rawDiagnostic) error.rawDiagnostic = redactDiagnosticObject(error.rawDiagnostic, provider.apiKey);
+      if (lastPayload !== undefined) {
+        const raw = typeof lastPayload === 'string' ? lastPayload : JSON.stringify(lastPayload);
+        error.rawDiagnostic = { status: request.response.status, method: 'POST', protocol: provider.protocol,
+          modelId: options.model.modelId, url: redactRawError(request.response.url, provider.apiKey), headers: {},
+          body: redactRawError(raw.slice(0, 1024 * 1024), provider.apiKey), truncated: raw.length > 1024 * 1024,
+          readNote: '生成结束前最后一条上游响应。' };
+      }
+      throw error;
+    }
     throw new UpstreamError('读取上游响应失败，回复可能不完整，请稍后重试。', 'UPSTREAM_CONNECTION_ERROR');
   } finally { await request.cleanup(); }
 }

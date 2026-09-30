@@ -1,45 +1,292 @@
 # API contract
 
-All responses JSON unless SSE. Error: `{error: string, code?:string}`. Auth session is HttpOnly cookie. Fetch credentials same-origin. GET /api/auth/session returns `{user:null|User, needsSetup:boolean, csrfToken?:string}`. Any mutating authenticated request MUST send `X-CSRF-Token`. Setup/login exempt but Origin enforced. Every endpoint uses user isolation; admin routes role-checked. Models empty until real upstream configuration; no demo replies.
+This document describes the HTTP API implemented by `server/app.mjs`, `server/provider-tools.mjs`, `server/work.mjs`, and `server/billing.mjs`. Paths below include the `/api` prefix. JSON object examples describe fields; a `?` suffix means optional. Downloads and server-sent events (SSE) are exceptions to JSON responses.
 
-User `{id,name,email,role:'admin'|'user',createdAt,disabled?:boolean,dailyLimit?:number}`.
+## Authentication and common behavior
 
-Auth: POST /api/auth/setup `{setupToken,name,email,password}` -> session; POST /api/auth/login `{email,password}` -> session; POST /api/auth/logout; POST /api/auth/password `{currentPassword,newPassword}`. GET /api/auth/invite?token=... -> `{email,expiresAt}`. POST /api/auth/invite/accept `{token,name,email,password}` -> session. Invite token may arrive in URL `?invite=...`. Setup token shown once in server terminal, never exposed by GET API. Password 12–256 chars; user name max60.
+- Sessions use the HttpOnly, SameSite=Strict `apirouter_session` cookie. Browser requests use same-origin credentials.
+- Authenticated mutations require `X-CSRF-Token`, obtained from the session response. Setup, login, invitation acceptance, and the separately verified Stripe webhook are exceptions. Cross-origin mutations are rejected.
+- User-owned chats, uploaded files, and Work artifacts are isolated by owner, including when the caller is an administrator. Administrator permissions do not grant access to another user's files.
+- `/api/admin/*` requires the `admin` role. Skill mutations also require that role although their paths begin with `/api/work/skills`.
+- Errors normally return an appropriate 4xx/5xx status and `{error: string, code?: string}`. A completed administrator model probe returns HTTP 200 with `ok:false` when the upstream probe failed. A balance query can return HTTP 200 with `available:false`.
+- API responses have `Cache-Control: no-store`; streaming responses use `no-cache, no-transform`. Clients must not persist API keys or password fields in local storage.
+- Normal JSON bodies have a 1 MB limit. Provider parse/import request envelopes have an 8 MB limit; pasted configuration text still has its own 2 MB limit. Multipart upload limits are separate.
 
-GET /api/models -> `{models: Model[],defaultModelId:string|null}`. Public Model `{id,providerId,modelId,name,enabled,vision,providerName?,channelCount?,status:'untested'|'ok'|'error',lastCheckedAt?:string|null,error?:string|null}`. Public models are grouped by `routeKey`; `id` is a stable `r_<hash>` route ID and `name`/`modelId` are the route key. Admin model APIs expose individual channel records: their `id` is the database ID and `modelId` is the real upstream name. See the channel routing extension below.
+`User`:
 
-GET /api/chats -> `{chats:Chat[]}`; Chat `{id,title,modelId,createdAt,updatedAt,pinned:boolean,archived:boolean}`.
-POST /api/chats `{modelId?,title?}` -> `{chat}`. GET /api/chats/:id -> `{chat,messages:Message[]}`. PATCH /api/chats/:id `{title?,pinned?,archived?,modelId?}` -> `{chat}`. DELETE /api/chats/:id -> `{ok:true}`.
-Message `{id,role:'user'|'assistant',content,modelId?,createdAt,status:'complete'|'streaming'|'error'|'stopped',attachments:Attachment[],error?:string|null}`.
-Attachment `{id,name,mime,size,kind:'image'|'text',url}`; POST /api/files multipart field `files` -> `{files:Attachment[]}`. Supports jpg/png/webp/gif/txt/md/csv/json/code/pdf/docx/xlsx, max 10MB each, 5 files/request. GET /api/files/:id/download authenticated. DELETE /api/files/:id -> `{ok:true}`.
-POST /api/chats/:id/messages `{content,modelId,attachmentIds?:string[]}` -> SSE.
-POST /api/chats/:id/regenerate `{modelId}` -> SSE (remove last assistant only; reuse last user).
-POST /api/chats/:id/edit `{messageId,content,modelId,attachmentIds?:string[]}` -> SSE (edit user and prune following messages; explicit UI confirmation).
-POST /api/chats/:id/stop -> `{ok:true}`.
-SSE events `meta` data `{userMessage?:Message,assistantMessage:Message,chat:Chat}`; `delta` data `{text}`; `done` data `{message:Message}`; `error` data `{error,message?:Message}`. Frontend AbortController plus stop endpoint. Disconnect aborts chat generation. SSE no fake delays.
+```text
+{id, name, email, role:'admin'|'user', disabled:boolean,
+ dailyLimit:number|null, createdAt}
+```
 
-Admin GET /api/admin/providers -> `{providers:Provider[]}`. Provider `{id,name,baseUrl,protocol:'openai-chat'|'openai-responses'|'anthropic',enabled,hasKey,keyHint,lastSyncedAt,lastSyncError,createdAt}`; never expose API key. POST /api/admin/providers `{name,baseUrl,protocol,apiKey,enabled?}` -> `{provider}`. PATCH /api/admin/providers/:id same optional fields; empty apiKey preserves current. DELETE route -> `{ok:true}`.
-POST /api/admin/providers/:id/sync -> `{models:Model[],count:number}` sync real /models, preserve enabled preferences, mark disappeared auto-synced models unavailable. New synced models disabled pending admin selection; manually added models enabled. Model includes `available:boolean`. GET /api/admin/models -> `{models:Model[],defaultModelId}`. POST /api/admin/models `{providerId,modelId,name?,vision?}` -> `{model}` manual fallback. PATCH /api/admin/models/:id `{name?,enabled?,vision?,isDefault?}` -> `{model}`. DELETE route -> `{ok:true}`. POST /api/admin/models/:id/test -> `{ok:boolean,error?:string,latencyMs:number}` REAL small generation (UI warn consumes tokens).
-GET /api/admin/users -> `{users:User[]}`. PATCH /api/admin/users/:id `{disabled?,dailyLimit?}`. POST /api/admin/invites `{email?,days?:number}` -> `{invite:{id,token,expiresAt}}`. GET /api/admin/invites -> `{invites:[{id,email,expiresAt,usedAt,createdAt}]}`. DELETE /api/admin/invites/:id.
-GET /api/admin/stats -> `{users,chats,messages,requestsToday}`.
-Failed administrator model tests may append a redacted, length-limited JSON upstream diagnostic to the response's `error`. Diagnostics are collected only for this fixed test prompt, returned only in that administrator response, and never persisted in model errors, chat messages, or routing logs. The original upstream HTTP status and retry policy remain unchanged; unsupported/oversized/slow error bodies fall back to the generic error.
-GET /api/settings -> `{settings:{siteName,systemPrompt,defaultModelId,dailyLimit,maxOutputTokens}}`. PATCH /api/admin/settings those fields -> `{settings}`. System prompt visible only to admin. Public settings endpoint should omit systemPrompt for non-admin. siteName max40, dailyLimit 0–100000 (0 forbids new requests), maxOutputTokens 128–32768, chat title max120.
+`Session` is `{user: User|null, needsSetup:boolean, csrfToken?:string}`.
 
-## Channel routing extension
+| Method and path | Input | Response |
+| --- | --- | --- |
+| GET `/api/health` | — | `{ok:true}` |
+| GET `/api/auth/session` | — | `Session` |
+| POST `/api/auth/setup` | `{setupToken,name,email,password}` | `Session`, 201 |
+| POST `/api/auth/login` | `{email,password}` | `Session` |
+| POST `/api/auth/logout` | — | `{ok:true}` |
+| POST `/api/auth/password` | `{currentPassword,newPassword}` | `{ok:true}` |
+| GET `/api/auth/invite?token=...` | Invitation token | `{email,expiresAt}` |
+| POST `/api/auth/invite/accept` | `{token,name,email,password}` | `Session`, 201 |
 
-Provider fields and POST/PATCH inputs add `priority` (0–1000, default0), `failureThreshold` (1–10, default3), `cooldownSeconds` (5–86400, default60), `authMode` ('auto'|'bearer'|'x-api-key', default'auto'). Admin models expose `routeKey`, `failureCount`, `cooldownUntil`. Model POST/PATCH accept `routeKey` (max300, defaults to upstream modelId); same key defines equivalent upstream models. Public `/models` groups by routeKey, uses stable `r_<hash>` IDs, exposes `channelCount` and routeKey as name. Admin model APIs continue using database IDs; old internal chat IDs remain accepted. Public default ID normalized to route ID.
+The setup token is shown in the server startup output and is never exposed by a GET endpoint. Passwords must be 12–256 characters; user names have a 60-character limit. Invitation URLs may carry `?invite=...` for the frontend.
 
-Settings add `routingMaxAttempts` (1–10, default6), `retriesPerChannel` (0–3, default1). POST /api/admin/models/:id/reset-health clears count/cooldown. GET /api/admin/routing-logs -> `{attempts:[{id,requestId,providerName,modelId,outcome,error,createdAt}]}` newest200 (outcome running/complete/error/stopped). SSE additionally emits `routing` data `{message:string}` before retries/switches. Message adds `sourceProvider` and `sourceModel` (actual selected source, informational). No automatic cross-route model downgrade; no switch after first visible text.
+## Public models and channel privacy
+
+`GET /api/models` returns `{models:PublicModel[],defaultModelId:string|null}`. Models are filtered by the user's effective plan. There are no built-in demonstration models or simulated production replies.
+
+```text
+PublicModel = {
+  id, name, modelId, routeKey,
+  vision:boolean, enabled:true, status:'untested'|'ok'|'error',
+  modes:('chat'|'work')[], reasoningEfforts:string[]
+}
+```
+
+An administrator-defined `routeKey` groups equivalent upstream models. The public ID is a stable `r_<hash>` route ID; `name`, `modelId`, and `routeKey` use the unified route name. This endpoint does not expose provider IDs, provider names, base URLs, channel counts, credentials, or the actual upstream model selected for a response. `Message` likewise omits `sourceProvider` and `sourceModel`.
+
+`reasoningEfforts` always includes `auto`, followed by configured levels supported by at least one enabled channel. Other accepted levels are `low`, `medium`, `high`, `xhigh`, and `max`. Advertised levels are administrator configuration, not a guarantee that an upstream accepts them. A request filters candidate channels by its chosen effort and mode. Unsupported combinations fail before generation.
+
+`modes` includes `work` when the runner is configured and the route has an eligible Anthropic channel. Check `/api/work/capabilities` as well: configured does not mean Docker is healthy or Work is currently enabled. Legacy internal model IDs are accepted for existing integrations, but new clients should use public route IDs.
+
+## Chats, messages, and uploads
+
+```text
+Chat = {id,title,modelId,mode:'chat'|'work',effort,skillIds:string[],
+        webSearch:boolean,pinned:boolean,archived:boolean,createdAt,updatedAt}
+Message = {id,role:'user'|'assistant',content,modelId,createdAt,
+           status:'complete'|'streaming'|'error'|'stopped',
+           attachments:Attachment[],error:string|null}
+Attachment = {id,name,mime,size,kind:'image'|'text',url}
+```
+
+Execution fields accepted when creating, updating, or generating a chat:
+
+```text
+{mode?:'chat'|'work', effort?:'auto'|'low'|'medium'|'high'|'xhigh'|'max',
+ skillIds?:string[], webSearch?:boolean}
+```
+
+Defaults are `chat`, `auto`, `[]`, and `false`; generation otherwise inherits saved chat settings. At most 10 skill IDs can be selected through the chat API. Choosing Chat clears skill selection and disables search. Updating an active chat requires stopping its current reply first.
+
+| Method and path | Input | Response |
+| --- | --- | --- |
+| GET `/api/chats` | — | `{chats:Chat[]}` |
+| POST `/api/chats` | `{modelId?,title?,...execution}` | `{chat}`, 201 |
+| GET `/api/chats/:id` | — | `{chat,messages:Message[]}` |
+| PATCH `/api/chats/:id` | `{title?,pinned?,archived?,modelId?,...execution}` | `{chat}` |
+| DELETE `/api/chats/:id` | — | `{ok:true}` |
+| POST `/api/chats/:id/messages` | `{content,modelId?,attachmentIds?:string[],...execution}` | SSE |
+| POST `/api/chats/:id/regenerate` | `{modelId?,...execution}` | SSE |
+| POST `/api/chats/:id/edit` | `{messageId,content,modelId?,attachmentIds?:string[],...execution}` | SSE |
+| POST `/api/chats/:id/stop` | — | `{ok:true}` |
+| POST `/api/files` | Multipart field `files` | `{files:Attachment[]}` |
+| GET `/api/files/:id/download` | — | Authenticated file body |
+| DELETE `/api/files/:id` | — | `{ok:true}` |
+
+Editing replaces the selected user message and removes all later messages. Regeneration removes messages after the most recent user message and generates again. Clients should make this consequence clear before an edit. Chat deletion also deletes its Work artifacts and releases unreferenced upload attachments.
+
+Uploads accept PNG/JPEG/WebP/GIF images, UTF-8 text/code, text PDFs, DOCX text, and XLSX cells. Limits are 10 MB per file and five files per request. PDF OCR, Office macros, and spreadsheet formula execution are not provided by upload parsing. Upload storage is limited to 200 MB and 500 files per user. See the deployment documentation for parsing boundaries.
+
+### SSE events
+
+A streaming request may first fail with ordinary JSON before SSE headers are sent. Once streaming begins, parse the named events below; do not assume each network chunk is a complete event.
+
+| Event | JSON data | Meaning |
+| --- | --- | --- |
+| `meta` | `{userMessage?:Message,assistantMessage:Message,chat:Chat}` | Saved conversation and initial reply |
+| `delta` | `{text:string}` | Append visible assistant text |
+| `routing` | `{message:string}` | Generic reconnect/retry notice, without channel identity |
+| `activity` | `{label:string}` | Work tool activity such as writing a file or delegating a task |
+| `artifact` | `{artifact:WorkArtifact}` | A file was actually saved and is available to download |
+| `done` | `{message:Message}` | Final saved reply, including `stopped` replies |
+| `error` | `{error:string,message?:Message}` | Failed reply with any partial content |
+
+SSE comment heartbeats are sent while waiting. Browser disconnects abort generation; explicit stop is also supported. Activity labels do not contain tool arguments, credential values, or private chain-of-thought. Ordinary users receive generic generation errors; administrators inspect detailed failures through the administrator endpoints below.
+
+Chat with a direct API channel calls its selected protocol. Chat with a `claude-code` channel uses the runner with tools disabled. Work uses Claude Code through eligible Anthropic channels, even if the provider normally uses direct API for Chat. Work artifacts and activities have their own events; writing code in a text reply alone does not create a downloadable file.
+
+## Administrator connections and models
+
+`Provider` returned by list/create/update contains:
+
+```text
+{id,name,baseUrl,protocol:'openai-chat'|'openai-responses'|'anthropic',
+ runtime:'api'|'claude-code',enabled,hasKey,keyHint,lastSyncedAt,lastSyncError,
+ createdAt,priority,failureThreshold,cooldownSeconds,authMode}
+```
+
+Ordinary provider CRUD responses never contain the full saved API key. Parse previews echo only the submitted configuration to an administrator; authenticated export is the explicit exception for saved keys.
+
+| Method and path | Input | Response |
+| --- | --- | --- |
+| GET `/api/admin/providers` | — | `{providers:Provider[]}` |
+| POST `/api/admin/providers` | `{name,baseUrl,protocol,apiKey,enabled?,runtime?,authMode?,priority?,failureThreshold?,cooldownSeconds?}` | `{provider}`, 201 |
+| PATCH `/api/admin/providers/:id` | Optional create fields | `{provider}` |
+| DELETE `/api/admin/providers/:id` | — | `{ok:true}` |
+| POST `/api/admin/providers/:id/sync` | — | `{models:AdminModel[],count:number}` |
+| GET `/api/admin/models` | — | `{models:AdminModel[],defaultModelId}` |
+| POST `/api/admin/models` | `{providerId,modelId,name?,routeKey?,vision?,reasoningEfforts?}` | `{model}`, 201 |
+| PATCH `/api/admin/models/:id` | `{name?,routeKey?,enabled?,vision?,reasoningEfforts?,isDefault?}` | `{model}` |
+| DELETE `/api/admin/models/:id` | — | `{ok:true}` |
+| POST `/api/admin/models/:id/test` | — | `{ok:boolean,latencyMs:number,error?:string,diagnostic?:object}` |
+| POST `/api/admin/models/:id/reset-health` | — | `{model}` |
+
+An empty `apiKey` in PATCH preserves the saved key. Allowed authentication modes are `auto`, `bearer`, and `x-api-key`. `claude-code` requires `anthropic` protocol and a configured runner. API base URLs must be public HTTPS addresses without embedded credentials, query strings, or fragments. A loopback-only exception exists for explicitly enabled local tests.
+
+`AdminModel` is a channel record with `{id,providerId,providerName,modelId,name,routeKey,reasoningEfforts,enabled,vision,available,status,lastCheckedAt,error,failureCount,cooldownUntil}`. Its ID is the database model ID, and its `modelId` is the exact upstream model name. The model page groups these records by `routeKey`; the API still returns the individual channel records.
+
+Sync queries the upstream's actual model list, preserves existing administrator choices, disables new records pending selection, and marks disappeared non-manual records unavailable. Manual records remain available and are enabled on creation. A test performs a small real generation and can consume upstream credits; it does not test the entire Work toolchain. Stored `reasoningEfforts` contains the explicit non-`auto` levels; an empty array permits only automatic effort.
+
+### Routing and original failure diagnostics
+
+Provider defaults and ranges: priority 0 (0–1000), failure threshold 3 (1–10), cooldown 60 seconds (5–86400). Workspace routing defaults are six total attempts (1–10) and one extra attempt on the same channel (0–3). Only channels within the same unified route are candidates. Invalid payloads are not retried across paid providers. Failover stops after visible response text or a committed Work tool action/artifact, preventing duplicate execution.
+
+`GET /api/admin/routing-logs` returns the newest 200 attempts:
+
+```text
+{attempts:[{id,requestId,providerName,modelId,
+ outcome:'running'|'complete'|'error'|'stopped',error,createdAt,hasDetail:boolean}]}
+```
+
+`GET /api/admin/routing-logs/:id/detail` returns `{detail:object}` or 404 if the original diagnostic is absent or has been removed. Detail is administrator-only, encrypted in the database, and never included in ordinary chat responses. Completed logs are pruned to a recent bounded history; in-flight attempts are retained until completion.
+
+Details can contain HTTP status, method, request URL, protocol, model ID, selected response headers, response body, `truncated`, and `readNote`; runner errors may have runtime-specific fields. Known API credentials are redacted. This preserves the original error text where available, including HTML as inert text, but is not an unlimited byte-for-byte packet capture: direct upstream error reads are capped at 1 MB and two seconds. An early-ended SSE error body or oversized body is marked accordingly. Never render a diagnostic body as executable HTML.
+
+Administrator model test responses may contain `diagnostic` with a structured explanation and `raw` detail. When raw details are available, the failed probe also creates an encrypted routing-log entry. Model status/errors contain only the safe summary. A successful test clears model failure/cooldown state.
+
+## Provider paste, backup, and balance
+
+All endpoints in this section require administrator authentication; mutations also require CSRF. Parse/import/balance mutations share a 20-per-minute limiter. Export has a separate five-per-15-minutes verification limit, in addition to the general API limiter.
+
+### Parse and import
+
+`POST /api/admin/providers/parse` accepts `{text:string,password?:string}` and returns `{providers:ImportProvider[],warnings:string[]}`. Parsing is local to the application server: it performs no upstream request and saves nothing.
+
+Accepted text formats include:
+
+```json
+{"_type":"newapi_channel_conn","key":"sk-XXX","url":"https://xxx.com"}
+```
+
+Also supported: an array of connection objects; OpenAI or Anthropic environment-variable assignments; Claude Code `{env:{...}}` settings; one unambiguous URL plus an `sk-...` key; and plain or encrypted APIRouter exports. Conflicting keys/URLs, malformed JSON, unsupported formats, and invalid addresses are rejected without echoing credentials in errors. The AnyRouter hostname suggests Anthropic/Bearer/Claude Code defaults in the editable preview; this is not a connectivity test.
+
+```text
+ImportProvider = {
+ name,baseUrl,apiKey,protocol,runtime,authMode,enabled,
+ priority,failureThreshold,cooldownSeconds,
+ balanceAdapter:'none'|'newapi'|'openai-compatible',
+ models:[{modelId,name,routeKey,enabled,vision,manual,available,reasoningEfforts}]
+}
+```
+
+`POST /api/admin/providers/import` accepts `{providers:ImportProvider[]}` and returns `{added,skipped,modelsAdded}`. The whole batch is validated before a transaction. Duplicate normalized URL/key/protocol combinations are skipped, including duplicates within the submitted batch; existing connections are not overwritten. Keys are encrypted for storage. Model mappings are restored with untested health state. Limits: 1–100 providers, up to 5000 model mappings per provider and 10000 per batch. Large backups must fit these import limits.
+
+### Save all connections locally
+
+`POST /api/admin/providers/export` accepts:
+
+```text
+{format:'plain'|'encrypted',currentPassword:string,password?:string}
+```
+
+`currentPassword` verifies the currently logged-in administrator before any saved keys are returned. `password` is the backup passphrase for encrypted exports and must be 12–1024 characters. Incorrect reauthentication returns 403. Responses are JSON attachments with `Cache-Control: no-store`; the browser UI saves them as a local download.
+
+Plain exports have `{_type:'apirouter_provider_export',version:1,encrypted:false,exportedAt,providers:[...]}` and include complete API keys, provider configuration, balance adapter choices, and model mappings. They do not include users, conversations, billing credentials, or transient balance/error history.
+
+Encrypted exports have the same `_type` and version, `encrypted:true`, and a versioned envelope containing `kdf` and `cipher` fields. The implementation uses scrypt (`N=32768,r=8,p=1`, random salt) and AES-256-GCM with a random nonce and authentication tag. Decryption accepts only the supported fixed parameters. Supply the encrypted file text and backup password to `/parse`, review the result, then call `/import` to restore it. Lost passphrases cannot be recovered by the server.
+
+### Balance adapters
+
+`GET /api/admin/providers/:id/balance` returns `{adapter,balance:Balance|null}` from cache without contacting the upstream.
+
+`POST /api/admin/providers/:id/balance` accepts `{adapter:'none'|'newapi'|'openai-compatible',refresh?:boolean}`. It saves the choice; only `refresh:true` requests a balance. Selecting `none` never sends an upstream query. Concurrent queries for the same provider are rejected. A changed base URL or key invalidates cached results.
+
+```text
+Balance = {available:boolean,adapter,checkedAt,message,
+ remaining?:number|null,used?:number,granted?:number,unit?:string,
+ unlimited?:boolean,expiresAt?:string|null,modelLimits?:string[],
+ periodStart?:string,upstreamStatus?:number}
+```
+
+The explicit `newapi` adapter queries the fixed `/api/usage/token/` endpoint using the saved key in a Bearer header. A configured reverse-proxy path prefix is preserved. It returns raw token quota (`unit:'quota'`), with `remaining:null` for unlimited quota. Token quota is not necessarily the account cash balance. See the [New API token usage contract](https://doc.newapi.pro/en/api/token-usage/).
+
+The explicit `openai-compatible` adapter queries the fixed legacy `/dashboard/billing/subscription` and `/dashboard/billing/usage` paths, using the current UTC month's start and the next UTC date for the usage query. It computes `hard_limit_usd - total_usage / 100`, but labels the result `provider-units`: compatible gateways can use their own display unit and accounting period, despite the historical field names. See the [New API billing implementation](https://github.com/QuantumNous/new-api/blob/main/controller/billing.go).
+
+Only the configured provider origin and service prefix are used. URLs are DNS-checked and pinned; private/reserved destinations and redirects are rejected. No arbitrary balance URL can be supplied. Unsupported, inaccessible, or malformed responses produce `available:false` with an explanation, not a fabricated zero balance. Clients should offer manual refresh and display the query timestamp.
+
+## Work capabilities, skills, and artifacts
+
+`GET /api/work/capabilities` requires a session and returns:
+
+```text
+{available:boolean,reason:string|null,runtime:'claude-code',skills:Skill[],
+ tools:string[],webSearchSupported:true,webSearchNote:string,limits:WorkSettings}
+```
+
+`available` checks configuration, the administrator's enabled flag, and runner health; health is briefly cached. The `webSearchSupported` flag means the integration offers a WebSearch option. Actual search availability depends on the selected upstream channel and model. It is not a general-purpose unrestricted browser API.
+
+`Skill` is `{id,name,description,createdAt,updatedAt,content?:string}`. Skills are workspace-wide administrator-managed Markdown instructions, not arbitrary installed application plugins.
+
+| Method and path | Access / input | Response |
+| --- | --- | --- |
+| GET `/api/work/skills` | Signed in | `{skills:Skill[]}`; full content only for admins in this list |
+| POST `/api/work/skills` | Admin; `{name?,description?,content?,url?}` | `{skill}`, 201 |
+| PATCH `/api/work/skills/:id` | Admin; same optional fields | `{skill}` |
+| DELETE `/api/work/skills/:id` | Admin | `{ok:true}` |
+| GET `/api/work/skills/:id/download` | Signed in | Markdown attachment named `<name>-SKILL.md` |
+| GET `/api/work/chats/:id/artifacts` | Chat owner | `{artifacts:WorkArtifact[]}` |
+| GET `/api/work/artifacts/:id/download` | Artifact owner | File attachment |
+| GET `/api/admin/work/settings` | Admin | Work status, settings, and bounds |
+| PATCH `/api/admin/work/settings` | Admin; partial `WorkSettings` | Updated status, settings, and bounds |
+
+A skill can be submitted as Markdown or downloaded from a final public HTTPS raw-file URL. Metadata may be read from front matter and explicitly overridden. Skill names use 1–64 lowercase letters, digits, and hyphens; descriptions have a 500-character limit; content is limited to 64 KB; at most 32 skills are installed. URL imports reject private addresses, redirects, and HTML pages. Imports rebuild front matter and reject dynamic `!` plus backtick command syntax; they do not install hooks, MCP servers, executable packages, or referenced auxiliary files.
+
+`WorkArtifact` is `{id,name,size,mime,createdAt,downloadUrl}`. The runner must actually create a file under its output directory before the server stores and exposes an artifact. Downloads use attachment disposition and restrictive response headers; HTML/SVG content is not executed by the artifact endpoint. A task can return up to 30 files, 10 MB each and 30 MB total. Saved Work artifact storage is separately limited to 500 files and 200 MB per user. Replacing an output path in the same chat replaces its saved artifact. Deleting that chat deletes its saved artifacts.
+
+Work settings responses are `{configured,...capabilities,settings:WorkSettings,limits:Bounds}`. Here `limits` contains bounds, overriding the current-value `limits` field used by the capabilities endpoint. Runner URL and authentication token are deployment configuration, not browser-editable fields.
+
+| Work setting | Default | Accepted range |
+| --- | --- | --- |
+| `enabled` | `true` | Boolean |
+| `maxTurns` | 20 | 1–80 |
+| `timeoutSeconds` | 600 | 30–1800 |
+| `memoryMb` | 768 | 512–4096 |
+| `cpus` | 1 | 0.25–4 |
+| `maxBudgetUsd` | 2 | 0.1–20 |
+| `maxConcurrentJobs` | 2 | 1–4 |
+
+Unknown settings are rejected. `maxBudgetUsd` is a Claude Code execution budget, not a prepaid balance reservation or a guarantee about a third-party provider's billing. The application's outer streaming deadline uses the configured runner timeout plus 60 seconds for runner-backed requests; direct API requests retain a ten-minute outer limit. Work job submission is integrated into chat generation; there is no public standalone `/jobs` API or durable background-task API. See [WORK.md](WORK.md) for runner deployment and sandbox boundaries.
+
+## Workspace settings, users, and invitations
+
+`GET /api/settings` returns `{settings}`. Non-admin responses omit `systemPrompt`. Workspace settings include `siteName`, `defaultModelId`, `dailyLimit`, `maxOutputTokens`, `routingMaxAttempts`, and `retriesPerChannel`; stored `workSettings` can also appear. Billing secrets and provider keys are not stored in these public settings.
+
+`PATCH /api/admin/settings` accepts workspace fields above plus `systemPrompt`; use the dedicated Work endpoint to modify runner limits. `siteName` has a 40-character limit, `systemPrompt` 20000 characters, daily quota 0–100000 (zero disables new requests), and direct-API output limit 128–32768. Chat titles have a 120-character limit.
+
+| Method and path | Input | Response |
+| --- | --- | --- |
+| GET `/api/admin/users` | — | `{users:User[]}` |
+| PATCH `/api/admin/users/:id` | `{disabled?,dailyLimit?:number|null}` | `{user}` |
+| GET `/api/admin/invites` | — | `{invites:[{id,email,expiresAt,usedAt,createdAt}]}` |
+| POST `/api/admin/invites` | `{email?,days?:number}` | `{invite:{id,token,expiresAt}}`, 201 |
+| DELETE `/api/admin/invites/:id` | — | `{ok:true}` |
+| GET `/api/admin/stats` | — | `{users,chats,messages,requestsToday}` |
+
+Invitation validity is 1–30 days, default seven. Administrators cannot be disabled through the user endpoint. Disabling a member ends their sessions and active requests. Explicit daily limits override membership; `dailyLimit:null` restores plan/free limits.
 
 ## Membership and billing
 
-`GET /api/billing` returns `{plans,freePlan,membership,requests,paymentMethods:{stripe,manual},canManageSubscription,canRequestManual,effectiveDailyLimit}`. Membership is null when expired. Plans contain `{id,name,description,priceCents,currency,interval,dailyLimit,allowedRoutes,active,allowStripe,allowManual,sortOrder}`; currency USD/CNY/EUR/HKD, interval month/year, allowedRoutes are route keys (empty = all). Admins bypass model restrictions but not quota. Explicit user `dailyLimit` overrides membership; PATCH `/api/admin/users/:id` with `dailyLimit:null` restores plan/free quota.
+`GET /api/billing` returns `{plans,freePlan,membership,requests,paymentMethods:{stripe,manual},canManageSubscription,canRequestManual,effectiveDailyLimit}`. Membership is null when expired. Plans contain `{id,name,description,priceCents,currency,interval,dailyLimit,allowedRoutes,active,allowStripe,allowManual,sortOrder}`; currency is USD/CNY/EUR/HKD, interval is month/year, and `allowedRoutes` contains route keys (empty means all). Administrators bypass model restrictions but not quota.
 
-- POST `/api/billing/requests` `{planId,note?}` -> `{request}`; only one pending per user. Sole enabled admin cannot submit an unreviewable manual application.
-- POST `/api/billing/checkout` `{planId}` and `/api/billing/portal` -> `{url}`. Server prices and official Stripe HTTPS destinations only.
-- GET/POST `/api/admin/plans`, PATCH `/api/admin/plans/:id`; existing purchase/application terms are snapshots. Disable plans instead of deleting purchase history.
-- GET `/api/admin/billing/requests`; POST `/api/admin/billing/requests/:id/review` `{decision:'approve'|'reject',note?}` -> `{request}`. No self-review or duplicate approval.
-- GET/PATCH `/api/admin/billing/settings` uses `{stripeEnabled,freeAllowedRoutes,secretKey?,webhookSecret?}`; GET exposes hints/has-key flags and webhookUrl only. Blank keys retain stored secrets; billing configuration is never stored in public workspace settings.
-- POST `/api/billing/webhook` is raw JSON with Stripe-Signature verification, before session/CSRF middleware. Events: checkout.session.completed / async_payment_succeeded, customer.subscription.created / updated / deleted, invoice.paid / payment_failed. Browser redirects never grant access.
+- POST `/api/billing/requests` `{planId,note?}` returns `{request}`. Only one pending request per user; the sole enabled administrator cannot submit an application requiring their own approval.
+- POST `/api/billing/checkout` `{planId}` and `/api/billing/portal` return `{url}`. The server chooses prices and validates official Stripe destinations.
+- GET/POST `/api/admin/plans` and PATCH `/api/admin/plans/:id` manage plans. Existing purchase/application terms are snapshots; disable plans rather than deleting purchase history.
+- GET `/api/admin/billing/requests`; POST `/api/admin/billing/requests/:id/review` `{decision:'approve'|'reject',note?}` returns `{request}`. Self-review and duplicate approvals are rejected.
+- GET/PATCH `/api/admin/billing/settings` uses `{stripeEnabled,freeAllowedRoutes,secretKey?,webhookSecret?}`. GET exposes only key hints/presence flags and the webhook URL; blank keys preserve saved secrets.
+- POST `/api/billing/webhook` accepts raw JSON with Stripe-Signature verification before session/CSRF middleware. Supported events include checkout completion/async payment success, subscription created/updated/deleted, and invoice paid/payment failed. Browser redirects never grant access.
 
-See `MEMBERSHIP.md` for deployment, lifecycle, and supported subscription operations.
+See [MEMBERSHIP.md](MEMBERSHIP.md) for deployment and subscription lifecycle details.

@@ -78,33 +78,24 @@ function raceAbort(promise, signal) {
   });
 }
 
-// Only fixed administrator probes opt in. Never collect arbitrary chat error bodies.
-async function adminErrorDetail(response, apiKey, signal) {
-  if (!/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')) return;
-  const limit = 64 * 1024;
-  if (Number(response.headers.get('content-length')) > limit || !response.body) return;
-  const budget = new AbortController();
-  const timer = setTimeout(() => budget.abort(), 2000);
-  timer.unref?.();
-  const readSignal = AbortSignal.any([signal, budget.signal]);
-  const reader = response.body.getReader();
-  try {
-    let length = 0;
-    const chunks = [];
-    while (true) {
-      const { done, value } = await raceAbort(reader.read(), readSignal);
-      if (done) break;
-      length += value.byteLength;
-      if (length > limit) return;
-      chunks.push(value);
-    }
-    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-    const error = parsed.error;
-    const fields = error && typeof error === 'object' && !Array.isArray(error)
-      ? [error.type, error.code, error.message]
-      : [parsed.type, parsed.code, typeof error === 'string' ? error : parsed.message];
-    let detail = [...new Set(fields.filter(value => typeof value === 'string' && value.trim()))].join(' · ');
+export function redactRawError(value, apiKey) {
+  let text = typeof value === 'string' ? value : '';
+  const secrets = [apiKey, encodeURIComponent(apiKey), JSON.stringify(apiKey).slice(1, -1), Buffer.from(apiKey).toString('base64')];
+  for (const secret of secrets.sort((a,b) => b.length - a.length)) if (secret) text = text.split(secret).join('[API KEY REDACTED]');
+  return text.replace(/\b(?:Bearer|Basic)\s+[^\s,;"']+/gi, '[AUTH REDACTED]')
+    .replace(/\b(?:sk|rk|pk|whsec|sess)[-_][\w.-]+/gi, '[KEY REDACTED]');
+}
+
+export function redactDiagnosticObject(value, apiKey) {
+  if (typeof value === 'string') return redactRawError(value, apiKey);
+  if (Array.isArray(value)) return value.map(item => redactDiagnosticObject(item, apiKey));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactDiagnosticObject(item, apiKey)]));
+  return value;
+}
+
+function redactDiagnosticText(value, apiKey) {
+    if (typeof value !== 'string') return;
+    let detail = value;
     // Do not echo error pages or stack traces, even when mislabeled as JSON.
     if (!detail || /<\/?[a-z!][^>]*>|\b(?:stack\s*trace|traceback)\b|\n\s*at\s+\S+/i.test(detail)) return;
     const secrets = [apiKey, encodeURIComponent(apiKey), JSON.stringify(apiKey).slice(1, -1), Buffer.from(apiKey).toString('base64')];
@@ -119,10 +110,100 @@ async function adminErrorDetail(response, apiKey, signal) {
       .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, ' ')
       .replace(/\s+/g, ' ').trim();
     return detail.length > 600 ? `${detail.slice(0, 600)}…` : detail || undefined;
+}
+
+function jsonErrorFields(parsed) {
+  if (typeof parsed === 'string') return parsed;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '';
+  const error = parsed.error;
+  const fields = error && typeof error === 'object' && !Array.isArray(error)
+    ? [error.type, error.code, error.message, error.msg, error.detail, error.error_description]
+    : [parsed.type, parsed.code, typeof error === 'string' ? error : null, parsed.message, parsed.msg, parsed.detail, parsed.error_description];
+  return [...new Set(fields.filter(value => typeof value === 'string' && value.trim()))].join(' · ');
+}
+
+function describeErrorBody(raw, contentType, apiKey) {
+  const text = raw.trim();
+  if (!text) return { responseFormat: 'empty', note: '上游错误响应没有正文，未提供具体原因。' };
+  // Classify browser challenges; never run their scripts or echo their contents.
+  if (contentType.includes('text/html') || /^<(?:!doctype|html|head|body|script)\b/i.test(text)) {
+    const challenge = /acw_sc__v2|cf-chl-|challenge-platform|captcha|document\.cookie/i.test(text);
+    return { responseFormat: 'html', note: challenge
+      ? '上游返回浏览器验证页面，未返回 API 错误说明。请向服务商确认允许服务器直接调用的 API 入口或放行方式。'
+      : '上游返回 HTML 错误页，未返回 API 错误说明。请核对 API 入口及服务商网关状态。' };
+  }
+  let fields;
+  let responseFormat = 'json';
+  try { fields = jsonErrorFields(JSON.parse(text)); }
+  catch {
+    if (contentType.includes('text/event-stream') || /(?:^|\n)data:/.test(text)) {
+      responseFormat = 'sse';
+      const frames = text.split(/\r?\n\r?\n/);
+      for (const frame of frames) {
+        const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+        try { fields = jsonErrorFields(JSON.parse(data)); } catch { continue; }
+        if (fields) break;
+      }
+    } else if (contentType.includes('json') || /^[{[]/.test(text)) {
+      return { responseFormat: 'invalid-json', note: '上游返回的错误正文不是有效 JSON，无法提取错误说明。' };
+    } else if (!contentType || contentType.startsWith('text/plain')) {
+      responseFormat = 'text';
+      fields = text;
+    } else return { responseFormat: 'unknown', note: '上游错误响应使用了未支持的格式，未显示原始内容。' };
+  }
+  const detail = redactDiagnosticText(fields, apiKey);
+  return { responseFormat, ...(detail ? { detail } : {}), note: detail
+    ? '以下为上游返回的说明，已脱敏并限制长度。'
+    : '错误正文没有可显示的说明字段，或包含已隐藏的页面、堆栈内容。' };
+}
+
+// The full bounded response is retained only for encrypted administrator audit logs.
+async function adminErrorDetail(response, apiKey, signal, rawTarget) {
+  const limit = 1024 * 1024;
+  if (!response.body) return { responseFormat: 'empty', note: '上游错误响应没有正文，未提供具体原因。' };
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+  const budget = new AbortController();
+  const timer = setTimeout(() => budget.abort(), 2000);
+  timer.unref?.();
+  const readSignal = AbortSignal.any([signal, budget.signal]);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let length = 0;
+  let readNote = '';
+  let truncated = false;
+  try {
+    while (true) {
+      const { done, value } = await raceAbort(reader.read(), readSignal);
+      if (done) break;
+      if (length + value.byteLength > limit) {
+        chunks.push(value.slice(0, limit - length));
+        truncated = true; readNote = '原始错误超过 1 MB，已截断。';
+        return { responseFormat: 'too-large', note: readNote };
+      }
+      length += value.byteLength;
+      chunks.push(value);
+      // Error SSE streams may stay open after the first complete error frame.
+      if (contentType.includes('text/event-stream')) {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        const boundary = /\r?\n\r?\n/.exec(raw);
+        if (boundary) {
+          const result = describeErrorBody(raw.slice(0, raw.lastIndexOf(boundary[0]) + boundary[0].length), contentType, apiKey);
+          if (result.detail) { truncated = true; readNote = '保留首个完整错误事件；事件流随后已关闭。'; return result; }
+        }
+      }
+    }
+    const raw = Buffer.concat(chunks).toString('utf8');
+    // Structured preview is shorter than the original body retained for administrators.
+    if (length > 64 * 1024) return { responseFormat: 'too-large', note: '错误正文超过 64 KB，请查看原始报错信息。' };
+    return describeErrorBody(raw, contentType, apiKey);
   } catch {
     // Diagnostics are best effort; the original HTTP error must keep its routing semantics.
-    return;
+    truncated = true;
+    readNote = budget.signal.aborted ? '读取上游错误正文超时（2 秒），保留已收到的内容及 HTTP 状态。' : '上游错误正文读取中断，保留已收到的内容。';
+    return { responseFormat: budget.signal.aborted ? 'timeout' : 'unreadable', note: readNote };
   } finally {
+    if (rawTarget) Object.assign(rawTarget, { body: redactRawError(Buffer.concat(chunks).toString('utf8'), apiKey), truncated, readNote,
+      headers: Object.fromEntries(['content-type', 'x-request-id', 'request-id', 'server'].map(key => [key, redactRawError(response.headers.get(key) || '', apiKey)]).filter(([,value]) => value)) });
     clearTimeout(timer);
     try { await reader.cancel(); } catch { /* The connection may already be closed. */ }
     reader.releaseLock();
@@ -200,7 +281,21 @@ export async function openUpstream(provider, endpoint, { signal, body, query, ti
         : response.status === 404 ? '请检查 API 基础地址、协议和模型名称。'
           : response.status === 429 ? '额度不足或请求过多，请稍后重试。' : '请稍后重试或检查服务商状态。';
       const error = new UpstreamError(`上游请求失败（HTTP ${response.status}）。${detail}`, 'UPSTREAM_HTTP_ERROR', 502, response.status);
-      if (diagnostics) error.adminDetail = await adminErrorDetail(response, provider.apiKey, effectiveSignal);
+      const raw = { status: response.status, method: body ? 'POST' : 'GET', url: redactRawError(url.toString(), provider.apiKey),
+        protocol: provider.protocol, modelId: body?.model || '', body: '', headers: {}, truncated: false, readNote: '' };
+      const description = await adminErrorDetail(response, provider.apiKey, effectiveSignal, raw);
+      error.rawDiagnostic = raw;
+      if (diagnostics) {
+        error.adminDetail = description.detail;
+        error.adminDiagnostic = {
+          version: 2, protocol: provider.protocol,
+          authMode: authMode === 'auto' ? provider.protocol === 'anthropic' ? 'x-api-key' : 'bearer' : authMode,
+          method: body ? 'POST' : 'GET', path: redactDiagnosticText(url.pathname, provider.apiKey) || '[路径已隐藏]',
+          modelId: redactDiagnosticText(body?.model, provider.apiKey) || '', upstreamStatus: response.status,
+          ...description,
+          requestId: redactDiagnosticText(response.headers.get('x-request-id') || response.headers.get('request-id'), provider.apiKey),
+        };
+      }
       throw error;
     }
     return { response, signal: effectiveSignal, cleanup };
@@ -221,6 +316,8 @@ export async function readJson(response, maxBytes = 4 * 1024 * 1024) {
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {
-    throw new UpstreamError('上游未返回有效的 JSON，请检查所选 API 协议。', 'INVALID_UPSTREAM_RESPONSE');
+    const error = new UpstreamError('上游未返回有效的 JSON，请检查所选 API 协议。', 'INVALID_UPSTREAM_RESPONSE');
+    error.rawDiagnostic = { status: response.status, body: Buffer.concat(chunks).subarray(0, 1024 * 1024).toString('utf8'), truncated: length > 1024 * 1024, readNote: '上游未返回有效 JSON。' };
+    throw error;
   }
 }

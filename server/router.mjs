@@ -3,13 +3,13 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { streamReply, UpstreamError, sanitizeUpstreamError } from './upstream.mjs';
 
 const selection = `SELECT m.*,p.name AS provider_name,p.base_url,p.protocol,p.encrypted_key,
-  p.priority,p.failure_threshold,p.cooldown_seconds,p.auth_mode,p.enabled AS provider_enabled
+  p.priority,p.failure_threshold,p.cooldown_seconds,p.auth_mode,p.runtime,p.enabled AS provider_enabled
   FROM models m JOIN providers p ON p.id=m.provider_id`;
 const nonChannelErrors = new Set([
   'INVALID_BASE_URL', 'BLOCKED_UPSTREAM_ADDRESS', 'INVALID_PROTOCOL', 'INVALID_AUTH_MODE',
   'MISSING_API_KEY', 'INVALID_MESSAGES', 'INVALID_ATTACHMENT', 'VISION_UNSUPPORTED',
   'INVALID_MODEL', 'UNSUPPORTED_TOOL_CALL', 'UNSUPPORTED_OUTPUT', 'OUTPUT_LIMIT_REACHED',
-  'UPSTREAM_CONTENT_FILTER', 'UPSTREAM_RESPONSE_TOO_LARGE',
+  'UPSTREAM_CONTENT_FILTER', 'UPSTREAM_RESPONSE_TOO_LARGE', 'INVALID_EFFORT', 'WORK_UNAVAILABLE', 'WORK_PROTOCOL_UNSUPPORTED',
 ]);
 const transientErrors = new Set(['UPSTREAM_CONNECTION_ERROR', 'UPSTREAM_TIMEOUT', 'UPSTREAM_TRUNCATED_STREAM']);
 const upstreamFailures = new Set([
@@ -66,15 +66,20 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     return auditId;
   }
   function auditEnd(auditId, outcome, error) {
-    if (auditId) store.run('UPDATE route_attempts SET outcome=?,error=? WHERE id=?', outcome, error ? sanitizeUpstreamError(error) : null, auditId);
+    if (auditId) {
+      store.run('UPDATE route_attempts SET outcome=?,error=?,encrypted_detail=? WHERE id=?', outcome, error ? sanitizeUpstreamError(error) : null,
+        error?.rawDiagnostic ? store.encrypt(JSON.stringify(error.rawDiagnostic)) : null, auditId);
+      store.run('DELETE FROM route_attempts WHERE outcome<>? AND rowid NOT IN (SELECT rowid FROM route_attempts ORDER BY rowid DESC LIMIT 200)', 'running');
+    }
   }
 
-  async function* run({ routeKey, messages, maxOutputTokens, systemPrompt, signal, maxAttempts = 6, retriesPerChannel = 1, onAttempt, requestId }) {
+  async function* run({ routeKey, messages, maxOutputTokens, systemPrompt, signal, maxAttempts = 6, retriesPerChannel = 1, onAttempt, requestId, mode = 'chat', effort = 'auto', skillIds = [], webSearch = false, context }) {
     signal?.throwIfAborted();
     if (typeof routeKey !== 'string' || !routeKey.trim()) throw new UpstreamError('请选择有效的模型路由。', 'INVALID_ROUTE', 400);
     if (!Array.isArray(messages) || !messages.length) throw new UpstreamError('消息不能为空。', 'INVALID_MESSAGES', 400);
     const needsVision = messages.some(message => message.attachments?.some(attachment => attachment.kind === 'image'));
-    const candidates = store.all(`${selection} WHERE m.route_key=? AND m.enabled=1 AND m.available=1 AND p.enabled=1${needsVision ? ' AND m.vision=1' : ''} ORDER BY p.priority DESC,m.id ASC`, routeKey);
+    const candidates = store.all(`${selection} WHERE m.route_key=? AND m.enabled=1 AND m.available=1 AND p.enabled=1${needsVision ? ' AND m.vision=1' : ''} ORDER BY p.priority DESC,m.id ASC`, routeKey)
+      .filter(candidate => (mode !== 'work' || candidate.protocol === 'anthropic') && (effort === 'auto' || JSON.parse(candidate.reasoning_efforts || '[]').includes(effort)));
     if (!candidates.length) throw new UpstreamError(needsVision ? '该模型路由没有支持图片的可用通道。' : '该模型路由没有可用通道，请联系管理员。', needsVision ? 'VISION_UNSUPPORTED' : 'ROUTE_UNAVAILABLE', 400);
     const attemptLimit = boundedInteger(maxAttempts, 1, 10, 6);
     const retryLimit = boundedInteger(retriesPerChannel, 0, 3, 1);
@@ -97,7 +102,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
           // Decryption and local configuration errors are not channel outages.
           const provider = {
             id: current.provider_id, name: current.provider_name, baseUrl: current.base_url,
-            protocol: current.protocol, authMode: current.auth_mode ?? 'auto',
+            protocol: current.protocol, authMode: current.auth_mode ?? 'auto', runtime: current.runtime || 'api',
             apiKey: store.decrypt(current.encrypted_key),
           };
           const model = { id: current.id, modelId: current.model_id, vision: !!current.vision };
@@ -112,14 +117,19 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
           const auditId = auditStart(requestId, current);
           let auditFinished = false;
           let attemptText = false;
+          let committed = false;
           let pendingUsage;
           try {
-            for await (const event of stream({ provider, model, messages, maxOutputTokens, systemPrompt, signal })) {
+            for await (const event of stream({ provider, model, messages, maxOutputTokens, systemPrompt, signal, mode, effort, skillIds, webSearch, context })) {
               signal?.throwIfAborted();
               if (event.type === 'delta' && typeof event.text === 'string' && event.text.length) {
                 attemptText = true; emittedText = true;
                 yield event;
               } else if (event.type === 'usage') pendingUsage = event;
+              else if (event.type === 'activity' || event.type === 'artifact') {
+                if (event.committed || event.type === 'artifact') committed = true;
+                yield event;
+              }
             }
             signal?.throwIfAborted();
             if (!attemptText) throw new UpstreamError('模型没有返回可显示的文本。', 'EMPTY_UPSTREAM_OUTPUT');
@@ -133,7 +143,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
             auditFinished = true;
             if (policy.cancelled) throw signal?.aborted ? signal.reason : error;
             if (policy.channel) recordFailure(current, error);
-            if (emittedText || !policy.switch) throw error;
+            if (emittedText || committed || !policy.switch) throw error;
             lastError = error;
             if (!policy.retry || retry >= retryLimit || halfOpen || attempts >= attemptLimit) break;
             const updated = readCandidate(initial.id, routeKey, needsVision);

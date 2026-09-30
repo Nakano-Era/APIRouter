@@ -8,10 +8,10 @@
 
 ```bash
 cd /opt/APIRouter
-sudo bash deploy.sh chat.example.com --install-docker
+sudo bash deploy.sh chat.example.com --install-docker --with-work
 ```
 
-把示例域名换成你的域名。脚本会检查环境，在支持的全新 Ubuntu/Debian 系统上安装 Docker，构建应用，再启动 HTTPS 入口。已有 Docker 时不会重新安装；已有 `.env` 和数据卷会保留。
+把示例域名换成你的域名。脚本会检查环境，在支持的全新 Ubuntu/Debian 系统上安装 Docker，构建应用与 Claude Code 工作镜像，再启动 HTTPS 入口。已有 Docker 时不会重新安装；已有 `.env` 和数据卷会保留。只需要直接 API 聊天时去掉 `--with-work`。
 
 成功后打开 `https://你的域名`。终端末尾会显示首次管理员设置码，用它创建管理员账号。若没看到设置码：
 
@@ -24,8 +24,8 @@ sudo docker compose logs --tail=30 app
 ## 部署前准备
 
 - **VPS 系统**：建议 64 位 Ubuntu 24.04 或 Debian 12/13。自动安装支持 Ubuntu 22.04、24.04、26.04，以及 Debian 12、13；其他系统先自行安装 Docker Engine 和 Compose 插件，再去掉 `--install-docker`。
-- **配置起点**：少量用户建议至少 2 核、2GB 内存，4GB 内存更宽裕；这是容量建议，不是压力测试结论。PDF/Office 文件解析、多个并发聊天和构建过程会增加内存占用。不需要显卡。
-- **磁盘**：建议至少预留 10GB 空间给镜像、依赖、附件及备份。实际占用取决于上传量。
+- **配置起点**：直接 API 聊天至少 2 核、2GB 内存；启用 Claude Code / Work 建议 4GB 起步。这是容量估算，不是压力测试结论。不需要显卡。
+- **磁盘**：聊天建议预留 10GB；含 Work 建议 20GB，用于镜像、依赖、文件及备份。实际占用取决于使用量。
 - **域名**：A 记录指向 VPS；只有 VPS 确实支持 IPv6 时才添加 AAAA 记录。不要填 `https://`、端口或路径。
 - **端口**：在云厂商安全组及服务器防火墙允许 TCP 80、443。SSH 端口按你的管理方式保留。应用的 3001 端口不会发布到公网。
 - **已有网站**：如果已有 Nginx、Caddy 或面板占用 80/443，先安排好域名代理，不能让两套服务同时占用相同端口。默认一键部署适合专用 VPS 或空闲端口。
@@ -42,15 +42,19 @@ sudo docker compose logs --tail=30 app
 | --- | --- |
 | 自己和少量受邀用户，主要文字聊天 | 2 核 CPU、2GB 内存 |
 | 经常上传文档，或 VPS 还运行其他服务 | 2 核 CPU、4GB 内存更宽裕 |
+| Claude Code / Work，少量任务 | 2 核 CPU、4GB 内存起步；机器紧张时将 Work 并发设为 1 |
+| 多个 Work 任务或较大文件 | 按任务内存上限增加内存，建议从 8GB 评估 |
 | 1GB 内存 VPS | 不适合当前默认部署；构建和文档解析容易耗尽内存 |
 
 这些是按实现估算的起点，未做生产容量压测，不能据此承诺同时在线人数。默认限制全站同时 10 条生成、每用户同时 2 条，文档解析同时 2 个；等待模型回答的连接和正在解析文档的请求，资源消耗差异很大。上游限流也会影响可用并发。
 
 Compose 为应用设置 1536MB、Caddy 设置 256MB 的内存上限，这是限制值，不是空闲占用；宿主系统和构建过程仍需要余量。升级 VPS 内存不会自动提高这些上限，确需调整时修改 `compose.yaml`，并同时评估并发。较大的使用规模应先用自己的文件和上游延迟进行压测。
 
+Work 另有 512MB 上限的网关容器，以及默认最多两个、每个 768MB / 1 CPU 的任务容器。任务的 CPU、内存、时限和并发可在管理后台配置；上游模型仍在服务商处运行。建议先用一个小文件任务验证资源消耗。
+
 ## 从 Windows 上传项目
 
-可以用 WinSCP 把项目目录复制到 `/opt/APIRouter`。上传源码时不要包含 `node_modules`、`.npm-cache`、`dist`、`data`、`backups`、`test-results`、`deliverables`、`.agents`、`.codex`、`.env` 和 `*.tsbuildinfo`；VPS 会自行安装依赖，数据迁移则使用下文的备份恢复流程。必须包含 `package-lock.json`、`server`、`src`、`public`、`deploy`、`scripts`、`Dockerfile`、`compose.yaml`、`deploy.sh` 及项目配置文件。
+可以用 WinSCP 把项目目录复制到 `/opt/APIRouter`。上传源码时不要包含 `node_modules`、`.npm-cache`、`dist`、`data`、`backups`、`test-results`、`deliverables`、`.agents`、`.codex`、`.env` 和 `*.tsbuildinfo`；VPS 会自行安装依赖，数据迁移则使用下文的备份恢复流程。必须包含 `package-lock.json`、`server`、`runner`、`src`、`public`、`deploy`、`scripts`、`Dockerfile`、`compose.yaml`、`compose.work.yaml`、`deploy.sh` 及项目配置文件。旧版本升级不能只替换 `server/`。
 
 也可以在项目目录中打开 PowerShell，先打包源码，再上传：
 
@@ -65,7 +69,7 @@ scp.exe .\APIRouter-deploy.tar.gz root@你的VPS公网IP:/root/
 sudo mkdir -p /opt/APIRouter
 sudo tar -xzf /root/APIRouter-deploy.tar.gz -C /opt/APIRouter
 cd /opt/APIRouter
-sudo bash deploy.sh chat.example.com --install-docker
+sudo bash deploy.sh chat.example.com --install-docker --with-work
 ```
 
 如果你使用普通 SSH 用户，把上传位置改为该用户自己的目录，并相应修改解压路径。
@@ -73,13 +77,34 @@ sudo bash deploy.sh chat.example.com --install-docker
 ## 创建账号与配置 AnyRouter
 
 1. 打开站点，用终端中的设置码创建管理员。
-2. 进入管理员后台，添加接口名称、API 地址、协议和 API Key。
+2. 进入管理员后台，添加接口名称、API 地址、协议和 API Key；也可粘贴 `{"_type":"newapi_channel_conn","key":"sk-XXX","url":"https://xxx.com"}`，检查识别预览后保存。
 3. 地址与协议以 `anyrouter.top` 给你的账号提供的信息为准。地址不是登录页面；不要仅凭域名猜测路径。本项目支持的协议及填写方式以后台提示为准。
 4. 同步模型列表；若上游不提供列表接口，可手动添加准确的模型 ID。列表中的“存在”不等于当前 Key 一定能调用，需要运行连通测试。
-5. 启用可用模型，按需要设置默认模型、视觉支持和用户额度。
-6. 创建邀请，把邀请链接发给受邀用户。普通用户不会看到或取得完整 API Key。
+5. 若选择 Claude Code 运行方式，使用 Anthropic Messages 协议并确认后台 Work 执行器可用；认证方式遵从上游说明。先用自动思考强度完成一次普通模型测试。
+6. 启用可用模型，按需要设置默认模型、视觉支持、支持的思考强度与用户额度；相同模型的各渠道在同一分组下管理。
+7. 创建邀请，把邀请链接发给受邀用户。普通用户不会看到渠道来源或完整 API Key。
 
 管理员界面设置 API Key 后无需修改 `.env` 或重启服务器。模型能否回复、是否支持图片、可用上下文及额度取决于上游账号；部署成功本身不代表 AnyRouter 已通过真实调用验证。
+
+### 旧版升级并启用 Work
+
+先备份，再将本版完整源码覆盖到原目录，保留服务器原有 `.env` 和数据卷，执行：
+
+```bash
+cd /opt/APIRouter
+sudo bash scripts/backup.sh
+sudo bash deploy.sh --with-work
+```
+
+脚本沿用原域名，自动补充 Work 执行器凭据及 Compose 配置，构建工作镜像并更新服务。数据库在应用启动时补充所需字段，不清空现有账号、密钥或聊天。只需在已更新的站点上补开 Work，可执行 `sudo bash deploy/work-enable.sh`。
+
+打开“管理工作空间 → Work”，确认执行器可用；新建对话，选择 Work 和可用的 Anthropic 模型，发送“创建一个包含你好字样的 SVG，保存到 output，提供下载”。只有实际写入的文件会出现在文件卡片中。详细技能安装、资源设置、网络搜索及文件限制见 [Work 指南](WORK.md)。
+
+### 查询余额和备份 API
+
+每条 API 连接可选择余额查询方式。New API 返回令牌额度；旧版兼容接口返回服务商单位，不保证是美元或完整账户余额。未实现该接口的服务商会显示不可用，普通模型调用不受影响。
+
+API 连接页的“导出全部”会先验证管理员当前密码，可选择明文或独立密码加密的 JSON；文件包含完整 API Key 和模型映射，应保存在自己的设备上。用“粘贴识别”可导入备份，加密文件需要解密密码。API 导出不替代数据库备份。
 
 ### 配置会员套餐
 
@@ -106,17 +131,17 @@ sudo bash deploy.sh chat.example.com --install-docker
 
 默认网络错误、超时或 5xx 会在当前渠道最多重试一次，再尝试备用渠道；401/403/404/429 直接尝试备用渠道。每次用户请求最多尝试六次，相关重试参数可在后台调整。连续失败和冷却按“渠道＋模型”计算；冷却到期后由下一次请求触发一次恢复探测。
 
-**重试与切换可能产生额外上游费用，不能保证只计费一次。回复已经开始输出文字后，中途失败不会自动换来源拼接内容**，用户可以选择重新生成。可在后台查看尝试记录和健康状态，排查到底使用了哪条渠道。
+**重试与切换可能产生额外上游费用，不能保证只计费一次。回复已输出文字，或 Work 已开始调用工具后，中途失败不会自动换来源重做任务**，用户可以确认结果后选择重新生成。后台可查看尝试记录、健康状态与原始报错；普通用户只看到统一模型和简化错误。
 
-这个版本提供网页聊天和文档内容提取；不要把部署容器视作能执行任意模型命令的 Work 沙箱。Office/PDF 解析使用限时子进程，上传文件不会被作为脚本执行。
+Work 使用单独的一次性任务容器执行模型工具；应用容器只负责网页、权限和数据。Office/PDF 输入仍按已实现的提取方式进入模型上下文。当前没有网页浏览器、通用互联网访问或后台任务队列。
 
 ## 数据保存在哪里
 
 Docker 的 `apirouter_app_data` 数据卷保存数据库、附件和 `master.key`。API Key 使用该密钥加密存储；**丢失 `master.key` 会导致已保存的 API Key 无法解密**。备份因此需要同时保留整个数据目录。
 
-应用以非 root 用户运行，程序目录只读，只能向数据卷和临时目录写入。容器没有挂载宿主的 Docker 控制接口。这些限制能降低影响范围，但不能使中转服务变成可信上游。
+应用以非 root 用户运行，程序目录只读，只能向数据卷和临时目录写入。应用与任务容器没有 Docker 控制接口；仅 Work 管理网关挂载 Docker socket，用于创建和清理任务容器。网关不对公网开放。自托管界面仍不能消除上游服务商的信任问题。
 
-`.env` 只需要一项：
+仅聊天部署的 `.env` 只需一项；启用 Work 后脚本会自动加入执行器凭据和 `COMPOSE_FILE`：
 
 ```dotenv
 DOMAIN=chat.example.com
@@ -131,10 +156,10 @@ DOMAIN=chat.example.com
 ```bash
 cd /opt/APIRouter
 sudo bash scripts/backup.sh
-sudo docker compose up -d --build --wait --wait-timeout 180
+sudo bash deploy.sh
 ```
 
-这个命令重建应用并使用原数据卷，不会清空历史记录。Compose 官方也使用重新构建、重新创建服务的方式部署更新，参见 [Compose 生产部署说明](https://docs.docker.com/compose/how-tos/production/)。
+脚本重建应用并使用原数据卷；已启用 Work 时会一起更新执行器和工作镜像，不会清空历史记录。Compose 官方也使用重新构建、重新创建服务的方式部署更新，参见 [Compose 生产部署说明](https://docs.docker.com/compose/how-tos/production/)。
 
 常用操作：
 
@@ -191,13 +216,16 @@ sudo bash scripts/restore.sh /opt/APIRouter/backups/apirouter-实际文件名.ta
 | 管理员设置码无效 | 查看本次启动的最新 app 日志；旧码在重启后失效。 |
 | 模型列表同步失败 | 确认 API 协议、地址和 Key；上游可能不提供模型列表，此时手动添加模型 ID 后测试。 |
 | 模型显示但请求失败 | 上游列表不证明调用权限；检查连通测试与上游额度。 |
-| 上游 HTTP 400 / 422 | 在管理员“模型”页对该渠道执行一次测试，查看本次提示中的“上游说明（已脱敏）”，按说明核对模型 ID、参数或客户端限制。继续重试通常不能修复相同的请求。 |
+| 上游 HTTP 400 / 422 | 在管理员“模型”页对该渠道执行一次测试，展开原始报错；也可在路由日志查看对应失败。按上游正文核对模型 ID、协议、参数及客户端限制。继续重试通常不能修复相同的请求。 |
 | 大文件上传失败 | 单文件上限 10MB；PDF 上限 100 页；提取文字上限 20 万字符；扫描 PDF 没有 OCR。 |
 | 构建或解析时内存不足 | 检查 VPS 可用内存，减少同时上传与并发；必要时升级到 4GB 或更多。 |
 | 更新后短暂出现 502 | 应用可能还在重启；查看 `docker compose ps` 与 app 日志。 |
+| Work 不可用 | 执行 `sudo bash deploy/work-enable.sh`，查看后台 Work 状态与 `docker compose logs --tail=100 work-runner`。 |
+| Work 没有下载文件 | 确认模型实际执行工具并保存到 `output/`；说明文字不等于已生成文件，任务文件受大小限制。 |
+| 网络搜索失败 | 当前搜索使用 Claude Code WebSearch，所选上游必须支持；切换兼容渠道或关闭搜索完成普通任务。 |
 
-管理员模型测试会发送固定的简短消息，消耗少量上游额度。若上游返回 JSON 错误，本次测试提示会附带经过脱敏、限长的原因；该说明只返回给发起测试的管理员，不写入模型记录、普通聊天或路由日志。HTML 错误页、畸形响应、过大响应或读取超时不会原样显示，仍保留通用 HTTP 错误。
+管理员模型测试会发送固定的简短消息，消耗少量上游额度。上游错误正文会在管理员诊断区显示，并加密保存到路由日志；模型记录保留简短提示。JSON、普通文字、HTML 等按原始文本展示，HTML 不会执行。凭据会脱敏，过大或读取超时的响应会标注截断：直接 API 最多 1MB，Claude Code 网关最多 128KB。普通用户不能读取这些详情。
 
-若安装的是只有通用错误提示的旧版，先将新版源码覆盖到原项目目录（保留 `.env` 和数据），然后执行 `sudo docker compose up -d --build --wait app`，刷新网页再测试。不要删除数据卷或重新初始化账号。
+若安装的是只有通用错误提示的旧版，先将新版完整源码覆盖到原项目目录（保留 `.env` 和数据），然后执行 `sudo bash deploy.sh --with-work`，刷新网页再测试。不要删除数据卷或重新初始化账号。
 
 **验证范围**：源码构建、应用测试、部署脚本语法及 Compose 配置可以在开发环境检查；真实 VPS 的镜像构建、Linux 运行、域名证书签发和 AnyRouter 实际调用仍需在你的服务器与账号上验证。当前开发机器未运行 Docker 引擎，不能把文档中的部署流程当作已在该 VPS 实测的承诺。

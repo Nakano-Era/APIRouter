@@ -5,11 +5,12 @@ umask 077
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 cd -- "$project_dir"
 install_docker=0
+with_work=0
 requested_domain=''
 
 usage() {
-  printf '%s\n' '用法：bash deploy.sh [chat.example.com] [--install-docker]' \
-    '首次部署：sudo bash deploy.sh chat.example.com --install-docker' \
+  printf '%s\n' '用法：bash deploy.sh [chat.example.com] [--install-docker] [--with-work]' \
+    '首次部署：sudo bash deploy.sh chat.example.com --install-docker --with-work' \
     '更新部署：sudo bash deploy.sh' \
     '脚本保留已有 .env 与数据卷；不会重置数据库。'
 }
@@ -17,6 +18,7 @@ usage() {
 for argument in "$@"; do
   case "$argument" in
     --install-docker) install_docker=1 ;;
+    --with-work) with_work=1 ;;
     --help|-h) usage; exit 0 ;;
     --*) printf '未知选项：%s\n' "$argument" >&2; usage; exit 1 ;;
     *)
@@ -104,7 +106,11 @@ export DOMAIN="$domain"
 
 docker compose config --quiet
 printf '%s\n' '开始构建并启动。首次构建需下载依赖，请稍候。'
-docker compose up -d --build --wait --wait-timeout 180
+if [[ "$with_work" == 1 ]] || grep -q '^COMPOSE_FILE=.*compose.work.yaml' .env; then
+  bash deploy/work-enable.sh
+else
+  docker compose up -d --build --wait --wait-timeout 180
+fi
 printf '\n网站已启动：https://%s\n' "$domain"
 printf '%s\n' '首次管理员设置码在下方 app 日志中；已有管理员时不会再生成。'
 docker compose logs --tail=15 app

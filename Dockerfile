@@ -19,6 +19,7 @@ WORKDIR /app
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
 COPY --chown=node:node package.json ./
 COPY --chown=node:node server ./server
+COPY --chown=node:node runner ./runner
 COPY --from=build --chown=node:node /app/dist ./dist
 RUN mkdir -p /app/data && chown node:node /app/data && chmod 700 /app/data
 USER node

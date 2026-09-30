@@ -1,0 +1,55 @@
+services:
+  app:
+    environment:
+      WORK_RUNNER_URL: http://work-runner:3210
+      WORK_RUNNER_TOKEN: ${WORK_RUNNER_TOKEN:?请运行 deploy/work-enable.sh 生成执行器凭据}
+    networks:
+      - default
+      - work-control
+    depends_on:
+      work-runner:
+        condition: service_healthy
+
+  work-runner:
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+      target: broker
+    restart: unless-stopped
+    init: true
+    environment:
+      WORK_RUNNER_TOKEN: ${WORK_RUNNER_TOKEN:?请运行 deploy/work-enable.sh}
+      WORK_WORKER_IMAGE: apirouter-work:local
+    # The broker is the only component allowed to create Docker containers.
+    # Never mount this socket in app or in a job container.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - work-control
+      - work-egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3210/health',{headers:{Authorization:'Bearer '+process.env.WORK_RUNNER_TOKEN}}).then(async r=>{if(!r.ok||!(await r.json()).available)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  work-control:
+    internal: true
+  work-egress:

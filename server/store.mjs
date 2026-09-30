@@ -52,17 +52,25 @@ export function createStore(dataDir) {
     const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
     for (const [name, definition] of Object.entries(columns)) if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
   };
-  addColumns('providers', { priority: 'INTEGER NOT NULL DEFAULT 0', failure_threshold: 'INTEGER NOT NULL DEFAULT 3', cooldown_seconds: 'INTEGER NOT NULL DEFAULT 60', auth_mode: "TEXT NOT NULL DEFAULT 'auto'" });
-  addColumns('models', { route_key: "TEXT NOT NULL DEFAULT ''", failure_count: 'INTEGER NOT NULL DEFAULT 0', cooldown_until: 'TEXT', failure_epoch: 'INTEGER NOT NULL DEFAULT 0' });
+  addColumns('providers', { priority: 'INTEGER NOT NULL DEFAULT 0', failure_threshold: 'INTEGER NOT NULL DEFAULT 3', cooldown_seconds: 'INTEGER NOT NULL DEFAULT 60', auth_mode: "TEXT NOT NULL DEFAULT 'auto'", runtime: "TEXT NOT NULL DEFAULT 'api'" });
+  addColumns('models', { route_key: "TEXT NOT NULL DEFAULT ''", failure_count: 'INTEGER NOT NULL DEFAULT 0', cooldown_until: 'TEXT', failure_epoch: 'INTEGER NOT NULL DEFAULT 0', reasoning_efforts: "TEXT NOT NULL DEFAULT '[]'" });
+  addColumns('chats', { mode: "TEXT NOT NULL DEFAULT 'chat'", effort: "TEXT NOT NULL DEFAULT 'auto'", skill_ids: "TEXT NOT NULL DEFAULT '[]'", web_search: 'INTEGER NOT NULL DEFAULT 0' });
   addColumns('messages', { source_provider: 'TEXT', source_model: 'TEXT' });
   db.exec("UPDATE models SET route_key=model_id WHERE route_key=''; CREATE INDEX IF NOT EXISTS idx_models_route ON models(route_key);");
   db.exec(`CREATE TABLE IF NOT EXISTS route_attempts (id TEXT PRIMARY KEY, request_id TEXT, provider_id TEXT, model_id TEXT, outcome TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_attempts_request ON route_attempts(request_id,created_at);`);
+  addColumns('route_attempts', { encrypted_detail: 'TEXT' });
   db.prepare("UPDATE messages SET status='error', error='服务重启导致回复中断，请重新生成。' WHERE status='streaming'").run();
   db.prepare("UPDATE requests SET status='interrupted' WHERE status='running'").run();
   db.prepare("UPDATE route_attempts SET outcome='stopped', error='服务重启导致尝试中断。' WHERE outcome='running'").run();
   const defaults = { siteName: 'APIRouter', systemPrompt: '你是一个认真、可靠的 AI 助手。使用用户的语言回答。明确区分已经执行的操作与建议，不要声称使用了未提供的工具。', defaultModelId: null, dailyLimit: 100, maxOutputTokens: 4096, routingMaxAttempts: 6, retriesPerChannel: 1 };
   for (const [key, value] of Object.entries(defaults)) db.prepare('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)').run(key, JSON.stringify(value));
+  if (!db.prepare("SELECT 1 FROM settings WHERE key='reasoningOptionsMigrated'").get()) {
+    for (const model of db.prepare('SELECT id,model_id FROM models').all()) {
+      if (/^claude-(?:opus|sonnet)-5(?:-|$)|^gpt-6(?:-|$)/.test(model.model_id)) db.prepare("UPDATE models SET reasoning_efforts=? WHERE id=? AND reasoning_efforts='[]'").run(JSON.stringify(['low','medium','high','xhigh','max']), model.id);
+    }
+    db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('reasoningOptionsMigrated', 'true');
+  }
   return {
     db, dataDir,
     all: (sql, ...params) => db.prepare(sql).all(...params),
