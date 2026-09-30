@@ -15,6 +15,10 @@ services:
       PUBLIC_ORIGIN: https://${DOMAIN:?请先在 .env 中设置 DOMAIN}
       COOKIE_SECURE: "true"
       TRUST_PROXY: "1"
+      MAX_CONCURRENT_PER_USER: ${MAX_CONCURRENT_PER_USER:-4}
+      MAX_CONCURRENT_CHATS: ${MAX_CONCURRENT_CHATS:-10}
+      CHAT_TIMEOUT_SECONDS: ${CHAT_TIMEOUT_SECONDS:-3600}
+      UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-180000}
     volumes:
       - app_data:/app/data
     read_only: true

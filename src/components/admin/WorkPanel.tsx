@@ -42,12 +42,12 @@ export default function WorkPanel({ onChanged }: { onChanged: () => Promise<void
     {error && <div className="alert error" role="alert">{error}</div>}{notice && <div className="alert success" role="status"><Check size={15}/>{notice}</div>}
     {loading ? <div className="settings-loading"><LoaderCircle size={22} className="spin"/>正在读取 Work 设置…</div> : <>
       {runtime && <>
-        <div className="work-admin-runtime"><strong><Terminal size={17}/>{runtime.available ? 'Work 已就绪' : runtime.configured ? 'Work 暂不可用' : '尚未连接 Work 服务'}</strong><p>{runtime.reason || (runtime.available ? '任务由 Claude Code 在独立 Docker 容器中执行，可读写文件、调用 Agent、使用技能及网络搜索。' : '请按部署文档启动 Work 服务，并刷新检查。')}</p></div>
+        <div className="work-admin-runtime"><strong><Terminal size={17}/>{runtime.available ? 'Work 已就绪' : runtime.configured ? 'Work 暂不可用' : '尚未连接 Work 服务'}</strong><p>{runtime.reason || (runtime.available ? '任务使用模型 API 和独立 Docker 沙箱，可读写文件、执行操作并使用技能。Claude Code 是可选运行方式。' : '请按部署文档启动 Work 服务，并刷新检查。')}</p></div>
         <form className="stack" key={version} onSubmit={save}>
           <label className="checkbox-label"><input type="checkbox" name="enabled" defaultChecked={runtime.settings.enabled}/>启用 Work 模式</label>
           <div className="form-grid"><label>每次任务最多轮次<input type="number" name="maxTurns" defaultValue={runtime.settings.maxTurns} min={1} max={80} required/><span className="field-help">限制 Agent 循环次数。</span></label><label>任务最长时间（秒）<input type="number" name="timeoutSeconds" defaultValue={runtime.settings.timeoutSeconds} min={30} max={1800} required/></label></div>
           <div className="form-grid"><label>每个任务内存（MB）<input type="number" name="memoryMb" defaultValue={runtime.settings.memoryMb} min={512} max={4096} step={128} required/></label><label>每个任务 CPU 核数<input type="number" name="cpus" defaultValue={runtime.settings.cpus} min={0.25} max={4} step={0.25} required/></label></div>
-          <div className="form-grid"><label>单次任务预算（美元）<input type="number" name="maxBudgetUsd" defaultValue={runtime.settings.maxBudgetUsd} min={0.1} max={20} step={0.01} required/><span className="field-help">由执行工具估算；实际扣费以服务商为准。</span></label><label>同时运行任务数<input type="number" name="maxConcurrentJobs" defaultValue={runtime.settings.maxConcurrentJobs} min={1} max={4} required/></label></div>
+          <div className="form-grid"><label>单次任务预算（美元）<input type="number" name="maxBudgetUsd" defaultValue={runtime.settings.maxBudgetUsd} min={0.1} max={20} step={0.01} required/><span className="field-help">Claude Code 任务的预算上限；直接 API 任务以轮次和时间限制控制，实际扣费以服务商为准。</span></label><label>同时运行任务数<input type="number" name="maxConcurrentJobs" defaultValue={runtime.settings.maxConcurrentJobs} min={1} max={4} required/></label></div>
           <div className="form-actions"><button className="button primary" disabled={!!busy}><Check size={15}/>保存 Work 设置</button></div>
         </form>
       </>}

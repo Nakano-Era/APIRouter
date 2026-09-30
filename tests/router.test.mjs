@@ -25,6 +25,7 @@ function fixture(t, channels = [{ id: 'a', priority: 10 }, { id: 'b', priority: 
     store.run('INSERT INTO providers VALUES (?,?,?,?,?,?,?,?,?,?,?)', c.id, `Provider ${c.id}`, `https://${c.id}.example.com/v1`, c.protocol ?? 'openai-chat', `secret-${c.id}`, c.providerEnabled ?? 1, c.priority ?? 0, c.threshold ?? 3, c.cooldownSeconds ?? 60, c.authMode ?? 'auto', c.runtime || 'api');
     store.run('INSERT INTO models VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', c.id, c.id, c.upstreamModelId ?? `upstream-${c.id}`, c.routeKey ?? 'shared-model', c.enabled ?? 1, c.available ?? 1, c.vision ?? 0, c.failureCount ?? 0, c.cooldownUntil ?? null, 0, 'untested', null, null, JSON.stringify(c.efforts || []));
   }
+  db.exec("ALTER TABLE providers ADD COLUMN responses_profile TEXT DEFAULT 'auto'");
   return store;
 }
 const input = overrides => ({ routeKey: 'shared-model', messages: [{ role: 'user', content: 'Hello', attachments: [] }], maxOutputTokens: 200, systemPrompt: 'Be helpful', ...overrides });
@@ -368,14 +369,14 @@ test('Work tools commit the attempt before text and forbid failover on later out
   assert.deepEqual(called,['a']);
 });
 
-test('effort and Work mode filter eligible channels and reach the selected runtime', async t => {
+test('Work accepts native API channels and still filters unsupported effort', async t => {
   const store=fixture(t,[{id:'a',protocol:'openai-chat',priority:100,efforts:['high']},{id:'b',protocol:'anthropic',priority:80,efforts:[]},{id:'c',protocol:'anthropic',runtime:'claude-code',efforts:['high']}]);
   const calls=[];
   const router=createRouter({store,stream:async function* (options) { calls.push(options); yield {type:'delta',text:'OK'}; }});
   await collect(router.run(input({mode:'work',effort:'high',context:{userId:'owner',chatId:'chat'}})));
   assert.equal(calls.length,1);
-  assert.equal(calls[0].provider.id,'c');
-  assert.equal(calls[0].provider.runtime,'claude-code');
+  assert.equal(calls[0].provider.id,'a');
+  assert.equal(calls[0].provider.runtime,'api');
   assert.equal(calls[0].effort,'high');
   assert.equal(calls[0].context.userId,'owner');
 });

@@ -4,6 +4,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { id, now, digest, verifyPassword } from './store.mjs';
 import { validateBaseUrl, openUpstream, readJson, sanitizeUpstreamError } from './net.mjs';
+import { responseProfiles } from './responses-compat.mjs';
 
 const derive = promisify(scrypt);
 const fail = (status, message) => Object.assign(new Error(message), { status });
@@ -32,6 +33,8 @@ function modelDefinition(value) {
   const reasoningEfforts = value.reasoningEfforts ?? [];
   if (!Array.isArray(reasoningEfforts) || reasoningEfforts.length > 5 || new Set(reasoningEfforts).size !== reasoningEfforts.length || reasoningEfforts.some(effort => !['low', 'medium', 'high', 'xhigh', 'max'].includes(effort))) throw fail(400, '模型思考强度配置无效。');
   return { modelId, name: text(value.name ?? modelId, '模型名称'), routeKey: text(value.routeKey ?? value.route_key ?? modelId, '统一模型名'), reasoningEfforts,
+    contextWindow: value.contextWindow == null ? null : integer(value.contextWindow, 1024, 10_000_000, '模型上下文容量'),
+    maxOutputTokens: value.maxOutputTokens == null ? null : integer(value.maxOutputTokens, 128, 1_000_000, '模型输出容量'),
     enabled: bool(value.enabled ?? false, '模型启用状态'), vision: bool(value.vision ?? false, '图片输入'), manual: bool(value.manual ?? true, '手动模型'), available: bool(value.available ?? true, '可用状态') };
 }
 export function normalizeProvider(value, warnings = []) {
@@ -41,17 +44,20 @@ export function normalizeProvider(value, warnings = []) {
   const apiKey = text(unique([value.apiKey, value.api_key, value.key, env.ANTHROPIC_AUTH_TOKEN, env.ANTHROPIC_API_KEY, env.OPENAI_API_KEY], 'API Key'), 'API Key', 4000);
   if (/\s/.test(apiKey)) throw fail(400, 'API Key 不能包含空白字符。');
   const anyrouter = /(^|\.)anyrouter\.top$/i.test(new URL(baseUrl).hostname);
-  const anthropic = anyrouter || !!(env.ANTHROPIC_BASE_URL || env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY);
-  const protocol = choice(value.protocol ?? (anthropic ? 'anthropic' : 'openai-chat'), protocols, '接口协议');
+  const openai = !!(env.OPENAI_BASE_URL || env.OPENAI_API_BASE || env.OPENAI_API_KEY);
+  const anthropic = (anyrouter && !openai) || !!(env.ANTHROPIC_BASE_URL || env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY);
+  const protocol = choice(value.protocol ?? (anthropic ? 'anthropic' : anyrouter && openai ? 'openai-responses' : 'openai-chat'), protocols, '接口协议');
   const runtime = choice(value.runtime ?? (anyrouter && protocol === 'anthropic' ? 'claude-code' : 'api'), ['api', 'claude-code'], '运行方式');
   if (runtime === 'claude-code' && protocol !== 'anthropic') throw fail(400, 'Claude Code 连接需要选择 Anthropic Messages 协议。');
   if (!value.protocol) warnings.push('接口协议由配置格式推断，请核对后保存；识别成功不代表服务商已通过连接测试。');
-  if (anyrouter && !value.runtime) warnings.push('AnyRouter 已预选 Claude Code 接入，请确认服务器已配置对应运行环境。');
+  if (anyrouter && runtime === 'claude-code' && !value.runtime) warnings.push('AnyRouter 已预选 Claude Code 接入，请确认服务器已配置对应运行环境；GPT/Codex 模型请另建 Responses 连接。');
+  if (anyrouter && protocol === 'openai-responses') warnings.push('AnyRouter Responses 自动使用 Codex 兼容请求格式；令牌仍需具备对应模型和客户端权限。');
   const modelValues = value.models ?? [];
   if (!Array.isArray(modelValues) || modelValues.length > 5000) throw fail(400, '每个连接最多导入 5000 个模型映射。');
   const models = modelValues.map(modelDefinition);
   if (new Set(models.map(model => model.modelId)).size !== models.length) throw fail(400, '同一连接存在重复的上游模型 ID。');
   return { name: text(value.name ?? new URL(baseUrl).hostname, '连接名称', 80), baseUrl, apiKey, protocol, runtime,
+    responsesProfile: choice(value.responsesProfile ?? 'auto', responseProfiles, 'Responses 请求格式'),
     authMode: choice(value.authMode ?? value.auth_mode ?? (env.ANTHROPIC_AUTH_TOKEN || anyrouter ? 'bearer' : 'auto'), ['auto', 'bearer', 'x-api-key'], '认证方式'),
     enabled: bool(value.enabled ?? true, '连接启用状态'), priority: integer(value.priority ?? 0, 0, 1000, '优先级'),
     failureThreshold: integer(value.failureThreshold ?? value.failure_threshold ?? 3, 1, 10, '失败阈值'), cooldownSeconds: integer(value.cooldownSeconds ?? value.cooldown_seconds ?? 60, 5, 86400, '冷却时间'),
@@ -167,10 +173,10 @@ export function createProviderTools({ store, providerJSON, ensureProviderIdle = 
         if (existing.has(signature)) { skipped++; continue; }
         existing.add(signature);
         const providerId = id();
-        store.run('INSERT INTO providers(id,name,base_url,protocol,encrypted_key,key_hint,enabled,created_at,priority,failure_threshold,cooldown_seconds,auth_mode,runtime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', providerId, provider.name, provider.baseUrl, provider.protocol, store.encrypt(provider.apiKey), `••••${provider.apiKey.slice(-4)}`, Number(provider.enabled), now(), provider.priority, provider.failureThreshold, provider.cooldownSeconds, provider.authMode, provider.runtime);
+        store.run('INSERT INTO providers(id,name,base_url,protocol,encrypted_key,key_hint,enabled,created_at,priority,failure_threshold,cooldown_seconds,auth_mode,runtime,responses_profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', providerId, provider.name, provider.baseUrl, provider.protocol, store.encrypt(provider.apiKey), `••••${provider.apiKey.slice(-4)}`, Number(provider.enabled), now(), provider.priority, provider.failureThreshold, provider.cooldownSeconds, provider.authMode, provider.runtime, provider.responsesProfile);
         store.run('INSERT INTO provider_tools(provider_id,balance_adapter) VALUES (?,?)', providerId, provider.balanceAdapter);
         for (const model of provider.models) {
-          store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,enabled,vision,manual,available,reasoning_efforts) VALUES (?,?,?,?,?,?,?,?,?,?)', id(), providerId, model.modelId, model.name, model.routeKey, Number(model.enabled), Number(model.vision), Number(model.manual), Number(model.available), JSON.stringify(model.reasoningEfforts)); modelsAdded++;
+          store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,enabled,vision,manual,available,reasoning_efforts,context_window,max_output_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', id(), providerId, model.modelId, model.name, model.routeKey, Number(model.enabled), Number(model.vision), Number(model.manual), Number(model.available), JSON.stringify(model.reasoningEfforts), model.contextWindow, model.maxOutputTokens); modelsAdded++;
         }
         added++;
       }
@@ -178,7 +184,7 @@ export function createProviderTools({ store, providerJSON, ensureProviderIdle = 
     return { added, skipped, modelsAdded };
   }
   function exportDocument() {
-    return { _type: envelopeType, version: 1, encrypted: false, exportedAt: now(), providers: store.all('SELECT * FROM providers ORDER BY created_at,id').map(row => ({ name: row.name, baseUrl: row.base_url, apiKey: store.decrypt(row.encrypted_key), protocol: row.protocol, runtime: row.runtime ?? 'api', authMode: row.auth_mode, enabled: !!row.enabled, priority: row.priority, failureThreshold: row.failure_threshold, cooldownSeconds: row.cooldown_seconds, balanceAdapter: store.get('SELECT balance_adapter FROM provider_tools WHERE provider_id=?', row.id)?.balance_adapter ?? 'none', models: store.all('SELECT * FROM models WHERE provider_id=? ORDER BY model_id', row.id).map(model => ({ modelId: model.model_id, name: model.name, routeKey: model.route_key, enabled: !!model.enabled, vision: !!model.vision, manual: !!model.manual, available: !!model.available, reasoningEfforts: JSON.parse(model.reasoning_efforts ?? '[]') })) })) };
+    return { _type: envelopeType, version: 1, encrypted: false, exportedAt: now(), providers: store.all('SELECT * FROM providers ORDER BY created_at,id').map(row => ({ name: row.name, baseUrl: row.base_url, apiKey: store.decrypt(row.encrypted_key), protocol: row.protocol, runtime: row.runtime ?? 'api', responsesProfile: row.responses_profile ?? 'auto', authMode: row.auth_mode, enabled: !!row.enabled, priority: row.priority, failureThreshold: row.failure_threshold, cooldownSeconds: row.cooldown_seconds, balanceAdapter: store.get('SELECT balance_adapter FROM provider_tools WHERE provider_id=?', row.id)?.balance_adapter ?? 'none', models: store.all('SELECT * FROM models WHERE provider_id=? ORDER BY model_id', row.id).map(model => ({ modelId: model.model_id, name: model.name, routeKey: model.route_key, contextWindow: model.context_window ?? null, maxOutputTokens: model.max_output_tokens ?? null, enabled: !!model.enabled, vision: !!model.vision, manual: !!model.manual, available: !!model.available, reasoningEfforts: JSON.parse(model.reasoning_efforts ?? '[]') })) })) };
   }
   function registerRoutes(app, { auth, admin, csrf }) {
     const router = express.Router();

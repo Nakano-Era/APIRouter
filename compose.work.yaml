@@ -20,6 +20,7 @@ services:
     environment:
       WORK_RUNNER_TOKEN: ${WORK_RUNNER_TOKEN:?请运行 deploy/work-enable.sh}
       WORK_WORKER_IMAGE: apirouter-work:local
+      WORK_CLAUDE_IMAGE: ${WORK_CLAUDE_IMAGE:-}
     # The broker is the only component allowed to create Docker containers.
     # Never mount this socket in app or in a job container.
     volumes:

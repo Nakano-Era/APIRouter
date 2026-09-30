@@ -11,23 +11,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=docker-client /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /opt/apirouter
 COPY --from=dependencies /opt/apirouter/node_modules ./node_modules
-COPY server/net.mjs ./server/net.mjs
+COPY server/net.mjs server/responses-compat.mjs ./server/
 COPY runner ./runner
 ENV NODE_ENV=production
 EXPOSE 3210
 CMD ["node", "runner/broker.mjs"]
 
 FROM node:24-bookworm-slim AS worker
-ARG CLAUDE_CODE_VERSION=2.1.285
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 python3-venv python3-pil python3-docx python3-openpyxl python3-reportlab git ripgrep bash && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv --system-site-packages /opt/pythonenv \
-    && /opt/pythonenv/bin/pip install --no-cache-dir python-pptx==1.0.2 XlsxWriter==3.2.9 typing-extensions==4.15.0 \
-    && npm install --global --no-audit --no-fund @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && npm cache clean --force \
-    && claude --version
+    && /opt/pythonenv/bin/pip install --no-cache-dir python-pptx==1.0.2 XlsxWriter==3.2.9 typing-extensions==4.15.0
 WORKDIR /opt/apirouter
-COPY --chown=node:node runner/worker.mjs runner/protocol.mjs ./
+COPY --chown=node:node runner/worker.mjs runner/protocol.mjs runner/native-agent.mjs runner/native-tools.mjs ./
 RUN mkdir -p /workspace && chown node:node /workspace
 ENV NODE_ENV=production PATH=/opt/pythonenv/bin:$PATH
 USER node
 WORKDIR /workspace
 CMD ["node", "/opt/apirouter/worker.mjs"]
+
+# Optional image; a normal Work deployment does not install Claude Code.
+FROM worker AS claude-worker
+USER root
+ARG CLAUDE_CODE_VERSION=2.1.285
+RUN npm install --global --no-audit --no-fund @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && npm cache clean --force && claude --version
+USER node

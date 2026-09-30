@@ -104,3 +104,5 @@
 .routing-request-id{font-size:11px;color:var(--faint);margin-top:7px;overflow-wrap:anywhere}
 .success-text{color:var(--green)}
 @media(max-width:580px){.model-row-actions{width:100%;justify-content:flex-end}.model-admin-meta .model-row-actions{margin-top:2px}.routing-log{padding:14px}.provider-routing-summary{font-size:11px}.routing-progress{font-size:12px}}
+
+.chat-running{flex-shrink:0;margin-left:7px;align-self:center;color:var(--muted)}.message-actions .continue-button{margin:3px 7px;color:var(--text)}

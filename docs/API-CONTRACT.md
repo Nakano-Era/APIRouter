@@ -10,7 +10,7 @@ This document describes the HTTP API implemented by `server/app.mjs`, `server/pr
 - `/api/admin/*` requires the `admin` role. Skill mutations also require that role although their paths begin with `/api/work/skills`.
 - Errors normally return an appropriate 4xx/5xx status and `{error: string, code?: string}`. A completed administrator model probe returns HTTP 200 with `ok:false` when the upstream probe failed. A balance query can return HTTP 200 with `available:false`.
 - API responses have `Cache-Control: no-store`; streaming responses use `no-cache, no-transform`. Clients must not persist API keys or password fields in local storage.
-- Normal JSON bodies have a 1 MB limit. Provider parse/import request envelopes have an 8 MB limit; pasted configuration text still has its own 2 MB limit. Multipart upload limits are separate.
+- Normal JSON bodies have a 1 MB limit. Chat generation/edit envelopes allow large text subject to the 32 MB message/history safety limits. Provider parse/import request envelopes have an 8 MB limit; pasted configuration text still has its own 2 MB limit. Multipart upload limits are separate.
 
 `User`:
 
@@ -42,7 +42,8 @@ The setup token is shown in the server startup output and is never exposed by a 
 PublicModel = {
   id, name, modelId, routeKey,
   vision:boolean, enabled:true, status:'untested'|'ok'|'error',
-  modes:('chat'|'work')[], reasoningEfforts:string[]
+  modes:('chat'|'work')[], reasoningEfforts:string[],
+  contextWindow:number|null, maxOutputTokens:number|null
 }
 ```
 
@@ -50,7 +51,9 @@ An administrator-defined `routeKey` groups equivalent upstream models. The publi
 
 `reasoningEfforts` always includes `auto`, followed by configured levels supported by at least one enabled channel. Other accepted levels are `low`, `medium`, `high`, `xhigh`, and `max`. Advertised levels are administrator configuration, not a guarantee that an upstream accepts them. A request filters candidate channels by its chosen effort and mode. Unsupported combinations fail before generation.
 
-`modes` includes `work` when the runner is configured and the route has an eligible Anthropic channel. Check `/api/work/capabilities` as well: configured does not mean Docker is healthy or Work is currently enabled. Legacy internal model IDs are accepted for existing integrations, but new clients should use public route IDs.
+`modes` includes `work` when the sandbox runner is configured. Native Work accepts any of the three supported API protocols; actual tool calling still depends on the upstream. Check `/api/work/capabilities` as well: configured does not mean Docker is healthy or Work is currently enabled. Legacy internal model IDs are accepted for existing integrations, but new clients should use public route IDs.
+
+Capacity metadata can be null when unknown; it is not inferred from a display name. Public route capacities summarize enabled channels and do not guarantee every channel has the same limits. The full history is retained instead of silently truncating to 300 messages. Declared context limits guide candidate selection using an approximate estimate, with the upstream enforcing the actual tokenizer/model limit; unknown metadata does not impose a guessed context ceiling. Independent 32 MB text/transport safety limits remain enforced.
 
 ## Chats, messages, and uploads
 
@@ -81,6 +84,7 @@ Defaults are `chat`, `auto`, `[]`, and `false`; generation otherwise inherits sa
 | DELETE `/api/chats/:id` | — | `{ok:true}` |
 | POST `/api/chats/:id/messages` | `{content,modelId?,attachmentIds?:string[],...execution}` | SSE |
 | POST `/api/chats/:id/regenerate` | `{modelId?,...execution}` | SSE |
+| POST `/api/chats/:id/continue` | `{messageId?,modelId?,...execution}` | SSE appended to the last assistant message |
 | POST `/api/chats/:id/edit` | `{messageId,content,modelId?,attachmentIds?:string[],...execution}` | SSE |
 | POST `/api/chats/:id/stop` | — | `{ok:true}` |
 | POST `/api/files` | Multipart field `files` | `{files:Attachment[]}` |
@@ -88,6 +92,12 @@ Defaults are `chat`, `auto`, `[]`, and `false`; generation otherwise inherits sa
 | DELETE `/api/files/:id` | — | `{ok:true}` |
 
 Editing replaces the selected user message and removes all later messages. Regeneration removes messages after the most recent user message and generates again. Clients should make this consequence clear before an edit. Chat deletion also deletes its Work artifacts and releases unreferenced upload attachments.
+
+Continuation retains the last assistant message ID and existing text, adds the saved reply and continuation instruction to a new provider request, and appends new deltas. The optional `messageId` must match the last assistant message. Sending a standalone recognized continuation request such as `继续` or `continue`, without attachments, is routed to the same behavior. It works for failed, stopped, or completed tail replies. Earlier replies and active replies cannot be resumed directly. A sufficiently long exact prefix overlap is removed; semantic repetition cannot be reliably deduplicated. Each continuation is a new generation request and consumes normal quota/upstream usage.
+
+Displayed deltas are saved before emission, including when a connection fails or the application restarts. This does not restore tokens the server never received or an upstream model's hidden session state. Native Work additionally uses owned, encrypted tool checkpoints; completed calls are not replayed, while interrupted calls with uncertain outcomes are returned to the model for inspection. The checkpoint's upstream model ID and protocol must remain compatible. CLI Work resumes only visible conversation and saved output files.
+
+By default, a user can generate in four distinct chats at once (`MAX_CONCURRENT_PER_USER`, 1–32), subject to the global limit of ten (`MAX_CONCURRENT_CHATS`). Each chat permits one active generation; another request for the same chat is rejected until it finishes or stops. The Work runner has a separate default limit of two concurrent sandboxes.
 
 Uploads accept PNG/JPEG/WebP/GIF images, UTF-8 text/code, text PDFs, DOCX text, and XLSX cells. Limits are 10 MB per file and five files per request. PDF OCR, Office macros, and spreadsheet formula execution are not provided by upload parsing. Upload storage is limited to 200 MB and 500 files per user. See the deployment documentation for parsing boundaries.
 
@@ -107,7 +117,7 @@ A streaming request may first fail with ordinary JSON before SSE headers are sen
 
 SSE comment heartbeats are sent while waiting. Browser disconnects abort generation; explicit stop is also supported. Activity labels do not contain tool arguments, credential values, or private chain-of-thought. Ordinary users receive generic generation errors; administrators inspect detailed failures through the administrator endpoints below.
 
-Chat with a direct API channel calls its selected protocol. Chat with a `claude-code` channel uses the runner with tools disabled. Work uses Claude Code through eligible Anthropic channels, even if the provider normally uses direct API for Chat. Work artifacts and activities have their own events; writing code in a text reply alone does not create a downloadable file.
+Chat with a direct API channel calls its selected protocol. Chat with a `claude-code` channel uses the optional CLI runner with tools disabled. Work with `runtime:'api'` uses the native API tool engine inside Docker; Work with `runtime:'claude-code'` uses the separately installed optional CLI image and requires Anthropic protocol. Work artifacts and activities have their own events; writing code in a text reply alone does not create a downloadable file.
 
 ## Administrator connections and models
 
@@ -115,7 +125,7 @@ Chat with a direct API channel calls its selected protocol. Chat with a `claude-
 
 ```text
 {id,name,baseUrl,protocol:'openai-chat'|'openai-responses'|'anthropic',
- runtime:'api'|'claude-code',enabled,hasKey,keyHint,lastSyncedAt,lastSyncError,
+ runtime:'api'|'claude-code',responsesProfile:'auto'|'standard'|'codex',enabled,hasKey,keyHint,lastSyncedAt,lastSyncError,
  createdAt,priority,failureThreshold,cooldownSeconds,authMode}
 ```
 
@@ -124,20 +134,24 @@ Ordinary provider CRUD responses never contain the full saved API key. Parse pre
 | Method and path | Input | Response |
 | --- | --- | --- |
 | GET `/api/admin/providers` | — | `{providers:Provider[]}` |
-| POST `/api/admin/providers` | `{name,baseUrl,protocol,apiKey,enabled?,runtime?,authMode?,priority?,failureThreshold?,cooldownSeconds?}` | `{provider}`, 201 |
+| POST `/api/admin/providers` | `{name,baseUrl,protocol,apiKey,enabled?,runtime?,responsesProfile?,authMode?,priority?,failureThreshold?,cooldownSeconds?}` | `{provider}`, 201 |
 | PATCH `/api/admin/providers/:id` | Optional create fields | `{provider}` |
 | DELETE `/api/admin/providers/:id` | — | `{ok:true}` |
 | POST `/api/admin/providers/:id/sync` | — | `{models:AdminModel[],count:number}` |
 | GET `/api/admin/models` | — | `{models:AdminModel[],defaultModelId}` |
-| POST `/api/admin/models` | `{providerId,modelId,name?,routeKey?,vision?,reasoningEfforts?}` | `{model}`, 201 |
-| PATCH `/api/admin/models/:id` | `{name?,routeKey?,enabled?,vision?,reasoningEfforts?,isDefault?}` | `{model}` |
+| POST `/api/admin/models` | `{providerId,modelId,name?,routeKey?,vision?,reasoningEfforts?,contextWindow?,maxOutputTokens?}` | `{model}`, 201 |
+| PATCH `/api/admin/models/:id` | `{name?,routeKey?,enabled?,vision?,reasoningEfforts?,contextWindow?,maxOutputTokens?,isDefault?}` | `{model}` |
 | DELETE `/api/admin/models/:id` | — | `{ok:true}` |
 | POST `/api/admin/models/:id/test` | — | `{ok:boolean,latencyMs:number,error?:string,diagnostic?:object}` |
 | POST `/api/admin/models/:id/reset-health` | — | `{model}` |
 
 An empty `apiKey` in PATCH preserves the saved key. Allowed authentication modes are `auto`, `bearer`, and `x-api-key`. `claude-code` requires `anthropic` protocol and a configured runner. API base URLs must be public HTTPS addresses without embedded credentials, query strings, or fragments. A loopback-only exception exists for explicitly enabled local tests.
 
-`AdminModel` is a channel record with `{id,providerId,providerName,modelId,name,routeKey,reasoningEfforts,enabled,vision,available,status,lastCheckedAt,error,failureCount,cooldownUntil}`. Its ID is the database model ID, and its `modelId` is the exact upstream model name. The model page groups these records by `routeKey`; the API still returns the individual channel records.
+`responsesProfile` selects Responses request compatibility. `auto` uses Codex-compatible requests for `anyrouter.top` and standard requests for ordinary providers; `standard` and `codex` explicitly override that choice. Chat and native Work share this adapter. It adjusts request shape and compatible headers, includes encrypted reasoning content, disables remote storage, and streams with explicit instructions. It does not install or run Codex CLI and does not guarantee access for a provider-restricted key. Codex-compatible requests omit `max_output_tokens`, so the upstream's default determines the individual response limit; standard Responses continues to send the configured budget. Claude-specific access uses the separate Anthropic/Claude Code path instead.
+
+`AdminModel` is a channel record with `{id,providerId,providerName,modelId,name,routeKey,reasoningEfforts,contextWindow,maxOutputTokens,enabled,vision,available,status,lastCheckedAt,error,failureCount,cooldownUntil}`. Its ID is the database model ID, and its `modelId` is the exact upstream model name. The model page groups these records by `routeKey`; the API still returns the individual channel records.
+
+`contextWindow` is null or 1024–10000000 tokens; model `maxOutputTokens` is null or 128–1000000 tokens. These describe provider capabilities, distinct from the workspace's chosen per-request output budget. Synchronization reads capacity metadata where provided, fills missing values, and preserves existing administrator values; null clears a manual value. Unknown limits are left null instead of guessed.
 
 Sync queries the upstream's actual model list, preserves existing administrator choices, disables new records pending selection, and marks disappeared non-manual records unavailable. Manual records remain available and are enabled on creation. A test performs a small real generation and can consume upstream credits; it does not test the entire Work toolchain. Stored `reasoningEfforts` contains the explicit non-`auto` levels; an empty array permits only automatic effort.
 
@@ -223,11 +237,12 @@ Only the configured provider origin and service prefix are used. URLs are DNS-ch
 `GET /api/work/capabilities` requires a session and returns:
 
 ```text
-{available:boolean,reason:string|null,runtime:'claude-code',skills:Skill[],
+{available:boolean,reason:string|null,runtime:'sandbox',
+ engines?:{native:boolean,'claude-code':boolean},skills:Skill[],
  tools:string[],webSearchSupported:true,webSearchNote:string,limits:WorkSettings}
 ```
 
-`available` checks configuration, the administrator's enabled flag, and runner health; health is briefly cached. The `webSearchSupported` flag means the integration offers a WebSearch option. Actual search availability depends on the selected upstream channel and model. It is not a general-purpose unrestricted browser API.
+`available` checks configuration, the administrator's enabled flag, and runner health; health is briefly cached. `engines`, when returned by runner health, distinguishes the default native sandbox from the separately installed optional CLI image. The `webSearchSupported` flag means the integration offers a search option: native search uses Anthropic or Responses server tools; Chat Completions has no standard built-in search. Actual availability depends on the selected upstream channel and model. It is not a general-purpose unrestricted browser API.
 
 `Skill` is `{id,name,description,createdAt,updatedAt,content?:string}`. Skills are workspace-wide administrator-managed Markdown instructions, not arbitrary installed application plugins.
 
@@ -259,7 +274,7 @@ Work settings responses are `{configured,...capabilities,settings:WorkSettings,l
 | `maxBudgetUsd` | 2 | 0.1–20 |
 | `maxConcurrentJobs` | 2 | 1–4 |
 
-Unknown settings are rejected. `maxBudgetUsd` is a Claude Code execution budget, not a prepaid balance reservation or a guarantee about a third-party provider's billing. The application's outer streaming deadline uses the configured runner timeout plus 60 seconds for runner-backed requests; direct API requests retain a ten-minute outer limit. Work job submission is integrated into chat generation; there is no public standalone `/jobs` API or durable background-task API. See [WORK.md](WORK.md) for runner deployment and sandbox boundaries.
+Unknown settings are rejected. `maxBudgetUsd` applies only to the optional Claude Code execution budget; native execution enforces rounds/output/time/resources rather than an inferred USD amount. Neither is a prepaid balance reservation or a guarantee about third-party billing. The application's outer streaming deadline uses the configured runner timeout plus 60 seconds for runner-backed requests. Direct API requests use a default one-hour outer limit (`CHAT_TIMEOUT_SECONDS`, 60–21600 seconds) and an independent inactivity timeout (`UPSTREAM_TIMEOUT_MS`, default 180000 ms) refreshed by received data. Work job submission is integrated into chat generation; there is no public standalone `/jobs` API or durable background-task API. See [WORK.md](WORK.md) for runner deployment and sandbox boundaries.
 
 ## Workspace settings, users, and invitations
 

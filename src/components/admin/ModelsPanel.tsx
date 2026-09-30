@@ -8,6 +8,10 @@ import ModelTestResult, { type ModelTestReport, type ModelTestResponse } from '.
 function EffortFields({ values = [] }: { values?: string[] }) {
   return <fieldset className="model-effort-fields"><legend>支持的思考强度</legend><p className="field-help">自动始终可用。只勾选此模型和接口实际接受的参数，未勾选的选项不会向用户显示。</p><div className="model-effort-options">{['low', 'medium', 'high', 'xhigh', 'max'].map(value => <label className="checkbox-label compact" key={value}><input type="checkbox" name="reasoningEfforts" value={value} defaultChecked={values.includes(value)}/>{effortLabels[value]} <small>{value}</small></label>)}</div></fieldset>;
 }
+function CapacityFields({ model }: { model?: AdminModel }) {
+  return <div className="form-grid"><label>上下文容量（tokens）<input name="contextWindow" type="number" min={1024} max={10000000} step={1} defaultValue={model?.contextWindow ?? ''} placeholder="未声明，留空"/><span className="field-help">以服务商的实际模型容量为准；留空不会猜测模型限制。</span></label><label>最大输出（tokens）<input name="maxOutputTokens" type="number" min={128} max={1000000} step={1} defaultValue={model?.maxOutputTokens ?? ''} placeholder="未设置，使用站点默认值"/><span className="field-help">单次调用的输出上限，不能超过模型实际支持的限制。</span></label></div>;
+}
+const capacityValues = (form: FormData) => ({ contextWindow: form.get('contextWindow') ? Number(form.get('contextWindow')) : null, maxOutputTokens: form.get('maxOutputTokens') ? Number(form.get('maxOutputTokens')) : null });
 export default function ModelsPanel({ models, providers, defaultModelId, run, busy }: { models: AdminModel[]; providers: Provider[]; defaultModelId: string | null; run: RunAction; busy: string }) {
   const [editing, setEditing] = useState<AdminModel | null>(null);
   const [testReport, setTestReport] = useState<ModelTestReport | null>(null);
@@ -24,7 +28,7 @@ export default function ModelsPanel({ models, providers, defaultModelId, run, bu
   const visible = groups.filter(group => group.channels.some(model => `${model.name} ${model.modelId} ${group.key} ${model.providerName || ''} ${providers.find(provider => provider.id === model.providerId)?.name || ''}`.toLowerCase().includes(query.toLowerCase())));
   async function add(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    const ok = await run('model-add', () => post('/admin/models', { providerId: form.get('providerId'), modelId: form.get('modelId'), name: form.get('name'), routeKey: form.get('routeKey') || undefined, vision: form.get('vision') === 'on', reasoningEfforts: form.getAll('reasoningEfforts') }), '模型已添加。相同统一模型名的渠道已归入同一模型。');
+    const ok = await run('model-add', () => post('/admin/models', { providerId: form.get('providerId'), modelId: form.get('modelId'), name: form.get('name'), routeKey: form.get('routeKey') || undefined, vision: form.get('vision') === 'on', reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form) }), '模型已添加。相同统一模型名的渠道已归入同一模型。');
     if (ok) setAdding(false);
   }
   async function test(model: AdminModel) {
@@ -48,18 +52,18 @@ export default function ModelsPanel({ models, providers, defaultModelId, run, bu
       <label>上游模型 ID<input name="modelId" placeholder="填写服务商提供的模型 ID" required/></label>
       <label>显示名称<input name="name" placeholder="可选，默认使用模型 ID"/></label>
       <label>统一模型名<input name="routeKey" placeholder="留空使用模型 ID" maxLength={120}/><span className="field-help">填写相同统一模型名的渠道会合并；失败时可以相互切换。</span></label>
-      <label className="checkbox-label"><input name="vision" type="checkbox"/>支持图片输入</label><EffortFields/>
+      <label className="checkbox-label"><input name="vision" type="checkbox"/>支持图片输入</label><EffortFields/><CapacityFields/>
       <div className="form-actions"><button className="button primary" disabled={!!busy}>添加模型</button></div>
     </form>}
     {editing && <form className="settings-card stack" key={editing.id} onSubmit={async event => {
       event.preventDefault(); const form = new FormData(event.currentTarget);
-      if (await run('model-edit', () => patch(`/admin/models/${editing.id}`, { name: form.get('name'), routeKey: form.get('routeKey'), reasoningEfforts: form.getAll('reasoningEfforts') }), '渠道模型设置已保存。')) setEditing(null);
+      if (await run('model-edit', () => patch(`/admin/models/${editing.id}`, { name: form.get('name'), routeKey: form.get('routeKey'), reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form) }), '渠道模型设置已保存。')) setEditing(null);
     }}>
       <div className="card-heading"><strong>编辑渠道模型</strong><button type="button" className="icon-button" aria-label="关闭编辑" onClick={() => setEditing(null)}><X size={16}/></button></div>
       <p className="muted small-text">{editing.providerName || providers.find(provider => provider.id === editing.providerId)?.name} · {editing.modelId}</p>
       <label>显示名称<input name="name" defaultValue={editing.name} required maxLength={120}/></label>
       <label>统一模型名<input name="routeKey" defaultValue={editing.routeKey || editing.modelId} required maxLength={120}/><span className="field-help">只合并能力相当、允许相互替代的模型。</span></label>
-      <EffortFields values={editing.reasoningEfforts}/>
+      <EffortFields values={editing.reasoningEfforts}/><CapacityFields model={editing}/>
       <div className="form-actions"><button className="button primary" disabled={!!busy}>保存</button></div>
     </form>}
     <div className="search-input bordered"><Search size={16}/><input aria-label="搜索模型或渠道" placeholder="搜索模型或渠道" value={query} onChange={event => setQuery(event.target.value)}/><span className="muted small-text">{groups.length} 个模型</span></div>
@@ -81,7 +85,7 @@ export default function ModelsPanel({ models, providers, defaultModelId, run, bu
               <div className="model-admin-meta"><span className={`model-status ${model.status}`}>{model.available === false ? '上游已不可用' : model.status === 'ok' ? '连接正常' : model.status === 'error' ? '测试失败' : '尚未测试'}</span>
                 <label className="checkbox-label compact"><input type="checkbox" checked={model.vision} disabled={!!busy} onChange={event => void run(`vision-${model.id}`, () => patch(`/admin/models/${model.id}`, { vision: event.target.checked }))}/><Eye size={12}/>识图</label>
                 <div className="model-row-actions">
-                  <button className="icon-button" title="编辑名称、路由与思考强度" aria-label={`编辑 ${providerName} 的模型`} disabled={!!busy} onClick={() => setEditing(model)}><Pencil size={14}/></button>
+                  <button className="icon-button" title="编辑名称、路由、思考强度与容量" aria-label={`编辑 ${providerName} 的模型`} disabled={!!busy} onClick={() => setEditing(model)}><Pencil size={14}/></button>
                   <button className="icon-button" title="重置失败记录和冷却状态" aria-label={`重置 ${providerName} 健康状态`} disabled={!!busy || (!model.failureCount && !model.cooldownUntil)} onClick={() => void run(`reset-${model.id}`, () => post(`/admin/models/${model.id}/reset-health`), '冷却与失败记录已重置。')}><RotateCcw size={14}/></button>
                   <button className={`icon-button ${defaultModelId === model.id ? 'star-active' : ''}`} title="设为默认模型" aria-label={`将 ${model.name} 设为默认模型`} disabled={!!busy || !model.enabled || model.available === false} onClick={() => void run(`default-${model.id}`, () => patch(`/admin/models/${model.id}`, { isDefault: true }), '默认模型已更新。')}><Star size={14}/></button>
                   <button className="icon-button" title="测试模型（消耗少量额度）" aria-label={`测试 ${providerName} 的 ${model.modelId}`} disabled={!!busy || model.available === false} onClick={() => setTesting(model)}>{busy === `test-${model.id}` ? <LoaderCircle size={14} className="spin"/> : <TestTubeDiagonal size={14}/>}</button>

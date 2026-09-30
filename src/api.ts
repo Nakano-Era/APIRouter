@@ -43,7 +43,7 @@ export async function stream(path: string, body: unknown, signal: AbortSignal, o
       if (done) break;
     }
     if (buffer.trim()) dispatch(buffer);
-    if (!completed && !signal.aborted) throw new Error('连接提前结束，请重试或重新生成回答。');
+    if (!completed && !signal.aborted) throw new Error('连接提前结束。已收到的内容会保留，可点击“继续生成”接着输出。');
   } finally { reader.releaseLock(); }
 }
 export function errorText(error: unknown) { return error instanceof Error ? error.message : '操作未完成，请重试。'; }

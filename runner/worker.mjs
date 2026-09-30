@@ -4,6 +4,7 @@ import { constants } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
+import { createHash } from 'node:crypto';
 import { claudeArguments, validateJob, validateSkill, safeRelativePath, MAX_ARTIFACTS, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_TOTAL, parseClaudeEvent } from './protocol.mjs';
 
 export async function collectArtifacts(directory, limits = {}) {
@@ -49,7 +50,7 @@ export async function collectArtifacts(directory, limits = {}) {
   return files;
 }
 
-export async function runWorker(input, { cwd = '/workspace', emit = event => process.stdout.write(JSON.stringify(event) + '\n'), spawnProcess = spawn } = {}) {
+export async function runWorker(input, { cwd = '/workspace', emit = event => process.stdout.write(JSON.stringify(event) + '\n'), spawnProcess = spawn, nativeRunner } = {}) {
   const job = validateJob(input);
   if (!/^http:\/\/gateway:3210\/proxy\/[a-f0-9]{32}$/.test(input.gateway) || !/^[A-Za-z0-9_-]{43}$/.test(input.jobToken)) throw new Error('Invalid per-job gateway');
   await mkdir(join(cwd, 'output'), { recursive: true });
@@ -64,6 +65,30 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, 'SKILL.md'), checked.content, { mode: 0o600 });
   }
+  const fileHashes = new Map();
+  const snapshot = async () => {
+    if (job.mode !== 'work') return;
+    for (const file of await collectArtifacts(join(cwd, 'output'))) {
+      const hash = createHash('sha256').update(file.data).digest('hex');
+      if (fileHashes.get(file.path) === hash) continue;
+      await emit({ type: 'file', file }); fileHashes.set(file.path, hash);
+    }
+  };
+  if (job.engine === 'native') {
+    const execute = nativeRunner ?? (await import('./native-agent.mjs')).runNativeAgent;
+    try {
+      await execute(job, { cwd, signal: AbortSignal.timeout(job.limits.timeoutSeconds * 1000), emit: async event => {
+        // Save the workspace before acknowledging the corresponding tool journal.
+        // A crash before this acknowledgement leaves a pending, never-replayed call.
+        if (event.type === 'checkpoint') await snapshot();
+        await emit(event);
+      } });
+    } catch (error) {
+      await emit({ type: 'error', code: error.code || 'WORK_EXECUTION_FAILED', error: String(error.message || '工作任务中断，已保留进度。'), diagnostic: { rawBody: error.rawDiagnostic?.body || error.message, source: 'native-agent' } });
+    } finally { await snapshot(); }
+    await emit({ type: 'done' });
+    return;
+  }
   const state = { finished: false, streamed: false, tools: new Set() };
   let stderr = '';
   const child = spawnProcess('claude', claudeArguments(job), {
@@ -72,7 +97,7 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
       ANTHROPIC_BASE_URL: input.gateway, ANTHROPIC_AUTH_TOKEN: input.jobToken,
       ANTHROPIC_DEFAULT_OPUS_MODEL: job.model, ANTHROPIC_DEFAULT_SONNET_MODEL: job.model, ANTHROPIC_DEFAULT_HAIKU_MODEL: job.model, CLAUDE_CODE_SUBAGENT_MODEL: job.model,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_AUTOUPDATER: '1', DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '16384', API_TIMEOUT_MS: String(Math.min(job.limits.timeoutSeconds * 1000, 180_000)) },
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(job.maxOutputTokens), API_TIMEOUT_MS: String(job.limits.timeoutSeconds * 1000) },
   });
   const exit = new Promise(resolveExit => { child.once('error', error => resolveExit({ code: null, error })); child.once('close', (code, signal) => resolveExit({ code, signal })); });
   const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch {} } };
@@ -90,7 +115,8 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
       if (!line.trim()) continue;
       let row;
       try { row = JSON.parse(line); } catch { continue; }
-      for (const event of parseClaudeEvent(row, state)) emit(event);
+      for (const event of parseClaudeEvent(row, state)) await emit(event);
+      if (row.type === 'user' && row.message?.content?.some?.(item => item.type === 'tool_result')) await snapshot();
     }
   } } catch (error) { killGroup(); await exit; throw error; }
   buffer += decoder.end();
@@ -100,16 +126,14 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
   killGroup();
   if (result.error) throw result.error;
   if (!state.finished) emit({ type: 'error', code: 'CLAUDE_EXECUTION_FAILED', error: 'Claude Code 未完成响应，请管理员检查运行日志。', diagnostic: { rawBody: stderr || `Claude exited with code ${result.code}, signal ${result.signal}`, source: 'claude-code' } });
-  if (job.mode === 'work') {
-    for (const file of await collectArtifacts(join(cwd, 'output'))) emit({ type: 'file', file });
-  }
+  await snapshot();
   emit({ type: 'done' });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     let input = ''; const decoder = new StringDecoder('utf8');
-    for await (const chunk of process.stdin) { input += decoder.write(chunk); if (input.length > 45 * 1024 * 1024) throw new Error('Job input too large'); }
+    for await (const chunk of process.stdin) { input += decoder.write(chunk); if (input.length > 128 * 1024 * 1024) throw new Error('Job input too large'); }
     input += decoder.end();
     await runWorker(JSON.parse(input));
   } catch (error) {

@@ -45,7 +45,8 @@ test('HTTP Chat and Work select the configured runtime, persist controls and hid
   assert.equal(sent.status, 200); assert.match(sent.text, /event: done/); assert.match(sent.text, /event: activity/);
   assert.equal(calls.length, 1); assert.equal(calls[0].provider.runtime, 'claude-code'); assert.equal(calls[0].model.modelId, 'private-wire-model');
   assert.equal(calls[0].effort, 'high'); assert.equal(calls[0].mode, 'work'); assert.deepEqual(calls[0].skillIds, ['skill-one']); assert.equal(calls[0].webSearch, true);
-  assert.deepEqual(calls[0].context, { userId: setup.data.user.id, chatId: chat.id });
+  assert.equal(calls[0].context.userId, setup.data.user.id); assert.equal(calls[0].context.chatId, chat.id);
+  assert.equal(calls[0].context.continuation, false); assert.ok(calls[0].context.assistantId);
   assert.ok(!sent.text.includes('Private source') && !sent.text.includes('private-wire-model') && !sent.text.includes('sk-fixture-private'));
   const saved = (await request(`/api/chats/${chat.id}`)).data;
   assert.equal(saved.chat.effort, 'high'); assert.equal(saved.chat.mode, 'work'); assert.equal(saved.messages.at(-1).sourceProvider, undefined);

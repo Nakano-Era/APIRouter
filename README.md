@@ -1,12 +1,12 @@
 # APIRouter
 
-**部署在自己 VPS 上的 AI 工作空间，支持 Chat / Work、Claude Code 沙箱、多 API 来源、自动切换与会员订阅。**
+**部署在自己 VPS 上的 AI 工作空间，支持 Chat / Work、Docker 沙箱、中断续写、多 API 来源、自动切换与会员订阅。**
 
 APIRouter 提供接近 ChatGPT 网页版的聊天体验，将模型接入、渠道管理、成员邀请和套餐配置集中到一个站点。浏览器通过本站后端调用模型，管理员在网页中配置服务地址与 API Key，成员无需自行填写密钥。
 
 适合个人与受邀成员使用。当前版本采用单实例部署，无需显卡，也无需在 VPS 上运行大模型。
 
-[快速开始](#快速开始) · [VPS 部署指南](docs/DEPLOY-VPS.md) · [Claude Code 与 Work](docs/WORK.md) · [会员与支付](docs/MEMBERSHIP.md) · [接口文档](docs/API-CONTRACT.md)
+[快速开始](#快速开始) · [VPS 部署指南](docs/DEPLOY-VPS.md) · [Work 沙箱](docs/WORK.md) · [会员与支付](docs/MEMBERSHIP.md) · [接口文档](docs/API-CONTRACT.md)
 
 > 本项目使用独立的名称与图标，与 OpenAI、ChatGPT 无隶属关系。本站套餐由站点管理员提供，与 ChatGPT 官方订阅互不通用。
 
@@ -14,11 +14,11 @@ APIRouter 提供接近 ChatGPT 网页版的聊天体验，将模型接入、渠�
 
 | 模块 | 支持内容 |
 | --- | --- |
-| 聊天体验 | 流式回答、停止生成、Markdown、代码高亮与复制、编辑重发、重新生成、Markdown 导出 |
+| 聊天体验 | 流式回答、停止生成、中断续写、Markdown、代码高亮与复制、编辑重发、重新生成、Markdown 导出 |
 | 对话管理 | 新建、搜索、重命名、置顶、归档与删除；桌面侧栏折叠、移动端布局、深浅主题 |
 | 模型接入 | 直接 API 或 Claude Code；OpenAI Chat Completions、Responses、Anthropic Messages；多个地址与 Key 独立配置 |
-| 模型管理 | 按统一模型分组、展开管理各渠道；同步、手动添加、识图、测试、思考强度配置 |
-| Work 任务 | 每次任务独立 Docker 沙箱，Agent、技能、读写文件、执行代码、按需 WebSearch、实际文件下载 |
+| 模型管理 | 按统一模型分组、展开管理各渠道；同步容量信息、手动添加、识图、测试、思考强度与上下文配置 |
+| Work 任务 | 普通 API 驱动独立 Docker 沙箱，子任务、技能、读写文件、执行代码、按需搜索、实际文件下载；Claude Code 可选 |
 | 连接管理 | 粘贴识别 New API JSON / 环境变量；余额或额度查询；明文或加密备份全部渠道及模型映射 |
 | 问题诊断 | 管理员查看上游原始错误正文、状态码与请求信息；凭据脱敏、加密保存；成员侧隐藏渠道 |
 | 渠道路由 | 等价模型映射、渠道优先级、失败重试、自动切换、连续失败冷却、恢复探测与尝试日志 |
@@ -30,10 +30,10 @@ APIRouter 提供接近 ChatGPT 网页版的聊天体验，将模型接入、渠�
 ## 界面预览
 
 <p align="center">
-  <img src="docs/images/work-desktop.png" alt="APIRouter Work 模式，包含任务活动、文件下载、模式、模型与思考强度选择" width="960" />
+  <img src="docs/images/work-desktop.png" alt="APIRouter 桌面 Work 首页，输入框内提供模式、搜索、技能、模型与思考强度选择" width="960" />
 </p>
 <p align="center">
-  <img src="docs/images/work-mobile.png" alt="APIRouter 移动端 Work 模式与文件下载" width="300" />
+  <img src="docs/images/work-mobile.png" alt="APIRouter 移动端 Work 首页与浅色主题" width="300" />
 </p>
 
 截图来自本地模拟执行的界面验收，没有调用真实模型或 Docker。测试模型、账号与套餐不随正式部署初始化，首次安装需自行配置。
@@ -49,7 +49,7 @@ cd /opt/APIRouter
 sudo bash deploy.sh chat.example.com --install-docker --with-work
 ```
 
-将 `chat.example.com` 替换为自己的域名。脚本会构建应用、Claude Code 工作镜像和 HTTPS 入口；在支持的 Ubuntu/Debian 系统上，`--install-docker` 可安装 Docker。已有 Docker 时不会重新安装。仅需直接 API 聊天可去掉 `--with-work`，日后运行 `sudo bash deploy/work-enable.sh` 即可启用 Work。
+将 `chat.example.com` 替换为自己的域名。脚本会构建应用、通用 Docker 工作沙箱和 HTTPS 入口；在支持的 Ubuntu/Debian 系统上，`--install-docker` 可安装 Docker。已有 Docker 时不会重新安装。仅需直接 API 聊天可去掉 `--with-work`，日后运行 `sudo bash deploy/work-enable.sh` 即可启用 Work。默认 Work 不安装 Claude Code；需要该可选引擎时再运行 `sudo bash deploy.sh --with-claude-code`。
 
 打开 `https://你的域名`，使用终端日志中的**首次管理员设置码**创建账号。若需要再次查看日志：
 
@@ -70,7 +70,7 @@ sudo docker compose logs --tail=30 app
 | 磁盘 | 聊天至少预留 10 GB；含 Work 建议 20 GB，随镜像、文件及备份增加 |
 | GPU | 不需要，推理由上游 API 服务商完成 |
 
-以上为按实现估算的起点，尚未经过生产容量压测。默认全站最多同时生成 10 条回复、每位用户 2 条；执行器另限同时 2 个沙箱，每个默认 768 MB / 1 CPU / 10 分钟。这些是保护限额，不代表经过验证的承载能力。可在后台调整 Work 资源。
+以上为按实现估算的起点，尚未经过生产容量压测。默认全站最多同时生成 10 条回复、每位用户 4 条，不同对话可并行，同一对话按顺序执行；执行器另限同时 2 个沙箱，每个默认 768 MB / 1 CPU / 10 分钟。这些是保护限额，不代表经过验证的承载能力。可在后台调整 Work 资源。
 
 ### 本地开发
 
@@ -96,16 +96,22 @@ npm start
 ## 首次配置
 
 1. 打开左下角账户菜单，进入**管理工作空间**。
-2. 在 **API 连接**添加地址、协议与 Key，或粘贴 New API 导出的连接 JSON，检查识别预览后保存。Claude Code 运行方式需要兼容的 Anthropic Messages 渠道及已启用的执行器。
+2. 在 **API 连接**添加地址、协议与 Key，或粘贴 New API 导出的连接 JSON，检查识别预览后保存。普通 Chat 和 Work 都可选择“直接 API”；只有可选 Claude Code 运行方式需要兼容的 Anthropic Messages 渠道及对应镜像。
 3. 同步模型列表；若上游不提供列表接口，可在**模型**页手动填写真实模型 ID。
 4. 启用需要开放的模型并设置默认模型。新同步的模型默认禁用；图片输入需单独开启“识图”。
 5. 执行一次模型测试，确认当前密钥可以调用。测试会消耗少量上游额度。
-6. 在后台 **Work** 查看执行器状态、设置资源、导入技能；聊天输入区可选 Chat / Work、模型和思考强度。
+6. 在后台 **Work** 查看执行器状态、设置资源、导入技能；聊天输入区可选 Chat / Work、模型和思考强度。普通 API 的 Work 需要上游支持工具调用。
 7. 在**成员与邀请**中创建邀请，或进入**套餐与支付**配置会员方案。
 
 保存 API 配置后无需重启服务。模型列表同步成功与真实调用成功分别记录，列表中存在某个模型并不代表当前账号一定有调用权限。
 
+AnyRouter 的 GPT / Codex 风格接口选择“直接 API”与 Responses，使用自动或显式 Codex 兼容配置；自动模式仅对 `anyrouter.top` 启用该适配，其他域名保留标准格式。适配共享于 Chat 和原生 Work，不安装 Codex CLI，也不能保证专属 Key 的调用权限。Codex 兼容模式不发送 `max_output_tokens`，单次长度使用上游默认值；标准 Responses 继续使用站点输出上限。Claude 专属接口则使用 Anthropic Messages 与可选 Claude Code 引擎。真实 AnyRouter 账号仍需自行测试。
+
 思考强度默认“自动”，不会额外向直接 API 发送强度参数。管理员按各渠道实际支持的档位配置；显式选择强度后只路由到兼容渠道。余额查询需要选择服务商支持的适配方式，不支持查询的渠道会显示“不可用”；New API 的令牌额度不等同于账户余额或美元金额。
+
+上下文容量和模型最大输出可从上游模型列表同步，也可由管理员按提供商规格设置。对话历史不再按固定 300 条静默截断；容量未知时完整发送可容纳的历史，由上游判断真实限制。已知容量用于选择更合适的渠道，估算不等同于服务商的 tokenizer。消息请求（含 JSON 包装）与完整历史传输仍有 32 MB 安全上限，达到时明确提示，不悄悄裁剪。
+
+回答超时、断网、主动停止或重启后，点击原回答的**继续生成**，也可发送“继续”。新内容追加到已有回答，原有文字保留；原生 Work 同时恢复已保存的文件与工具检查点，已完成的工具不会自动重放。检查点之间未保存的进程状态和上游隐藏状态无法恢复；续写是新请求，模型可能出现重复或改写，系统只自动移除足够长的精确重复片段。
 
 管理员在 API 连接页可下载所有渠道备份，包含完整密钥和模型映射。导出前验证当前账户密码；加密备份使用独立密码、scrypt 和 AES-256-GCM，可再次粘贴或上传导入。该备份不含用户和聊天记录，站点迁移仍需完整数据备份。
 
@@ -134,10 +140,10 @@ npm start
 | 同一渠道的同一模型连续失败 3 次 | 冷却 60 秒，期间跳过该模型渠道 |
 | 冷却结束 | 下一次请求触发单次恢复探测，成功后恢复使用 |
 | 单次用户请求 | 总计最多尝试 6 次，包含首次请求与重试 |
-| 已经输出正文后中断 | 保留已有内容并报错，不切换来源拼接回答 |
+| 已经输出正文后中断 | 保留已有内容，可选择继续追加；不中途自动切换来源重做 |
 | Work 已经开始工具调用 | 即使尚未输出正文，也不自动切换或重跑，避免重复修改文件或执行任务 |
 
-用户取消、无效参数及不支持的工具请求不会触发盲目重试。切换只发生在相同统一模型名内，不会自动更换为其他模型。后台可查看最近 200 条尝试记录及加密保存的原始错误正文，也可手动重置渠道健康状态。HTTP 错误正文最多保存 1 MB；Claude Code 网关最多 128 KB，截断会标注。密钥会脱敏，原始 HTML 仅按文字显示。普通用户的模型与消息接口不返回渠道名称、地址或上游模型映射。
+用户取消、无效参数及不支持的工具请求不会触发盲目重试。切换只发生在相同统一模型名内，不会自动更换为其他模型。后台可查看最近 200 条尝试记录及加密保存的原始错误正文，也可手动重置渠道健康状态。HTTP 错误正文最多保存 1 MB；沙箱网关最多 128 KB，截断会标注。密钥会脱敏，原始 HTML 仅按文字显示。普通用户的模型与消息接口不返回渠道名称、地址或上游模型映射。
 
 **重试可能产生额外上游费用。** 本站每日额度按用户提交的生成请求计数，不按内部渠道尝试次数重复扣减；上游仍可能对每次尝试分别收费。
 
@@ -168,7 +174,7 @@ Stripe 密钥、Webhook 事件、客户门户、续费与取消规则，以及�
 
 单文件最大 10 MB，每条消息最多 5 个文件，单个文件提取文字最多 20 万字符。每位用户默认可保存 200 MB、最多 500 个附件；删除对话会清理其中不再被引用的附件。
 
-Work 通过 Claude Code 在 Docker 中实际读写文件和执行代码，支持 Agent、管理员提供的 Markdown 技能，以及所选上游支持的 WebSearch。镜像预装 Python、Pillow、python-docx、openpyxl、ReportLab 和 python-pptx，可用于生成文档、表格、演示文稿、PDF 或 SVG；成功与质量仍取决于模型和技能。只有实际生成的文件才提供下载。
+Work 默认由普通 API 的工具调用驱动，在 Docker 中实际读写文件和执行代码，支持分派子任务、管理员提供的 Markdown 技能，以及 Anthropic / Responses 上游支持的搜索工具。Claude Code 是可选引擎。镜像预装 Python、Pillow、python-docx、openpyxl、ReportLab 和 python-pptx，可用于生成文档、表格、演示文稿、PDF 或 SVG；成功与质量仍取决于模型和技能。只有实际生成的文件才提供下载。
 
 **本项目不等同于完整 ChatGPT / Work。** 没有远程浏览器、语音、内置图像生成服务或关闭网页后继续执行的任务队列。工作沙箱不能任意访问互联网、挂载宿主目录或安装联网依赖。WebSearch 取决于上游兼容性；技能导入目前只支持单份 `SKILL.md`，不自动安装仓库脚本、hooks 或 MCP。详细范围见 [Work 指南](docs/WORK.md)。
 
@@ -203,11 +209,14 @@ API 来源、模型、套餐和支付密钥通过管理后台配置。以下环�
 | `TRUST_PROXY` | 单层可信反向代理设为 `1`，后端端口仅允许反代访问 |
 | `MASTER_KEY` | 可选，64 位十六进制主密钥；未设置时自动生成并保存 |
 | `SETUP_TOKEN` | 可选，指定首次管理员设置码 |
-| `MAX_CONCURRENT_CHATS` | `10`，全站同时生成上限；每位用户另限 2 条 |
+| `MAX_CONCURRENT_CHATS` | `10`，全站同时生成上限 |
+| `MAX_CONCURRENT_PER_USER` | `4`，每用户不同对话同时生成上限，范围 1–32；同一对话串行 |
 | `USER_STORAGE_MB` | `200`，每位用户的附件存储额度 |
-| `UPSTREAM_TIMEOUT_MS` | `180000`，单次上游调用时限，最高 10 分钟 |
+| `UPSTREAM_TIMEOUT_MS` | `180000`，直接 API 等待响应或流无新数据的超时，最高 10 分钟；持续收到数据会刷新计时 |
+| `CHAT_TIMEOUT_SECONDS` | `3600`，直接 API 单个任务总时限，范围 60–21600 秒 |
 | `ALLOW_PRIVATE_UPSTREAM` | 默认关闭，仅供本地测试回环接口使用 |
 | `WORK_RUNNER_URL` / `WORK_RUNNER_TOKEN` | Work 执行器地址与认证凭据；一键启用脚本自动配置，不应公开执行器端口 |
+| `WORK_CLAUDE_IMAGE` | 可选 Claude Code 镜像，`--with-claude-code` 自动配置；默认不需要 |
 | `COMPOSE_FILE` | 启用 Work 后由脚本设置为 `compose.yaml:compose.work.yaml`，保留在 `.env` |
 
 ## 开发与验证
@@ -217,7 +226,7 @@ API 来源、模型、套餐和支付密钥通过管理后台配置。以下环�
 ```text
 src/            聊天界面、设置面板与会员页面
 server/         鉴权、聊天、协议适配、路由、附件与支付
-runner/         Claude Code 网关、工作容器与协议
+runner/         API 工具引擎、工作容器、受控网关与可选 Claude Code
 tests/          本地自动化测试
 docs/           部署、会员与接口文档
 deploy/         Caddy 配置
@@ -240,7 +249,7 @@ npm run check   # 构建并测试
 ## 文档与反馈
 
 - [VPS 一键部署、更新与备份恢复](docs/DEPLOY-VPS.md)
-- [Claude Code、Work 沙箱与技能](docs/WORK.md)
+- [Work 沙箱、技能与可选 Claude Code](docs/WORK.md)
 - [套餐、人工审批与 Stripe 配置](docs/MEMBERSHIP.md)
 - [接口契约](docs/API-CONTRACT.md)
 

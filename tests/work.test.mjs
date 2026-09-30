@@ -18,7 +18,7 @@ import { safePublicRequest } from '../runner/network.mjs';
 const provider = { baseUrl: 'https://example.com/v1', protocol: 'anthropic', apiKey: 'sk-test-secret-never-worker', authMode: 'bearer' };
 const token = 'a'.repeat(43);
 const jobId = 'c'.repeat(32);
-const job = extra => ({ mode: 'work', model: 'claude-test', effort: 'high', prompt: '创建文件，回答中文', systemPrompt: '', webSearch: false, skills: [], files: [], images: [], limits: { ...DEFAULT_LIMITS }, ...extra });
+const job = extra => ({ engine: 'native', protocol: 'anthropic', mode: 'work', model: 'claude-test', effort: 'high', prompt: '创建文件，回答中文', systemPrompt: '', webSearch: false, skills: [], files: [], images: [], limits: { ...DEFAULT_LIMITS }, ...extra });
 function temp(t, beforeCleanup = () => {}) {
   const directory = mkdtempSync(join(tmpdir(), 'apirouter-work-test-'));
   t.after(() => { beforeCleanup(); const target = realpathSync(directory), root = realpathSync(tmpdir()); assert.ok(target.startsWith(root + sep) && target.includes('apirouter-work-test-')); rmSync(target, { recursive: true, force: true }); });
@@ -108,7 +108,7 @@ test('work worker uses only short-lived gateway token and decodes split Chinese 
       child.stdout.end(JSON.stringify({ type: 'result', subtype: 'success', result: '中文测试' }) + '\n'); child.stderr.end(); child.emit('close', 0, null);
     }); } }); return child;
   };
-  await runWorker({ ...job({ mode: 'chat' }), gateway: `http://gateway:3210/proxy/${jobId}`, jobToken: token, provider }, { cwd: directory, spawnProcess, emit: event => events.push(event) });
+  await runWorker({ ...job({ engine: 'claude-code', mode: 'chat' }), gateway: `http://gateway:3210/proxy/${jobId}`, jobToken: token, provider }, { cwd: directory, spawnProcess, emit: event => events.push(event) });
   assert.equal(events.find(event => event.type === 'delta').text, '中文测试');
   assert.equal(captured.command, 'claude'); assert.equal(captured.spawnOptions.env.ANTHROPIC_AUTH_TOKEN, token);
   assert.ok(!JSON.stringify(captured).includes(provider.apiKey)); assert.ok(events.some(event => event.type === 'done'));
@@ -130,7 +130,7 @@ test('work service unavailable by default and rejects incompatible protocols bef
   assert.equal(service.isConfigured(), false); assert.equal((await service.capabilities()).available, false);
   await assert.rejects(collect(service.stream(options())), error => error.code === 'WORK_NOT_CONFIGURED');
   const configured = fixture(t, { fetcher: () => { throw new Error('Must not request'); } }).service;
-  await assert.rejects(collect(configured.stream(options({ provider: { ...provider, protocol: 'openai-chat' } }))), error => error.code === 'WORK_PROTOCOL_UNSUPPORTED');
+  await assert.rejects(collect(configured.stream(options({ provider: { ...provider, runtime: 'claude-code', protocol: 'openai-chat' } }))), error => error.code === 'WORK_PROTOCOL_UNSUPPORTED');
   await assert.rejects(collect(configured.stream(options({ context: { userId: 'other', chatId: 'chat' } }))), /无权/);
 });
 
@@ -252,4 +252,94 @@ test('work deployment files keep socket out of app and preserve compose override
   assert.ok(!/^\s+ports:/m.test(compose)); assert.match(compose, /internal: true/);
   const deploy = readFileSync(new URL('../deploy/work-enable.sh', import.meta.url), 'utf8');
   assert.match(deploy, /COMPOSE_FILE=compose.yaml:compose.work.yaml/); assert.ok(!/source\s+\.env/.test(deploy));
+  const dockerfile = readFileSync(new URL('../runner/Dockerfile', import.meta.url), 'utf8');
+  assert.ok(!dockerfile.split('FROM worker AS claude-worker')[0].includes('@anthropic-ai/claude-code'));
+  assert.match(deploy, /--with-claude-code/);
+});
+
+test('native Work supports each API protocol and passes model context budgets without Claude Code', async t => {
+  const calls = [];
+  const { service } = fixture(t, { fetcher: async (_url, request) => { calls.push(JSON.parse(request.body)); return eventsResponse([{ type: 'delta', text: '实际回答' }, { type: 'done' }]); } });
+  for (const protocol of ['anthropic', 'openai-chat', 'openai-responses']) {
+    const result = await collect(service.stream(options({ provider: { ...provider, protocol, runtime: 'api' }, model: { modelId: 'any-provider-model', contextWindow: 1_000_000, maxOutputTokens: 65000 }, maxOutputTokens: 32000 })));
+    assert.equal(result[0].text, '实际回答');
+    assert.equal(calls.at(-1).engine, 'native'); assert.equal(calls.at(-1).protocol, protocol);
+    assert.equal(calls.at(-1).contextWindow, 1_000_000); assert.equal(calls.at(-1).maxOutputTokens, 32000);
+  }
+  assert.doesNotThrow(() => validateJob(job({ prompt: 'a'.repeat(2 * 1024 * 1024), maxOutputTokens: 100000 })));
+});
+
+test('native worker saves actual files before a completed-tool checkpoint and does not invoke CLI', async t => {
+  const directory = temp(t), events = [];
+  const state = { version: 1, model: 'claude-test', protocol: 'anthropic', history: [], journal: [{ id: 'one', status: 'completed' }], pendingCalls: [], visibleText: '', partial: null, completed: false };
+  await runWorker({ ...job(), gateway: `http://gateway:3210/proxy/${jobId}`, jobToken: token }, { cwd: directory, spawnProcess: () => { throw new Error('CLI must not run'); }, emit: event => events.push(event), nativeRunner: async (_job, runtime) => {
+    writeFileSync(join(runtime.cwd, 'output', 'report.txt'), '已实际创建');
+    await runtime.emit({ type: 'checkpoint', state });
+    await runtime.emit({ type: 'checkpoint', state });
+    return { completed: true, state };
+  } });
+  assert.deepEqual(events.map(event => event.type), ['file', 'checkpoint', 'checkpoint', 'done']);
+  assert.equal(Buffer.from(events[0].file.data, 'base64').toString(), '已实际创建');
+});
+
+test('native Work checkpoints are encrypted, survive service restarts, enforce ownership, and bind model/protocol', async t => {
+  const state = { version: 1, model: 'claude-test', protocol: 'openai-chat', history: [{ role: 'assistant', content: '工作历史' }], journal: [{ id: 'one', status: 'completed', result: '已写入' }], pendingCalls: [], visibleText: '', partial: null, completed: false };
+  let requestCount = 0, resumed;
+  const fetcher = async (_url, request) => {
+    const payload = JSON.parse(request.body); requestCount++;
+    if (requestCount > 1) { resumed = payload; return eventsResponse([{ type: 'done' }]); }
+    return eventsResponse([{ type: 'file', file: { path: 'saved.txt', data: Buffer.from('完成工具的文件').toString('base64') } }, { type: 'checkpoint', state }, { type: 'error', error: '连接中断', code: 'WORK_INTERRUPTED' }, { type: 'done' }]);
+  };
+  const { store, service } = fixture(t, { fetcher });
+  store.run("INSERT INTO messages(id,chat_id,role,content,created_at) VALUES (?,?,?,?,?)", 'answer', 'chat', 'assistant', '当前已输出内容', new Date().toISOString());
+  const requestOptions = options({ provider: { ...provider, protocol: 'openai-chat' }, context: { userId: 'owner', chatId: 'chat', assistantId: 'answer' } });
+  await assert.rejects(collect(service.stream(requestOptions)), /连接中断/);
+  const saved = store.get('SELECT * FROM work_checkpoints'); assert.ok(!saved.encrypted_state.includes('工作历史')); assert.deepEqual(JSON.parse(store.decrypt(saved.encrypted_state)), state);
+  assert.deepEqual(service.continuationCandidates(requestOptions.context, [
+    { id: 'a', model_id: 'different-model', protocol: 'openai-chat', runtime: 'api' },
+    { id: 'b', model_id: state.model, protocol: state.protocol, runtime: 'api' },
+    { id: 'c', model_id: state.model, protocol: 'anthropic', runtime: 'api' },
+  ]).map(row => row.id), ['b']);
+  service.close();
+  const recovered = createWorkService({ store, runnerUrl: 'http://runner:3210', runnerToken: token, fetcher }); t.after(() => recovered.close());
+  await collect(recovered.stream({ ...requestOptions, context: { ...requestOptions.context, continuation: true, resumeText: '精确末尾' } }));
+  assert.deepEqual(resumed.resumeState, state); assert.equal(resumed.resumeText, '精确末尾'); assert.equal(resumed.files[0].path, 'output/saved.txt');
+  await assert.rejects(collect(recovered.stream({ ...requestOptions, context: { ...requestOptions.context, userId: 'other', continuation: true } })), /无权/);
+  await assert.rejects(collect(recovered.stream({ ...requestOptions, model: { modelId: 'different-model' }, context: { ...requestOptions.context, continuation: true } })), error => error.code === 'WORK_CHECKPOINT_INCOMPATIBLE');
+  assert.equal(requestCount, 2);
+});
+
+for (const protocol of ['openai-chat', 'openai-responses']) test(`native gateway only permits selected ${protocol} endpoint, tools and token limit`, async t => {
+  let forwarded;
+  const broker = createBroker({ token, self: 'broker', docker: async () => '', publicRequest: async (url, options) => { forwarded = { url, ...options }; return { response: new Response('{}'), cleanup: async () => {} }; } });
+  const task = { id: jobId, network: `ar-work-${jobId}`, config: job({ protocol, maxOutputTokens: 4096 }), provider: { ...provider, protocol, authMode: 'auto' }, jobToken: 'z'.repeat(43), controller: new AbortController(), calls: 0 };
+  broker.jobs.set(jobId, task);
+  const base = await listen(broker.server); t.after(() => broker.close());
+  const endpoint = protocol === 'openai-chat' ? 'chat/completions' : 'responses';
+  const limitName = protocol === 'openai-chat' ? 'max_completion_tokens' : 'max_output_tokens';
+  const request = (body = {}, path = endpoint) => fetch(`${base}/proxy/${jobId}/v1/${path}`, { method: 'POST', headers: { authorization: `Bearer ${task.jobToken}`, 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-test', [limitName]: 1024, ...body }) });
+  assert.equal((await request({}, 'messages')).status, 403);
+  assert.equal((await request({ [limitName]: 4097 })).status, 400);
+  assert.equal((await request({ tools: [{ type: 'function', name: 'unknown_tool' }] })).status, 403);
+  if (protocol === 'openai-responses') assert.equal((await request({ background: true })).status, 403);
+  const tool = protocol === 'openai-chat' ? { type: 'function', function: { name: 'write_file', parameters: {} } } : { type: 'function', name: 'write_file', parameters: {} };
+  assert.equal((await request({ tools: [tool], store: true })).status, 200);
+  assert.equal(forwarded.url, `https://example.com/v1/${endpoint}`); assert.equal(forwarded.headers.authorization, `Bearer ${provider.apiKey}`); assert.equal(forwarded.headers['x-api-key'], undefined);
+  if (protocol === 'openai-responses') assert.equal(JSON.parse(forwarded.body).store, false);
+});
+
+test('native Work applies Codex format only after enforcing the job token budget', async t => {
+  let forwarded;
+  const broker = createBroker({ token, self: 'broker', docker: async () => '', publicRequest: async (url, options) => { forwarded = { url, ...options }; return { response: new Response('{}'), cleanup: async () => {} }; } });
+  const task = { id: jobId, config: job({ protocol: 'openai-responses', maxOutputTokens: 4096 }), provider: { ...provider, protocol: 'openai-responses', responsesProfile: 'codex' }, jobToken: 'z'.repeat(43), controller: new AbortController(), calls: 0 };
+  broker.jobs.set(jobId, task);
+  const base = await listen(broker.server); t.after(() => broker.close());
+  const request = limit => fetch(`${base}/proxy/${jobId}/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${task.jobToken}`, 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-test', max_output_tokens: limit, input: [{ role: 'user', content: 'save a file' }], tools: [{ type: 'function', name: 'write_file', parameters: {} }] }) });
+  assert.equal((await request(5000)).status, 400); assert.equal(forwarded, undefined);
+  assert.equal((await request(4096)).status, 200);
+  const payload = JSON.parse(forwarded.body);
+  assert.equal(payload.max_output_tokens, undefined); assert.equal(payload.store, false);
+  assert.equal(payload.tools[0].name, 'write_file'); assert.equal(payload.input[0].content[0].type, 'input_text');
+  assert.match(forwarded.headers['user-agent'], /APIRouter compatibility/);
+  assert.equal(forwarded.headers.authorization, `Bearer ${provider.apiKey}`);
 });

@@ -1,16 +1,18 @@
 /* Chat and Work share a compact composer and the same model menu. */
 .composer-tools { position: relative; flex-wrap: wrap; gap: 5px; min-width: 0; }
-.composer-toolbar { align-items: flex-end; gap: 10px; }
+.composer-toolbar { align-items: center; gap: 8px; flex-wrap: wrap; }
+.composer-tools { flex: 1; }
+.composer-submit-tools { margin-left: auto; }
 .task-picker { display: inline-flex; }
-.task-pill { display: inline-flex; align-items: center; gap: 6px; padding: 7px 9px; min-height: 33px; border: 1px solid transparent; border-radius: 18px; color: var(--muted); white-space: nowrap; font-size: 12px; }
+.task-pill { display: inline-flex; align-items: center; gap: 6px; padding: 7px 9px; min-height: 33px; border: 1px solid transparent; border-radius: 18px; color: var(--muted); white-space: nowrap; font-size: 13px; color: var(--text); }
 .task-pill:hover { color: var(--text); background: var(--hover); }
 .task-pill.selected { color: var(--text); border-color: var(--border); background: var(--hover); }
-.task-pill:disabled { cursor: not-allowed; opacity: .5; }
-.task-menu { position: absolute; bottom: calc(100% + 11px); left: 0; width: min(330px, calc(100vw - 62px)); max-height: min(380px, calc(100dvh - 210px)); overflow: auto; padding: 7px; z-index: 35; border: 1px solid var(--border); border-radius: 15px; box-shadow: 0 8px 35px #0004; background: var(--panel); }
+.task-pill:disabled { cursor: not-allowed; opacity: .6; }
+.task-menu { position: absolute; bottom: calc(100% + 11px); left: 0; width: min(330px, calc(100vw - 62px)); max-height: min(380px, calc(100dvh - 210px)); overflow: auto; padding: 7px; z-index: 90; border: 1px solid var(--border); border-radius: 15px; box-shadow: 0 8px 30px #0004; background: var(--panel-raised); }
 .task-option { width: 100%; display: flex; align-items: center; gap: 12px; text-align: left; padding: 11px 10px; border-radius: 9px; }
 .task-option:hover, .task-option.chosen { background: var(--hover); }
 .task-option > span { flex: 1; min-width: 0; }
-.task-option strong { display: block; font-size: 14px; font-weight: 550; }
+.task-option strong { display: block; font-size: 14px; font-weight: 500; }
 .task-option small { display: block; font-size: 12px; line-height: 1.6; color: var(--muted); margin-top: 2px; }
 .task-menu-note { font-size: 12px; line-height: 1.7; padding: 10px; color: var(--muted); }
 .task-skill-list { max-height: 245px; overflow: auto; }

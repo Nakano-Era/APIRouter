@@ -1,9 +1,10 @@
 import { openUpstream, readJson, UpstreamError, redactRawError, redactDiagnosticObject } from './net.mjs';
+import { modelCapacities } from './continuation.mjs';
 export { validateBaseUrl, sanitizeUpstreamError, UpstreamError } from './net.mjs';
 
 const invalid = () => new UpstreamError('上游响应格式不符合所选协议，请检查 API 配置。', 'INVALID_UPSTREAM_RESPONSE');
 const toolError = () => new UpstreamError('模型请求了工具调用，但当前站点未启用工具执行；本次任务未执行这些操作。', 'UNSUPPORTED_TOOL_CALL');
-const outputLimit = () => new UpstreamError('回复达到输出上限，内容可能不完整。可提高上限后重新生成。', 'OUTPUT_LIMIT_REACHED');
+const outputLimit = () => new UpstreamError('回复达到本次输出上限，已保存内容，可继续生成。', 'OUTPUT_LIMIT_REACHED');
 const number = value => Number.isFinite(value) && value >= 0 ? value : 0;
 const hasToolType = type => /tool|function_call|computer|web_search|file_search|code_interpreter|image_generation|mcp_|shell|apply_patch/.test(type ?? '');
 
@@ -25,7 +26,8 @@ export async function listModels(provider, { signal } = {}) {
         const id = typeof item === 'string' ? item : item?.id;
         if (typeof id !== 'string' || !id.trim() || id.length > 512 || /[\u0000-\u001f\u007f]/.test(id)) continue;
         const name = item?.display_name || item?.name || id;
-        models.set(id, { modelId: id, name: typeof name === 'string' ? name.slice(0, 512) : id });
+        const capacity = modelCapacities(typeof item === 'object' ? item : {});
+        models.set(id, { modelId: id, name: typeof name === 'string' ? name.slice(0, 512) : id, ...(capacity.contextWindow ? { contextWindow: capacity.contextWindow } : {}), ...(capacity.maxOutputTokens ? { maxOutputTokens: capacity.maxOutputTokens } : {}) });
       }
       if (models.size > 10_000) throw new UpstreamError('上游模型列表过大，请改为手动添加需要的模型。', 'UPSTREAM_RESPONSE_TOO_LARGE');
       if (provider.protocol !== 'anthropic' || !result.has_more) return [...models.values()];
@@ -98,7 +100,7 @@ function requestBody({ provider, model, messages, maxOutputTokens, systemPrompt,
   };
 }
 
-async function* sseEvents(body) {
+async function* sseEvents(body, touch = () => {}) {
   if (!body) throw invalid();
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let buffer = '';
@@ -119,6 +121,7 @@ async function* sseEvents(body) {
     return null;
   }
   for await (const chunk of body) {
+    touch();
     totalSize += chunk.length;
     if (totalSize > 32 * 1024 * 1024) throw new UpstreamError('上游响应过大，已停止生成。', 'UPSTREAM_RESPONSE_TOO_LARGE');
     buffer += decoder.decode(chunk, { stream: true });
@@ -176,25 +179,26 @@ function checkStop(reason) {
 }
 
 function extractJson(result, protocol) {
-  if (!result || result.error) throw new UpstreamError('上游返回了错误响应，请检查 API 配置或稍后重试。', 'UPSTREAM_RESPONSE_ERROR');
-  let text = '';
+  if (!result || (result.error && !(protocol === 'openai-responses' && Array.isArray(result.output)))) throw new UpstreamError('上游返回了错误响应，请检查 API 配置或稍后重试。', 'UPSTREAM_RESPONSE_ERROR');
+  let text = '', error;
+  const stop = reason => { try { checkStop(reason); } catch (caught) { error = caught; } };
   let usage = result.usage;
   if (protocol === 'openai-chat') {
     const choice = result.choices?.[0];
     if (!choice?.message) throw invalid();
     if (choice.message.tool_calls?.length || choice.message.function_call) throw toolError();
-    checkStop(choice.finish_reason);
+    stop(choice.finish_reason);
     text = chatText(choice.message.content) || choice.message.refusal || '';
   } else if (protocol === 'openai-responses') {
-    if (result.status === 'failed' || result.status === 'cancelled') throw new UpstreamError('上游未完成回复。', 'UPSTREAM_RESPONSE_ERROR');
+    if (result.error || result.status === 'failed' || result.status === 'cancelled') error = new UpstreamError('上游未完成回复。', 'UPSTREAM_RESPONSE_ERROR');
     if (result.status === 'incomplete') {
-      checkStop(result.incomplete_details?.reason);
-      throw new UpstreamError('上游回复未完成。', 'UPSTREAM_INCOMPLETE');
+      stop(result.incomplete_details?.reason);
+      error ||= new UpstreamError('上游回复未完成，可继续生成。', 'UPSTREAM_INCOMPLETE');
     }
     text = responseText(result.output);
   } else {
     if (!Array.isArray(result.content)) throw invalid();
-    checkStop(result.stop_reason);
+    stop(result.stop_reason);
     text = result.content.map(part => {
       if (hasToolType(part.type)) throw toolError();
       if (part.type === 'text') return part.text ?? '';
@@ -202,7 +206,7 @@ function extractJson(result, protocol) {
       throw new UpstreamError('上游返回了当前界面不支持的非文本内容。', 'UNSUPPORTED_OUTPUT');
     }).join('');
   }
-  return { text, usage };
+  return { text, usage, error };
 }
 
 function normalizedUsage(usage, protocol) {
@@ -218,7 +222,7 @@ export async function* streamReply(options) {
   const { provider, signal } = options;
   const body = requestBody(options);
   const endpoint = provider.protocol === 'anthropic' ? 'messages' : provider.protocol === 'openai-responses' ? 'responses' : 'chat/completions';
-  const request = await openUpstream(provider, endpoint, { signal, body, diagnostics: options.diagnostics === true });
+  const request = await openUpstream(provider, endpoint, { signal, body, diagnostics: options.diagnostics === true, idleTimeout: true, sessionId: options.context?.chatId });
   let finished = false;
   let emittedText = false;
   let usage;
@@ -227,12 +231,13 @@ export async function* streamReply(options) {
     if (!(request.response.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
       lastPayload = await readJson(request.response, 16 * 1024 * 1024);
       const result = extractJson(lastPayload, provider.protocol);
-      if (!result.text) throw new UpstreamError('模型没有返回可显示的文本；可能仅返回推理或不支持的内容。', 'EMPTY_UPSTREAM_OUTPUT');
-      yield { type: 'delta', text: result.text };
+      if (result.text) yield { type: 'delta', text: result.text };
       if (result.usage) yield normalizedUsage(result.usage, provider.protocol);
+      if (result.error) throw result.error;
+      if (!result.text) throw new UpstreamError('模型没有返回可显示的文本；可能仅返回推理或不支持的内容。', 'EMPTY_UPSTREAM_OUTPUT');
       return;
     }
-    for await (const event of sseEvents(request.response.body)) {
+    for await (const event of sseEvents(request.response.body, request.touch)) {
       lastPayload = event.data;
       if (event.data.trim() === '[DONE]') {
         if (provider.protocol === 'openai-chat') { finished = true; break; }
@@ -244,13 +249,13 @@ export async function* streamReply(options) {
       if (data.error || data.type === 'error' || event.event === 'error') {
         throw new UpstreamError('上游在生成过程中返回错误，回复可能不完整。', 'UPSTREAM_STREAM_ERROR');
       }
-      let text = '';
+      let text = '', terminalError;
       if (provider.protocol === 'openai-chat') {
         if (data.usage) usage = data.usage;
         const choice = data.choices?.find(choice => choice.index === 0) ?? data.choices?.[0];
         if (choice) {
           if (choice.delta?.tool_calls?.length || choice.delta?.function_call || choice.message?.tool_calls?.length) throw toolError();
-          checkStop(choice.finish_reason);
+          try { checkStop(choice.finish_reason); } catch (error) { terminalError = error; }
           if (choice.finish_reason) finished = true;
           text = chatText(choice.delta?.content ?? choice.message?.content) || choice.delta?.refusal || '';
         }
@@ -259,13 +264,21 @@ export async function* streamReply(options) {
         if (hasToolType(type) || hasToolType(data.item?.type)) throw toolError();
         if (type === 'response.output_text.delta') text = data.delta ?? '';
         if (type === 'response.refusal.delta') text = data.delta ?? '';
-        if (type === 'response.failed') throw new UpstreamError('上游生成失败，回复可能不完整。', 'UPSTREAM_STREAM_ERROR');
+        if (type === 'response.failed') {
+          const final = extractJson(data.response || { status: 'failed' }, provider.protocol);
+          if (!emittedText) text = final.text;
+          usage = final.usage;
+          terminalError = new UpstreamError('上游生成失败，已保存的内容可以继续生成。', 'UPSTREAM_STREAM_ERROR');
+        }
         if (type === 'response.incomplete') {
-          checkStop(data.response?.incomplete_details?.reason);
-          throw new UpstreamError('上游回复未完成。', 'UPSTREAM_INCOMPLETE');
+          const final = extractJson(data.response || { status: 'incomplete' }, provider.protocol);
+          if (!emittedText) text = final.text;
+          usage = final.usage;
+          terminalError = final.error || new UpstreamError('上游回复未完成，可以继续生成。', 'UPSTREAM_INCOMPLETE');
         }
         if (type === 'response.completed') {
           const final = extractJson(data.response, provider.protocol);
+          terminalError = final.error;
           if (!emittedText) text = final.text;
           usage = final.usage;
           finished = true;
@@ -289,12 +302,14 @@ export async function* streamReply(options) {
       }
       if (typeof text !== 'string') throw invalid();
       if (text) { emittedText = true; yield { type: 'delta', text }; }
+      if (terminalError) throw terminalError;
       if (finished && provider.protocol !== 'openai-chat') break;
     }
-    if (!finished) throw new UpstreamError('上游连接提前结束，回复可能不完整，请重新生成。', 'UPSTREAM_TRUNCATED_STREAM');
+    if (!finished) throw new UpstreamError('上游连接提前结束，已保存的内容可以继续生成。', 'UPSTREAM_TRUNCATED_STREAM');
     if (!emittedText) throw new UpstreamError('模型没有返回可显示的文本；可能仅返回推理或不支持的内容。', 'EMPTY_UPSTREAM_OUTPUT');
     if (usage) yield normalizedUsage(usage, provider.protocol);
   } catch (error) {
+    if (usage) yield normalizedUsage(usage, provider.protocol);
     if (request.signal.aborted) throw request.signal.reason;
     if (error instanceof UpstreamError) {
       if (error.rawDiagnostic) error.rawDiagnostic = redactDiagnosticObject(error.rawDiagnostic, provider.apiKey);

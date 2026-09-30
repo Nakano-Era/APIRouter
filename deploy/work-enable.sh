@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+with_claude=0
+for argument in "$@"; do
+  case "$argument" in
+    --with-claude-code) with_claude=1 ;;
+    *) echo "不支持的参数：$argument" >&2; exit 1 ;;
+  esac
+done
 
 if [[ ! -f compose.yaml || ! -f runner/Dockerfile ]]; then
   echo '请在完整 APIRouter 项目中运行此脚本。' >&2
@@ -34,7 +41,15 @@ else
   printf '\nCOMPOSE_FILE=compose.yaml:compose.work.yaml\n' >> .env
 fi
 chmod 600 .env
-echo '正在构建 Claude Code 沙箱镜像，首次需要下载运行环境。'
+echo '正在构建通用工作沙箱镜像，首次需要下载运行环境。'
 docker build --file runner/Dockerfile --target worker --tag apirouter-work:local .
+if [[ "$with_claude" == 1 ]] || grep -Eq '^WORK_CLAUDE_IMAGE=apirouter-work-claude:local$' .env; then
+  docker build --file runner/Dockerfile --target claude-worker --tag apirouter-work-claude:local .
+  if grep -Eq '^WORK_CLAUDE_IMAGE=' .env; then
+    sed -i 's|^WORK_CLAUDE_IMAGE=.*|WORK_CLAUDE_IMAGE=apirouter-work-claude:local|' .env
+  else
+    printf '\nWORK_CLAUDE_IMAGE=apirouter-work-claude:local\n' >> .env
+  fi
+fi
 docker compose -f compose.yaml -f compose.work.yaml up -d --build --wait
-echo 'Work 执行器已启用。请在管理后台测试 Anthropic 渠道，再选择 Work 模式运行任务。'
+echo 'Work 沙箱已启用。请在管理后台测试渠道，选择直接 API 运行方式及 Work 模式。Claude Code 是可选引擎。'

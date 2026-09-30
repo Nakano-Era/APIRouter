@@ -1,12 +1,12 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
-import { ArrowDownToLine, Check, LoaderCircle, PanelLeft, Sparkles, SquarePen, X } from 'lucide-react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowDownToLine, Check, Code2, FileText, ListChecks, LoaderCircle, PenLine, Search, PanelLeft, Sparkles, SquarePen, X } from 'lucide-react';
 import { api, errorText, post, setSessionToken } from './api';
 import type { Session, User } from './types';
 import { useChat } from './hooks/useChat';
 import Auth from './components/Auth';
 import Brand from './components/Brand';
 import Sidebar from './components/Sidebar';
-import Composer from './components/Composer';
+import Composer, { emptyComposerDraft, type ComposerDraft } from './components/Composer';
 import ModelPicker from './components/ModelPicker';
 import ChatControls from './components/ChatControls';
 const MessageList = lazy(() => import('./components/MessageList'));
@@ -16,7 +16,18 @@ const BillingModal = lazy(() => import('./components/BillingModal'));
 function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: () => void; theme: string; onTheme: (theme: string) => void }) {
   const chat = useChat();
   const [mobileOpen, setMobileOpen] = useState(false); const [sidebarCollapsed, setSidebarCollapsed] = useState(false); const [settingsOpen, setSettingsOpen] = useState(false);
-  const [draft, setDraft] = useState(''); const [draftKey, setDraftKey] = useState(0); const [composerVersion, setComposerVersion] = useState(0);
+  const [drafts, setDrafts] = useState<Record<string, ComposerDraft>>({});
+  const [newDraftId, setNewDraftId] = useState('new-0');
+  const nextDraftId = useRef(0); const draftRedirects = useRef(new Map<string, string>());
+  const composerId = chat.selectedId || newDraftId;
+  function updateDraft(key: string, update: (current: ComposerDraft) => ComposerDraft) {
+    const target = draftRedirects.current.get(key) || key;
+    setDrafts(current => ({ ...current, [target]: update(current[target] || emptyComposerDraft()) }));
+  }
+  function attachDraft(key: string, chatId: string) {
+    draftRedirects.current.set(key, chatId);
+    setDrafts(current => { const next = { ...current, [chatId]: current[key] || emptyComposerDraft() }; delete next[key]; return next; });
+  }
   const [exported, setExported] = useState(false);
   const [billingOpen, setBillingOpen] = useState(() => new URLSearchParams(window.location.search).has('billing'));
   const [membership, setMembership] = useState<{planName:string;activeUntil:string;source:string} | null>(null);
@@ -28,9 +39,9 @@ function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: (
   const selected = chat.models.find(model => model.id === chat.modelId);
   const currentChat = chat.chats.find(item => item.id === chat.selectedId);
   const empty = !chat.messages.length && !chat.generating && !chat.chatLoading;
-  function resetComposer() { setDraft(''); setDraftKey(key => key + 1); setComposerVersion(key => key + 1); }
-  function newChat() { if (chat.generating) return; chat.newChat(); resetComposer(); }
-  async function openChat(id: string) { const previousId = chat.selectedId; if (id === previousId && !chat.chatLoading) return; const opened = await chat.openChat(id); if (opened && id !== previousId) resetComposer(); }
+  const starters = chat.mode === 'work' ? [{ label: '生成文件', icon: FileText, prompt: '帮我创建一个可以下载的文件。先确认内容和文件格式。' }, { label: '整理报告', icon: Search, prompt: '帮我整理一份研究报告。先确认主题、资料范围和交付格式。' }, { label: '完成任务', icon: ListChecks, prompt: '我想让你执行一个任务。先帮我明确目标、步骤和需要的文件。' }] : [{ label: '帮我写作', icon: PenLine, prompt: '帮我写一段文字。先确认用途、读者和想要的语气。' }, { label: '编写代码', icon: Code2, prompt: '帮我编写一段代码。先确认目标、语言和运行环境。' }, { label: '梳理思路', icon: ListChecks, prompt: '帮我梳理一个问题，把信息、选择和下一步分清楚。' }];
+  function newChat() { setNewDraftId(`new-${++nextDraftId.current}`); chat.newChat(); }
+  async function openChat(id: string) { if (id === chat.selectedId && !chat.chatLoading) return; await chat.openChat(id); }
   function exportChat() {
     if (!currentChat) return;
     const content = `# ${currentChat.title}\n\n` + chat.messages.map(message => `## ${message.role === 'user' ? '你' : '助手'}\n\n${message.content}${message.attachments.length ? '\n\n附件：' + message.attachments.map(file => file.name).join('、') : ''}`).join('\n\n---\n\n');
@@ -42,16 +53,16 @@ function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: (
   return <div className={`workspace ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
     <Sidebar chats={chat.chats} selectedId={chat.selectedId} user={user} siteName={chat.settings?.siteName || 'APIRouter'} mobileOpen={mobileOpen} onClose={closeSidebar} onShow={showSidebar} onCollapse={() => { setSidebarCollapsed(true); setMobileOpen(false); }} onNew={newChat}
       onOpen={id => void openChat(id)} onUpdate={(id,values) => void chat.updateChat(id,values)} onDelete={id => void chat.deleteChat(id)}
-      onSettings={() => setSettingsOpen(true)} onUpgrade={() => setBillingOpen(true)} planName={membership?.planName || '免费'} onLogout={() => void logout()} disabled={chat.generating}/>
+      onSettings={() => setSettingsOpen(true)} onUpgrade={() => setBillingOpen(true)} planName={membership?.planName || '免费'} onLogout={() => void logout()} activeChatIds={chat.activeChatIds}/>
     <main className={`main-panel ${empty ? 'is-empty' : ''}`}>
       <header className="topbar"><div className="topbar-left">
         <button className="icon-button sidebar-open-button" onClick={showSidebar} aria-label="打开侧栏" title="打开侧栏"><PanelLeft size={21}/></button>
-        <button className="icon-button collapsed-new-chat" onClick={newChat} disabled={chat.generating} aria-label="新聊天" title="新聊天"><SquarePen size={21}/></button>
-        <ModelPicker models={chat.availableModels} value={chat.modelId} onChange={chat.setModelId} disabled={chat.generating || chat.chatLoading} isAdmin={user.role === 'admin'} onSettings={() => setSettingsOpen(true)}/>
+        <button className="icon-button collapsed-new-chat" onClick={newChat} aria-label="新聊天" title="新聊天"><SquarePen size={21}/></button>
+        <div className="workspace-title"><span>{chat.settings?.siteName || 'APIRouter'}</span>{chat.mode === 'work' && <small>Work</small>}</div>
       </div><div className="topbar-right">
         <button className="upgrade-button" onClick={() => setBillingOpen(true)}><Sparkles size={15}/><span>{membership ? '管理套餐' : '升级套餐'}</span></button>
         {currentChat && <button className="icon-button export-button" onClick={exportChat} aria-label="导出对话" title="导出 Markdown">{exported ? <Check size={18}/> : <ArrowDownToLine size={18}/>}</button>}
-        <button className="icon-button mobile-only" onClick={newChat} disabled={chat.generating} aria-label="新聊天"><SquarePen size={21}/></button>
+        <button className="icon-button mobile-only" onClick={newChat} aria-label="新聊天"><SquarePen size={21}/></button>
       </div></header>
       {chat.loading ? <div className="app-loading"><LoaderCircle size={26} className="spin"/><p>正在打开工作空间…</p></div> : <>
         <div className={`chat-layout ${empty ? 'empty-layout' : ''}`}>
@@ -59,13 +70,15 @@ function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: (
             <h1>{chat.mode === 'work' ? '今天想完成什么？' : '有什么可以帮忙的？'}</h1>
             {chat.mode === 'work' && <p className="work-welcome-subtitle">将任务交给 Work，在独立工作区中使用工具完成。</p>}
           </div></div>}
-          {!empty && <Suspense fallback={<div className="app-loading"><LoaderCircle size={23} className="spin"/></div>}><MessageList messages={chat.messages} models={chat.models} generating={chat.generating} onRegenerate={() => void chat.generate('',[],'regenerate')}
+          {!empty && <Suspense fallback={<div className="app-loading"><LoaderCircle size={23} className="spin"/></div>}><MessageList messages={chat.messages} models={chat.models} generating={chat.generating} onRegenerate={() => void chat.generate('',[],'regenerate')} onContinue={message => void chat.generate('', [], 'continue', message.id)}
             onEdit={(message,content) => chat.generate(content,message.attachments,'edit',message.id)} loading={chat.chatLoading} activity={chat.activity} artifacts={chat.artifacts}/></Suspense>}
-          <div className="composer-zone">{chat.routingNotice && <div className="routing-progress" role="status"><LoaderCircle size={14} className="spin"/>{chat.routingNotice}</div>}<Composer key={composerVersion} onSend={(content,files) => chat.generate(content,files)} onStop={() => void chat.stop()}
-            generating={chat.generating} model={chat.chatLoading ? undefined : selected} draft={draft} draftKey={draftKey} onError={chat.setError} work={chat.mode === 'work'} disabled={chat.mode === 'work' && !chat.capabilities?.available}
-            tools={<ChatControls mode={chat.mode} onMode={chat.setMode} model={selected} effort={chat.effort} onEffort={chat.setEffort} capabilities={chat.capabilities} skillIds={chat.skillIds} onSkills={chat.setSkillIds} webSearch={chat.webSearch} onWebSearch={chat.setWebSearch} disabled={chat.generating || chat.chatLoading}/>}/>
+          <div className="composer-zone">{chat.routingNotice && <div className="routing-progress" role="status"><LoaderCircle size={14} className="spin"/>{chat.routingNotice}</div>}<Composer key={composerId} onSend={(content,files) => chat.generate(content, files, 'messages', undefined, id => attachDraft(composerId, id))} onStop={() => void chat.stop()}
+            generating={chat.generating} model={chat.chatLoading ? undefined : selected} draft={drafts[composerId] || emptyComposerDraft()} onDraftChange={update => updateDraft(composerId, update)} work={chat.mode === 'work'} disabled={chat.mode === 'work' && !chat.capabilities?.available}
+            modelControls={<ModelPicker models={chat.availableModels} value={chat.modelId} onChange={chat.setModelId} effort={chat.effort} onEffort={chat.setEffort} disabled={chat.generating || chat.chatLoading} isAdmin={user.role === 'admin'} onSettings={() => setSettingsOpen(true)}/>}
+            tools={<ChatControls mode={chat.mode} onMode={chat.setMode} capabilities={chat.capabilities} skillIds={chat.skillIds} onSkills={chat.setSkillIds} webSearch={chat.webSearch} onWebSearch={chat.setWebSearch} disabled={chat.generating || chat.chatLoading}/>}/>
             {chat.mode === 'work' && !chat.capabilities?.available && <div className="work-availability" role="status"><span>{chat.capabilities?.reason || '正在检查 Work 服务…'}</span>{user.role === 'admin' && <button onClick={() => setSettingsOpen(true)}>打开设置</button>}</div>}
           </div>
+          {empty && !drafts[composerId]?.content.trim() && chat.availableModels.length > 0 && <div className="welcome-starters" aria-label="开始一个话题">{starters.map(({ label, icon: Icon, prompt }) => <button key={label} onClick={() => { updateDraft(composerId, current => ({ ...current, content: prompt })); window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus()); }}><Icon size={16}/><span>{label}</span></button>)}</div>}
           {empty && chat.availableModels.length === 0 && <div className="configuration-hint">{user.role === 'admin' ? <><span>{chat.mode === 'work' ? '请配置支持 Work 的模型。' : '连接 API 后即可开始聊天。'}</span><button onClick={() => setSettingsOpen(true)}>配置模型</button></> : <span>当前模式暂时没有可用模型，请联系管理员。</span>}</div>}
         </div>
         {chat.error && <div className="workspace-alert" role="alert"><span>{chat.error}</span><button className="icon-button" aria-label="关闭提示" onClick={() => chat.setError('')}><X size={15}/></button></div>}

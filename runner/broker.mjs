@@ -6,39 +6,40 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import { apiUrl, validateBaseUrl } from '../server/net.mjs';
-import { validateJob, dockerArguments, fault } from './protocol.mjs';
+import { validateJob, dockerArguments, fault, validateCheckpoint } from './protocol.mjs';
 import { safePublicRequest, redactCredentials } from './network.mjs';
+import { prepareResponsesRequest, responseRequestShape } from '../server/responses-compat.mjs';
 
 const execute = promisify(execFile);
 const same = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const json = (res, status, value) => { if (!res.headersSent) res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
-async function bodyJSON(req, maximum = 45 * 1024 * 1024) {
+async function bodyJSON(req, maximum = 128 * 1024 * 1024) {
   if (Number(req.headers['content-length']) > maximum) throw fault('请求超过大小限制。', 413);
   let length = 0; const chunks = [];
   for await (const chunk of req) { length += chunk.length; if (length > maximum) throw fault('请求超过大小限制。', 413); chunks.push(chunk); }
   try { return JSON.parse(Buffer.concat(chunks).toString()); } catch { throw fault('请求不是有效 JSON。'); }
 }
 
-export function gatewayEndpoint(pathname, id) {
+export function gatewayEndpoint(pathname, id, protocol = 'anthropic') {
   const base = `/proxy/${id}/v1/`;
   if (!pathname.startsWith(base)) return null;
   const endpoint = pathname.slice(base.length);
-  return ['messages', 'messages/count_tokens'].includes(endpoint) ? endpoint : null;
+  return ({ anthropic: ['messages', 'messages/count_tokens'], 'openai-chat': ['chat/completions'], 'openai-responses': ['responses'] })[protocol]?.includes(endpoint) ? endpoint : null;
 }
 
 export function gatewayHeaders(source, provider) {
-  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'anthropic-version': '2023-06-01' };
+  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(provider.protocol === 'anthropic' ? { 'anthropic-version': '2023-06-01' } : {}) };
   for (const [key, value] of Object.entries(source)) {
     if (['anthropic-version', 'anthropic-beta', 'user-agent', 'x-app'].includes(key) || /^x-stainless-[a-z-]+$/.test(key)) {
       if (typeof value === 'string' && value.length <= 2048 && !/[\r\n]/.test(value)) headers[key] = value;
     }
   }
-  if (provider.authMode === 'bearer') headers.authorization = `Bearer ${provider.apiKey}`;
+  if (provider.authMode === 'bearer' || (provider.authMode !== 'x-api-key' && provider.protocol !== 'anthropic')) headers.authorization = `Bearer ${provider.apiKey}`;
   else headers['x-api-key'] = provider.apiKey;
   return headers;
 }
 
-export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = process.env.WORK_WORKER_IMAGE || 'apirouter-work:local', self = process.env.HOSTNAME, docker = async args => (await execute('docker', args, { timeout: 30_000, maxBuffer: 1024 * 1024 })).stdout.trim(), spawnDocker = args => spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] }), publicRequest = safePublicRequest } = {}) {
+export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = process.env.WORK_WORKER_IMAGE || 'apirouter-work:local', claudeImage = process.env.WORK_CLAUDE_IMAGE || null, self = process.env.HOSTNAME, docker = async args => (await execute('docker', args, { timeout: 30_000, maxBuffer: 1024 * 1024 })).stdout.trim(), spawnDocker = args => spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] }), publicRequest = safePublicRequest } = {}) {
   if (!token || token.length < 32) throw new Error('WORK_RUNNER_TOKEN must be at least 32 characters');
   if (!/^[a-zA-Z0-9_.-]{1,128}$/.test(self ?? '')) throw new Error('Broker container hostname is required');
   const jobs = new Map();
@@ -46,8 +47,13 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
   const health = async () => {
     if (healthCache && Date.now() - healthCache.at < 5000) return healthCache.value;
     let value;
-    try { await docker(['version', '--format', '{{.Server.Version}}']); await docker(['image', 'inspect', image, '--format', '{{.Id}}']); value = { available: !closing, runtime: 'claude-code', reason: closing ? '工作执行器正在停止。' : null }; }
-    catch { value = { available: false, runtime: 'claude-code', reason: 'Docker 或 Claude Code 工作镜像未就绪，请运行 Work 部署脚本。' }; }
+    try {
+      await docker(['version', '--format', '{{.Server.Version}}']); await docker(['image', 'inspect', image, '--format', '{{.Id}}']);
+      let claudeReady = false;
+      if (claudeImage) { try { await docker(['image', 'inspect', claudeImage, '--format', '{{.Id}}']); claudeReady = true; } catch {} }
+      value = { available: !closing, runtime: 'sandbox', engines: { native: !closing, 'claude-code': !closing && claudeReady }, reason: closing ? '工作执行器正在停止。' : null };
+    }
+    catch { value = { available: false, runtime: 'sandbox', engines: { native: false, 'claude-code': false }, reason: 'Docker 工作镜像未就绪，请运行 Work 部署脚本。' }; }
     healthCache = { at: Date.now(), value }; return value;
   };
   const cleanup = async job => {
@@ -67,16 +73,27 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     const job = jobs.get(id);
     const bearer = req.headers.authorization?.replace(/^Bearer /, '') || req.headers['x-api-key'];
     if (!job || !same(bearer, job.jobToken)) return json(res, 401, { error: { type: 'authentication_error', message: 'Job credential expired or invalid' } });
-    const endpoint = gatewayEndpoint(url.pathname, id);
+    const endpoint = gatewayEndpoint(url.pathname, id, job.config.protocol ?? job.provider.protocol);
     if (req.method !== 'POST' || !endpoint || [...url.searchParams.keys()].some(key => key !== 'beta')) return json(res, 403, { error: { type: 'permission_error', message: 'Endpoint is not enabled for this job' } });
     if (++job.calls > 160) return json(res, 429, { error: { type: 'rate_limit_error', message: 'Per-job request limit reached' } });
-    const body = await bodyJSON(req, 20 * 1024 * 1024);
+    const body = await bodyJSON(req, 96 * 1024 * 1024);
     if (body.model !== job.config.model) return json(res, 400, { error: { type: 'invalid_request_error', message: 'This job can use only its selected model' } });
-    if (endpoint === 'messages' && (!Number.isInteger(body.max_tokens) || body.max_tokens < 1 || body.max_tokens > 32768)) return json(res, 400, { error: { type: 'invalid_request_error', message: 'max_tokens must be 1–32768' } });
+    const maximum = job.config.maxOutputTokens ?? 16384;
+    const requestedTokens = endpoint === 'messages' ? body.max_tokens : endpoint === 'responses' ? body.max_output_tokens : body.max_completion_tokens ?? body.max_tokens;
+    if (endpoint !== 'messages/count_tokens' && (!Number.isInteger(requestedTokens) || requestedTokens < 1 || requestedTokens > maximum)) return json(res, 400, { error: { type: 'invalid_request_error', message: 'Output token limit exceeds this job configuration' } });
     if (job.config.mode === 'chat' && Array.isArray(body.tools) && body.tools.length) return json(res, 403, { error: { type: 'permission_error', message: 'Tools are disabled in Chat mode' } });
     if (!job.config.webSearch && body.tools?.some(tool => /web_search|web_fetch/.test(tool.type ?? ''))) return json(res, 403, { error: { type: 'permission_error', message: 'Network search is disabled for this job' } });
+    if (job.config.engine === 'native') {
+      const allowed = new Set(['read_file', 'write_file', 'list_files', 'run_command', 'use_skill', 'delegate_task']);
+      if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.some(tool => !(allowed.has(tool.name ?? tool.function?.name) || (job.config.webSearch && ['web_search', 'web_search_20250305'].includes(tool.type)))))) return json(res, 403, { error: { type: 'permission_error', message: 'Tool is not enabled for this job' } });
+      if (endpoint === 'responses') {
+        if (body.background || body.previous_response_id || body.conversation) return json(res, 403, { error: { type: 'permission_error', message: 'Remote persistent sessions are disabled' } });
+        body.store = false;
+      }
+    }
     const upstreamUrl = apiUrl(job.provider.baseUrl, endpoint) + url.search;
-    const request = await publicRequest(upstreamUrl, { method: 'POST', headers: gatewayHeaders(req.headers, job.provider), body: JSON.stringify(body), signal: job.controller.signal, timeoutMs: Math.min(180_000, job.config.limits.timeoutSeconds * 1000) });
+    const compatible = endpoint === 'responses' ? prepareResponsesRequest(job.provider, body, { sessionId: id }) : null;
+    const request = await publicRequest(upstreamUrl, { method: 'POST', headers: { ...gatewayHeaders(req.headers, job.provider), ...compatible?.headers }, body: JSON.stringify(compatible?.body ?? body), signal: job.controller.signal, timeoutMs: job.config.limits.timeoutSeconds * 1000 });
     try {
       const headers = { 'content-type': request.response.headers.get('content-type') || 'application/json', 'cache-control': 'no-store' };
       for (const name of ['request-id', 'x-request-id', 'retry-after']) { const value = request.response.headers.get(name); if (value) headers[name] = value; }
@@ -90,7 +107,7 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
           if (chunk.length > remaining) { truncated = true; break; }
         }
         const raw = redactCredentials(Buffer.concat(chunks).toString(), [job.provider.apiKey, job.jobToken]);
-        job.lastDiagnostic = { source: 'upstream-http', status: request.response.status, method: 'POST', url: upstreamUrl, protocol: 'anthropic', modelId: body.model, headers, body: raw, truncated, readNote: 'Claude Code 网关捕获的上游原始错误响应；认证凭据已隐藏。' };
+        job.lastDiagnostic = { source: 'upstream-http', status: request.response.status, method: 'POST', url: upstreamUrl, protocol: job.provider.protocol, modelId: body.model, headers, body: raw, truncated, readNote: '沙箱网关捕获的上游原始错误响应；认证凭据已隐藏。', ...(compatible ? { requestShape: responseRequestShape(compatible.body, compatible.profile) } : {}) };
         res.end(raw); return;
       }
       job.lastDiagnostic = null;
@@ -108,7 +125,8 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     const config = validateJob(input);
     if (jobs.size >= config.limits.maxConcurrentJobs || jobs.size >= 4) throw fault('工作沙箱已满，请稍后重试。', 429, 'WORK_BUSY');
     const provider = input.provider;
-    if (provider?.protocol !== 'anthropic' || typeof provider.apiKey !== 'string' || !provider.apiKey || provider.apiKey.length > 8192 || /[\r\n]/.test(provider.apiKey) || !['auto', 'bearer', 'x-api-key'].includes(provider.authMode ?? 'auto')) throw fault('Claude Code 运行需要有效的 Anthropic API 配置。');
+    if (provider?.protocol !== config.protocol || typeof provider.apiKey !== 'string' || !provider.apiKey || provider.apiKey.length > 8192 || /[\r\n]/.test(provider.apiKey) || !['auto', 'bearer', 'x-api-key'].includes(provider.authMode ?? 'auto')) throw fault('工作沙箱需要有效且协议一致的 API 配置。');
+    if (config.engine === 'claude-code' && !claudeImage) throw fault('未安装可选 Claude Code 镜像；请将渠道运行方式改为直接 API，或安装可选镜像。', 503, 'CLAUDE_NOT_INSTALLED');
     validateBaseUrl(provider.baseUrl);
     const id = randomBytes(16).toString('hex');
     const job = { id, network: `ar-work-${id}`, jobToken: randomBytes(32).toString('base64url'), config, provider, controller: new AbortController(), calls: 0 };
@@ -128,13 +146,13 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
       job.controller.signal.throwIfAborted();
       await docker(['network', 'connect', '--alias', 'gateway', job.network, self]);
       job.controller.signal.throwIfAborted();
-      await docker(dockerArguments({ id, network: job.network, image, limits: config.limits }));
+      await docker(dockerArguments({ id, network: job.network, image: config.engine === 'claude-code' ? claudeImage : image, limits: config.limits }));
       job.controller.signal.throwIfAborted();
       const child = spawnDocker(['start', '-a', '-i', `ar-work-${id}`]);
       const exited = new Promise(resolveExit => { child.once('error', error => resolveExit({ error })); child.once('close', code => resolveExit({ code })); });
       // Explicit allowlist: provider credentials never enter the worker, its
       // process environment, the Docker command line or the model context.
-      const workerInput = { mode: config.mode, model: config.model, effort: config.effort, prompt: config.prompt, systemPrompt: config.systemPrompt, skills: config.skills, files: config.files, images: config.images ?? [], webSearch: config.webSearch, limits: config.limits, gateway: `http://gateway:3210/proxy/${id}`, jobToken: job.jobToken };
+      const workerInput = { engine: config.engine, protocol: config.protocol, maxOutputTokens: config.maxOutputTokens, contextWindow: config.contextWindow, resumeState: config.resumeState, resumeText: config.resumeText, continuation: !!config.continuation, mode: config.mode, model: config.model, effort: config.effort, prompt: config.prompt, systemPrompt: config.systemPrompt, skills: config.skills, files: config.files, images: config.images ?? [], webSearch: config.webSearch, limits: config.limits, gateway: `http://gateway:3210/proxy/${id}`, jobToken: job.jobToken };
       child.stdin.on('error', () => {});
       child.stdin.end(JSON.stringify(workerInput));
       let buffer = '', stderr = '', done = false, outputBytes = 0;
@@ -142,13 +160,14 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
       child.stderr.on('data', chunk => { stderr += errorDecoder.write(chunk).slice(0, Math.max(0, 128 * 1024 - stderr.length)); });
       for await (const chunk of child.stdout) {
         outputBytes += chunk.length;
-        if (outputBytes > 50 * 1024 * 1024) throw fault('任务输出超过大小限制。', 502);
+        if (outputBytes > 512 * 1024 * 1024) throw fault('任务输出超过大小限制。', 502);
         buffer += decoder.write(chunk);
         let end;
         while ((end = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
           let event; try { event = JSON.parse(line); } catch { continue; }
-          if (!['delta', 'activity', 'usage', 'file', 'error', 'done'].includes(event.type)) continue;
+          if (!['delta', 'activity', 'usage', 'checkpoint', 'file', 'error', 'done'].includes(event.type)) continue;
+          if (event.type === 'checkpoint') validateCheckpoint(event.state, { model: config.model, protocol: config.protocol });
           if (event.type === 'error') event = { type: 'error', code: event.code, error: event.error, rawDiagnostic: job.lastDiagnostic ?? { status: null, protocol: 'claude-code', modelId: config.model, body: redactCredentials(event.diagnostic?.rawBody || event.error, [job.provider.apiKey, job.jobToken]), truncated: false } };
           if (event.type === 'delta') event.text = redactCredentials(event.text, [job.provider.apiKey, job.jobToken]);
           if (event.type === 'done') done = true;

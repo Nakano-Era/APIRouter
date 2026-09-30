@@ -2,6 +2,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { Agent, fetch } from 'undici';
 import ipaddr from 'ipaddr.js';
+import { prepareResponsesRequest, responseRequestShape } from './responses-compat.mjs';
 
 export class UpstreamError extends Error {
   constructor(message, code = 'UPSTREAM_ERROR', status = 502, upstreamStatus) {
@@ -210,7 +211,9 @@ async function adminErrorDetail(response, apiKey, signal, rawTarget) {
   }
 }
 
-export async function openUpstream(provider, endpoint, { signal, body, query, timeoutMs, diagnostics = false } = {}) {
+export async function openUpstream(provider, endpoint, { signal, body, query, timeoutMs, diagnostics = false, idleTimeout = false, sessionId } = {}) {
+  const compatible = endpoint === 'responses' && body ? prepareResponsesRequest(provider, body, { sessionId }) : null;
+  if (compatible) body = compatible.body;
   if (!['openai-chat', 'openai-responses', 'anthropic'].includes(provider.protocol)) {
     throw new UpstreamError('请选择受支持的 API 协议。', 'INVALID_PROTOCOL', 400);
   }
@@ -227,8 +230,9 @@ export async function openUpstream(provider, endpoint, { signal, body, query, ti
   const effectiveSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   const configured = Number(process.env.UPSTREAM_TIMEOUT_MS);
   const duration = timeoutMs ?? (Number.isFinite(configured) && configured > 0 ? Math.max(100, Math.min(configured, 600_000)) : 180_000);
-  const timer = setTimeout(() => controller.abort(new UpstreamError('上游响应超时，请稍后重试。', 'UPSTREAM_TIMEOUT', 504)), duration);
-  timer.unref?.();
+  let timer;
+  const touch = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort(new UpstreamError('上游响应超时，已保存的内容可以继续生成。', 'UPSTREAM_TIMEOUT', 504)), duration); timer.unref?.(); };
+  touch();
   let dispatcher;
   let response;
   const cleanup = async () => {
@@ -262,7 +266,7 @@ export async function openUpstream(provider, endpoint, { signal, body, query, ti
         },
       },
     });
-    const headers = { Accept: body ? 'text/event-stream, application/json' : 'application/json' };
+    const headers = { accept: body ? 'text/event-stream, application/json' : 'application/json', ...compatible?.headers };
     if (authMode === 'x-api-key' || (authMode === 'auto' && provider.protocol === 'anthropic')) headers['x-api-key'] = provider.apiKey;
     else headers.Authorization = `Bearer ${provider.apiKey}`;
     if (provider.protocol === 'anthropic') headers['anthropic-version'] = '2023-06-01';
@@ -282,8 +286,13 @@ export async function openUpstream(provider, endpoint, { signal, body, query, ti
           : response.status === 429 ? '额度不足或请求过多，请稍后重试。' : '请稍后重试或检查服务商状态。';
       const error = new UpstreamError(`上游请求失败（HTTP ${response.status}）。${detail}`, 'UPSTREAM_HTTP_ERROR', 502, response.status);
       const raw = { status: response.status, method: body ? 'POST' : 'GET', url: redactRawError(url.toString(), provider.apiKey),
-        protocol: provider.protocol, modelId: body?.model || '', body: '', headers: {}, truncated: false, readNote: '' };
+        protocol: provider.protocol, modelId: body?.model || '', body: '', headers: {}, truncated: false, readNote: '',
+        ...(compatible ? { requestShape: responseRequestShape(body, compatible.profile) } : {}) };
       const description = await adminErrorDetail(response, provider.apiKey, effectiveSignal, raw);
+      if (/invalid codex request|invalid claude code request/i.test(raw.body)) {
+        description.note = `上游拒绝了客户端请求格式。当前使用${compatible?.profile === 'codex' ? ' Codex 兼容格式' : '标准 API 格式'}；请核对令牌允许的客户端和分组。Claude Code 专属连接使用 Anthropic + Claude Code，GPT 使用 Responses；兼容格式仍被拒绝时需由服务商确认准入条件。`;
+        raw.readNote = [raw.readNote, description.note].filter(Boolean).join(' ');
+      }
       error.rawDiagnostic = raw;
       if (diagnostics) {
         error.adminDetail = description.detail;
@@ -298,7 +307,7 @@ export async function openUpstream(provider, endpoint, { signal, body, query, ti
       }
       throw error;
     }
-    return { response, signal: effectiveSignal, cleanup };
+    return { response, signal: effectiveSignal, cleanup, touch: idleTimeout ? touch : () => {} };
   } catch (error) {
     await cleanup();
     if (effectiveSignal.aborted) throw effectiveSignal.reason;

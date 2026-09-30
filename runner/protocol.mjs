@@ -6,6 +6,8 @@ export const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 export const MAX_ARTIFACT_TOTAL = 30 * 1024 * 1024;
 export const MAX_ARTIFACTS = 30;
 export const MAX_SKILL_BYTES = 64 * 1024;
+export const MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024;
+export const PROTOCOLS = new Set(['anthropic', 'openai-chat', 'openai-responses']);
 export const EFFORTS = new Set(['auto', 'low', 'medium', 'high', 'xhigh', 'max']);
 export const fault = (message, status = 400, code = 'INVALID_WORK_REQUEST') => Object.assign(new Error(message), { status, code });
 
@@ -59,8 +61,12 @@ export function skillMetadata(content) {
 
 export function validateJob(job) {
   if (!job || !['chat', 'work'].includes(job.mode) || !EFFORTS.has(job.effort ?? 'auto')) throw fault('请选择有效的模式及思考强度。');
+  const engine = job.engine ?? 'native', protocol = job.protocol ?? 'anthropic';
+  if (!['native', 'claude-code'].includes(engine) || !PROTOCOLS.has(protocol) || (engine === 'claude-code' && protocol !== 'anthropic')) throw fault('工作引擎或接口协议无效。');
   if (!job.model || typeof job.model !== 'string' || !job.model.trim() || job.model.length > 512 || /[\u0000-\u0020\u007f]/.test(job.model) || job.model.startsWith('-')) throw fault('上游模型 ID 无效。');
-  if (typeof job.prompt !== 'string' || !job.prompt.trim() || Buffer.byteLength(job.prompt) > 1024 * 1024) throw fault('工作上下文为空或超过 1 MB。');
+  if (typeof job.prompt !== 'string' || !job.prompt.trim() || Buffer.byteLength(job.prompt) > 32 * 1024 * 1024) throw fault('工作上下文为空或超过 32 MB。');
+  for (const [key, maximum] of [['contextWindow', 10_000_000], ['maxOutputTokens', 1_000_000]]) if (job[key] != null && (!Number.isInteger(job[key]) || job[key] < 1 || job[key] > maximum)) throw fault('模型上下文或输出长度设置无效。');
+  if (job.resumeState != null) validateCheckpoint(job.resumeState, { model: job.model, protocol });
   if (typeof job.systemPrompt !== 'string' || job.systemPrompt.length > 100_000) throw fault('系统提示词无效。');
   if (typeof job.webSearch !== 'boolean') throw fault('网络搜索选项无效。');
   if (!Array.isArray(job.skills) || job.skills.length > 10) throw fault('一次最多使用 10 项技能。');
@@ -82,7 +88,12 @@ export function validateJob(job) {
     size += Buffer.from(image.source.data, 'base64').length;
   }
   if (size > MAX_ARTIFACT_TOTAL) throw fault('工作文件与图片总大小超过 30 MB。');
-  return { ...job, effort: job.effort ?? 'auto', limits: validateLimits(job.limits) };
+  return { ...job, engine, protocol, maxOutputTokens: job.maxOutputTokens ?? 16384, effort: job.effort ?? 'auto', limits: validateLimits(job.limits) };
+}
+
+export function validateCheckpoint(state, { model, protocol }) {
+  if (!state || typeof state !== 'object' || Array.isArray(state) || state.version !== 1 || state.model !== model || state.protocol !== protocol || Buffer.byteLength(JSON.stringify(state)) > MAX_CHECKPOINT_BYTES) throw fault('工作恢复记录与当前模型不匹配或超过大小限制。', 409, 'WORK_CHECKPOINT_INVALID');
+  return state;
 }
 
 export function claudeArguments(job) {

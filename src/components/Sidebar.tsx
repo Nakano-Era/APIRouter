@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Archive, ArchiveRestore, Check, ChevronUp, LogOut, MoreHorizontal, PanelLeftClose, Pencil, Pin, Search, Settings, Shield, Sparkles, SquarePen, Trash2, X } from 'lucide-react';
+import { Archive, ArchiveRestore, Check, ChevronUp, LoaderCircle, LogOut, MoreHorizontal, PanelLeftClose, Pencil, Pin, Search, Settings, Shield, Sparkles, SquarePen, Trash2, X } from 'lucide-react';
 import type { Chat, User } from '../types';
 import Brand from './Brand';
 import Modal from './Modal';
@@ -8,10 +8,10 @@ interface SidebarProps {
   chats: Chat[]; selectedId: string | null; user: User; siteName: string; mobileOpen: boolean;
   onClose: () => void; onShow: () => void; onCollapse: () => void; onNew: () => void; onOpen: (id: string) => void;
   onUpdate: (id: string, values: Partial<Chat>) => void; onDelete: (id: string) => void;
-  onSettings: () => void; onUpgrade: () => void; planName: string; onLogout: () => void; disabled: boolean;
+  onSettings: () => void; onUpgrade: () => void; planName: string; onLogout: () => void; activeChatIds: string[];
 }
 
-export default function Sidebar({ chats, selectedId, user, siteName, mobileOpen, onClose, onShow, onCollapse, onNew, onOpen, onUpdate, onDelete, onSettings, onUpgrade, planName, onLogout, disabled }: SidebarProps) {
+export default function Sidebar({ chats, selectedId, user, siteName, mobileOpen, onClose, onShow, onCollapse, onNew, onOpen, onUpdate, onDelete, onSettings, onUpgrade, planName, onLogout, activeChatIds }: SidebarProps) {
   const [query, setQuery] = useState(''); const [archiveView, setArchiveView] = useState(false);
   const [menu, setMenu] = useState<string | null>(null); const [accountOpen, setAccountOpen] = useState(false);
   const [editing, setEditing] = useState<Chat | null>(null); const [title, setTitle] = useState(''); const [deleting, setDeleting] = useState<Chat | null>(null);
@@ -46,15 +46,22 @@ export default function Sidebar({ chats, selectedId, user, siteName, mobileOpen,
 
   const filtered = chats.filter(chat => chat.archived === archiveView && chat.title.toLowerCase().includes(query.toLowerCase())).sort((a,b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   const pinned = filtered.filter(chat => chat.pinned); const recent = filtered.filter(chat => !chat.pinned);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const historyGroups = new Map<string, Chat[]>();
+  for (const chat of recent) {
+    const daysAgo = Math.floor((today.getTime() - Date.parse(chat.updatedAt)) / 86400000);
+    const label = query ? '搜索结果' : archiveView ? '已归档' : Date.parse(chat.updatedAt) >= today.getTime() ? '今天' : daysAgo < 1 ? '昨天' : daysAgo < 7 ? '过去 7 天' : daysAgo < 30 ? '过去 30 天' : '更早';
+    historyGroups.set(label, [...(historyGroups.get(label) || []), chat]);
+  }
   function row(chat: Chat) {
     return <div className={`chat-row ${selectedId === chat.id ? 'active' : ''}`} key={chat.id}>
-      <button className="chat-select" onClick={() => { onOpen(chat.id); onClose(); }} disabled={disabled}><span>{chat.title || '新聊天'}</span></button>
-      <button className={`chat-more icon-button ${menu === chat.id ? 'visible' : ''}`} title="聊天选项" aria-label={`${chat.title} 的选项`} onClick={() => setMenu(menu === chat.id ? null : chat.id)} disabled={disabled}><MoreHorizontal size={18}/></button>
+      <button className="chat-select" aria-current={selectedId === chat.id ? 'page' : undefined} title={chat.title} onClick={() => { onOpen(chat.id); onClose(); }}><span>{chat.title || '新聊天'}</span>{activeChatIds.includes(chat.id) && <LoaderCircle className="spin chat-running" size={13} aria-label="任务进行中"/>}</button>
+      <button className={`chat-more icon-button ${menu === chat.id ? 'visible' : ''}`} title="聊天选项" aria-label={`${chat.title} 的选项`} onClick={() => setMenu(menu === chat.id ? null : chat.id)}><MoreHorizontal size={18}/></button>
       {menu === chat.id && <><button className="popover-dismiss" aria-label="关闭菜单" onClick={() => setMenu(null)}/><div className="chat-menu popover">
         <button onClick={() => { setEditing(chat); setTitle(chat.title); setMenu(null); }}><Pencil size={16}/>重命名</button>
         <button onClick={() => { onUpdate(chat.id,{pinned:!chat.pinned}); setMenu(null); }}><Pin size={16}/>{chat.pinned ? '取消置顶' : '置顶聊天'}</button>
         <button onClick={() => { onUpdate(chat.id,{archived:!chat.archived}); setMenu(null); }}><Archive size={16}/>{chat.archived ? '移出归档' : '归档聊天'}</button>
-        <button className="danger-text" onClick={() => { setDeleting(chat); setMenu(null); }}><Trash2 size={16}/>删除聊天</button>
+        <button className="danger-text" disabled={activeChatIds.includes(chat.id)} onClick={() => { setDeleting(chat); setMenu(null); }}><Trash2 size={16}/>删除聊天</button>
       </div></>}
     </div>;
   }
@@ -62,18 +69,18 @@ export default function Sidebar({ chats, selectedId, user, siteName, mobileOpen,
   return <>
     <div className={`sidebar-shade ${mobileOpen ? 'show' : ''}`} onClick={onClose}/>
     <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`} ref={sidebarRef} aria-label="聊天侧栏">
-      <div className="sidebar-brand"><Brand/>
+      <div className="sidebar-brand"><button className="brand-home" title={siteName} aria-label={`${siteName}，新聊天`} onClick={() => { onNew(); onClose(); }}><Brand compact/></button>
         <button className="icon-button desktop-sidebar-close" onClick={onCollapse} aria-label="收起侧栏" title="收起侧栏"><PanelLeftClose size={20}/></button>
         <button className="icon-button mobile-only mobile-sidebar-close" onClick={onClose} aria-label="关闭侧栏"><PanelLeftClose size={20}/></button>
       </div>
-      <button className="new-chat-button" onClick={() => { onNew(); onClose(); }} disabled={disabled}><SquarePen size={20}/><span>新聊天</span></button>
+      <button className="new-chat-button" onClick={() => { onNew(); onClose(); }}><SquarePen size={20}/><span>新聊天</span></button>
       <div className="sidebar-search"><Search size={20}/><input ref={searchRef} aria-label="搜索聊天" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索聊天"/>
         {query && <button className="icon-button" aria-label="清除搜索" onClick={() => setQuery('')}><X size={15}/></button>}
       </div>
-      <div className="sidebar-history">
+      <div className="sidebar-history">{activeChatIds.length > 0 && <div className="sidebar-task-status" role="status"><span className="task-status-dot"/>{activeChatIds.length} 个任务进行中</div>}
         {archiveView && <button className="archive-heading" onClick={() => setArchiveView(false)}><ArchiveRestore size={15}/>已归档的聊天<span>返回</span></button>}
         {pinned.length > 0 && <><div className="history-heading">已置顶</div>{pinned.map(row)}</>}
-        {recent.length > 0 && <><div className="history-heading">{query ? '搜索结果' : archiveView ? '已归档' : '你的聊天'}</div>{recent.map(row)}</>}
+        {[...historyGroups].map(([label, items]) => <section className="history-group" key={label} aria-label={label}><div className="history-heading">{label}</div>{items.map(row)}</section>)}
         {filtered.length === 0 && (query || archiveView) && <div className="history-empty">{query ? '没有找到相关聊天' : '没有已归档的聊天'}</div>}
       </div>
       <div className="sidebar-bottom"><div className="account-area" ref={accountRef}>

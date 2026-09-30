@@ -1,7 +1,7 @@
-.upgrade-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap;border-radius:999px;padding:8px 14px;min-height:36px;background:#373044;color:#dfc7ff;font-size:14px;font-weight:550}
-.upgrade-button:hover{background:#463a59}
+.upgrade-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap;border-radius:999px;padding:8px 14px;min-height:36px;background:#303030;color:#ececec;font-size:14px;font-weight:500}
+.upgrade-button:hover{background:#3b3b3b}
 .account-name .account-plan{display:block;margin-top:3px;font-size:12px;font-weight:400;color:var(--muted)}
-:root[data-theme=light] .upgrade-button{background:#f2e9ff;color:#6c3c9d}
-:root[data-theme=light] .upgrade-button:hover{background:#e9d8ff}
+:root[data-theme=light] .upgrade-button{background:#f0f0f0;color:#303030}
+:root[data-theme=light] .upgrade-button:hover{background:#e5e5e5}
 .topbar-left,.model-picker{min-width:0}
 @media(max-width:580px){.upgrade-button{padding:7px 10px;font-size:13px;gap:5px}.upgrade-button svg{width:14px;height:14px}.topbar-right>.mobile-only{display:none}.topbar .model-trigger{max-width:min(47vw,220px)}.topbar-right{flex-shrink:0}}

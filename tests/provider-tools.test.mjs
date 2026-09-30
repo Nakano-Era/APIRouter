@@ -78,6 +78,25 @@ test('import transaction rolls back every connection when a later insertion fail
   assert.equal(store.get('SELECT COUNT(*) AS n FROM providers').n, 0); assert.equal(store.get('SELECT COUNT(*) AS n FROM models').n, 0);
 });
 
+test('provider backups preserve Responses format and model context capacities', t => {
+  const { store, tools } = fixture(t);
+  tools.importProviders([{ ...sample(), protocol: 'openai-responses', responsesProfile: 'codex', models: [{ ...sample().models[0], contextWindow: 10_000_000, maxOutputTokens: 1_000_000 }] }]);
+  const saved = tools.exportDocument().providers[0];
+  assert.equal(saved.responsesProfile, 'codex'); assert.equal(saved.models[0].contextWindow, 10_000_000);
+  tools.importProviders([{ ...saved, baseUrl: 'https://restored.example.com' }]);
+  const restored = store.get('SELECT * FROM providers WHERE base_url=?', 'https://restored.example.com');
+  assert.equal(restored.responses_profile, 'codex');
+  assert.equal(store.get('SELECT * FROM models WHERE provider_id=?', restored.id).max_output_tokens, 1_000_000);
+  assert.throws(() => normalizeProvider({ ...sample(), responsesProfile: 'invalid' }), /请求格式/);
+});
+
+test('AnyRouter OpenAI environment imports select Responses rather than Claude Code', async () => {
+  const result = await parseProviderInput('OPENAI_BASE_URL=https://anyrouter.top/v1\nOPENAI_API_KEY=sk-import-test');
+  assert.equal(result.providers[0].protocol, 'openai-responses');
+  assert.equal(result.providers[0].runtime, 'api');
+  assert.equal(result.providers[0].responsesProfile, 'auto');
+});
+
 test('New API balance uses same service prefix and bearer header, returns raw quota with no credentials', async t => {
   let seen = 0;
   const provider = await mock(t, (req, res) => { seen++; assert.equal(req.url, '/prefix/api/usage/token/'); assert.equal(req.headers.authorization, 'Bearer sk-balance-private-test-value'); assert.equal(req.headers['x-api-key'], undefined); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ code: true, data: { total_granted: 100, total_used: 25, total_available: 75, unlimited_quota: false, expires_at: 0, model_limits_enabled: true, model_limits: { 'model-one': true, 'model-two': false } } })); });
