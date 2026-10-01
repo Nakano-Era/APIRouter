@@ -26,6 +26,11 @@ function fixture(t, channels = [{ id: 'a', priority: 10 }, { id: 'b', priority: 
     store.run('INSERT INTO models VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', c.id, c.id, c.upstreamModelId ?? `upstream-${c.id}`, c.routeKey ?? 'shared-model', c.enabled ?? 1, c.available ?? 1, c.vision ?? 0, c.failureCount ?? 0, c.cooldownUntil ?? null, 0, 'untested', null, null, JSON.stringify(c.efforts || []));
   }
   db.exec("ALTER TABLE providers ADD COLUMN responses_profile TEXT DEFAULT 'auto'");
+  db.exec('ALTER TABLE providers ADD COLUMN failure_protection_enabled INTEGER DEFAULT 1; ALTER TABLE models ADD COLUMN variant_name TEXT DEFAULT \'\'; ALTER TABLE models ADD COLUMN failure_protection_enabled INTEGER; ALTER TABLE models ADD COLUMN failure_threshold_override INTEGER; ALTER TABLE models ADD COLUMN cooldown_seconds_override INTEGER;');
+  for (const c of channels) {
+    store.run('UPDATE providers SET failure_protection_enabled=? WHERE id=?', c.protection ?? 1, c.id);
+    store.run('UPDATE models SET variant_name=?,failure_protection_enabled=?,failure_threshold_override=?,cooldown_seconds_override=? WHERE id=?', c.variantName ?? '', c.modelProtection ?? null, c.modelThreshold ?? null, c.modelCooldownSeconds ?? null, c.id);
+  }
   return store;
 }
 const input = overrides => ({ routeKey: 'shared-model', messages: [{ role: 'user', content: 'Hello', attachments: [] }], maxOutputTokens: 200, systemPrompt: 'Be helpful', ...overrides });
@@ -118,7 +123,7 @@ test('threshold counts actual failures and opens a persistent per-model cooldown
 
 test('one broken model does not cool down other models on the same provider', async t => {
   const store = fixture(t, [{ id: 'a', threshold: 1 }]);
-  store.run("INSERT INTO models SELECT 'other',provider_id,'other-upstream','other-route',1,1,0,0,NULL,0,'untested',NULL,NULL,'[]' FROM models WHERE id='a'");
+  store.run("INSERT INTO models(id,provider_id,model_id,route_key,enabled,available,vision,failure_count,cooldown_until,failure_epoch,status,error,last_checked_at,reasoning_efforts) SELECT 'other',provider_id,'other-upstream','other-route',1,1,0,0,NULL,0,'untested',NULL,NULL,'[]' FROM models WHERE id='a'");
   const router = createRouter({ store, stream: async function* ({ model: candidate }) {
     if (candidate.id === 'a') throw failure(404);
     yield { type: 'delta', text: 'Other model works' };
@@ -387,4 +392,64 @@ test('Work accepts native API channels and still filters unsupported effort', as
   assert.equal(calls[0].provider.runtime,'api');
   assert.equal(calls[0].effort,'high');
   assert.equal(calls[0].context.userId,'owner');
+});
+
+test('model versions fail over only within the selected version, including the unversioned route', async t => {
+  const store = fixture(t, [{ id: 'normal', priority: 100, variantName: '普通版' }, { id: 'smart-a', priority: 10, variantName: '高智商版' }, { id: 'smart-b', variantName: '高智商版' }, { id: 'legacy', priority: 200 }]);
+  const calls = [];
+  const router = createRouter({ store, stream: async function* ({ model }) { calls.push(model.id); if (model.id === 'smart-a') throw failure(429); yield { type: 'delta', text: '回答' }; } });
+  assert.deepEqual(selected(await collect(router.run(input({ variantName: '高智商版' })))), ['smart-a', 'smart-b']);
+  assert.deepEqual(selected(await collect(router.run(input()))), ['legacy']);
+  assert.deepEqual(selected(await collect(router.run(input({ variantName: '普通版' })))), ['normal']);
+  await assert.rejects(collect(router.run(input({ variantName: '不存在的版本' }))), { code: 'ROUTE_UNAVAILABLE' });
+  assert.equal(calls.length, 4);
+  const output = [];
+  await assert.rejects(collect(router.run(input({ variantName: '高智商版', candidateIds: ['normal'] })), output), { code: 'ROUTE_UNAVAILABLE' });
+  assert.deepEqual(output, []);
+});
+
+test('a version assignment changed during routing is rechecked before failover', async t => {
+  const store = fixture(t, [{ id: 'a', priority: 10, variantName: '高智商版' }, { id: 'b', variantName: '高智商版' }]);
+  const calls = [];
+  const router = createRouter({ store, stream: async function* ({ model }) {
+    calls.push(model.id);
+    store.run('UPDATE models SET variant_name=? WHERE id=?', '普通版', 'b');
+    throw failure(429);
+  } });
+  await assert.rejects(collect(router.run(input({ variantName: '高智商版' }))), { code: 'ROUTE_EXHAUSTED' });
+  assert.deepEqual(calls, ['a']);
+});
+
+test('disabled provider failure protection ignores persisted cooldown and continues tracking errors without disabling', async t => {
+  const store = fixture(t, [{ id: 'a', protection: 0, threshold: 1, failureCount: 9, cooldownUntil: '2099-01-01T00:00:00Z' }]);
+  let calls = 0;
+  const router = createRouter({ store, stream: async function* () { calls++; throw failure(429); } });
+  for (let attempt = 0; attempt < 3; attempt++) await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
+  assert.equal(calls, 3); assert.equal(model(store, 'a').failure_count, 12); assert.equal(model(store, 'a').cooldown_until, null);
+});
+
+test('per-model failure protection can override either enabled or disabled provider defaults', async t => {
+  const store = fixture(t, [{ id: 'a', protection: 1, modelProtection: 0, threshold: 1 }, { id: 'b', protection: 0, modelProtection: 1, threshold: 1, modelCooldownSeconds: 120 }]);
+  const stamp = Date.parse('2026-10-01T00:00:00Z');
+  const router = createRouter({ store, clock: () => stamp, stream: async function* () { throw failure(429); } });
+  await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
+  assert.equal(model(store, 'a').cooldown_until, null);
+  assert.equal(model(store, 'b').cooldown_until, '2026-10-01T00:02:00.000Z');
+  const events = [];
+  await assert.rejects(collect(router.run(input()), events), { code: 'ROUTE_EXHAUSTED' });
+  assert.deepEqual(selected(events), ['a']);
+});
+
+test('per-model threshold and cooldown override provider defaults and allow recovery afterwards', async t => {
+  const store = fixture(t, [{ id: 'a', threshold: 1, cooldownSeconds: 60, modelThreshold: 2, modelCooldownSeconds: 300 }]);
+  let now = Date.parse('2026-10-01T00:00:00Z'), fail = true;
+  const router = createRouter({ store, clock: () => now, stream: async function* () { if (fail) throw failure(429); yield { type: 'delta', text: '恢复' }; } });
+  await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
+  assert.equal(model(store, 'a').cooldown_until, null);
+  await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
+  assert.equal(model(store, 'a').cooldown_until, '2026-10-01T00:05:00.000Z');
+  await assert.rejects(collect(router.run(input())), { code: 'ROUTE_COOLDOWN' });
+  now += 300_001; fail = false;
+  assert.deepEqual(selected(await collect(router.run(input()))), ['a']);
+  assert.equal(model(store, 'a').failure_count, 0); assert.equal(model(store, 'a').cooldown_until, null);
 });

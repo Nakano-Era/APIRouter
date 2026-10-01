@@ -13,10 +13,11 @@ export async function collectArtifacts(directory, limits = {}) {
   const root = await realpath(directory);
   const files = [];
   let total = 0, visited = 0;
+  const skip = reason => { if (typeof limits.onSkip === 'function') limits.onSkip(reason); };
   const walk = async (relative = '', depth = 0) => {
-    if (depth > 6) return;
+    if (depth > 6) { skip('depth'); return; }
     for (const entry of await readdir(join(root, relative), { withFileTypes: true })) {
-      if (++visited > 3000 || files.length >= (limits.count ?? MAX_ARTIFACTS)) return;
+      if (++visited > 3000 || files.length >= (limits.count ?? MAX_ARTIFACTS)) { skip('count'); return; }
       const name = relative ? `${relative}/${entry.name}` : entry.name;
       try { safeRelativePath(name); } catch { continue; }
       const target = join(root, name);
@@ -25,7 +26,9 @@ export async function collectArtifacts(directory, limits = {}) {
       const actual = await realpath(target);
       if (!actual.startsWith(root + sep)) continue;
       if (stat.isDirectory()) { await walk(name, depth + 1); continue; }
-      if (!stat.isFile() || stat.nlink !== 1 || stat.size > (limits.bytes ?? MAX_ARTIFACT_BYTES) || total + stat.size > (limits.total ?? MAX_ARTIFACT_TOTAL)) continue;
+      if (!stat.isFile() || stat.nlink !== 1) continue;
+      if (stat.size > (limits.bytes ?? MAX_ARTIFACT_BYTES)) { skip('size'); continue; }
+      if (total + stat.size > (limits.total ?? MAX_ARTIFACT_TOTAL)) { skip('total'); continue; }
       // O_NOFOLLOW plus fstat protects against a symlink swap while a background
       // process is still exiting. Exact size bounds prevent unbounded reads.
       let file;
@@ -66,12 +69,18 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
     await writeFile(join(directory, 'SKILL.md'), checked.content, { mode: 0o600 });
   }
   const fileHashes = new Map();
+  const warned = new Set();
   const snapshot = async () => {
     if (job.mode !== 'work') return;
-    for (const file of await collectArtifacts(join(cwd, 'output'))) {
+    const skipped = new Set();
+    for (const file of await collectArtifacts(join(cwd, 'output'), { onSkip: reason => skipped.add(reason) })) {
       const hash = createHash('sha256').update(file.data).digest('hex');
       if (fileHashes.get(file.path) === hash) continue;
       await emit({ type: 'file', file }); fileHashes.set(file.path, hash);
+    }
+    for (const reason of skipped) if (!warned.has(reason)) {
+      warned.add(reason);
+      await emit({ type: 'activity', label: ({ count: '部分文件未保存：单次最多 30 个文件，请让 Work 将源码打成 ZIP。', size: '部分文件未保存：单个文件超过 10 MB，请压缩或拆分。', total: '部分文件未保存：文件总量超过 30 MB，请分批生成。', depth: '部分文件未保存：目录过深，请让 Work 将源码打成 ZIP。' })[reason] });
     }
   };
   if (job.engine === 'native') {

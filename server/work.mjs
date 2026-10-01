@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { basename, extname } from 'node:path';
+import archiver from 'archiver';
 import { UpstreamError } from './net.mjs';
 import { LIMIT_BOUNDS, validateLimits, validateSkill, skillMetadata, validateJob, validateCheckpoint, safeRelativePath, MAX_SKILL_BYTES, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_TOTAL, MAX_ARTIFACTS, fault } from '../runner/protocol.mjs';
 import { safePublicRequest, boundedBody, redactCredentials } from '../runner/network.mjs';
@@ -9,7 +10,7 @@ const now = () => new Date().toISOString();
 const id = () => randomBytes(16).toString('hex');
 const mimeFor = name => ({ '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.html': 'text/html', '.json': 'application/json', '.csv': 'text/csv', '.zip': 'application/zip', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation' })[extname(name).toLowerCase()] ?? 'application/octet-stream';
 const skillJSON = (row, content = false) => ({ id: row.id, name: row.name, description: row.description, createdAt: row.created_at, updatedAt: row.updated_at, ...(content ? { content: row.content } : {}) });
-const artifactJSON = row => ({ id: row.id, name: row.name, size: row.size, mime: row.mime, createdAt: row.created_at, downloadUrl: `/api/work/artifacts/${row.id}/download` });
+const artifactJSON = row => ({ id: row.id, name: row.name, path: row.path, chatId: row.chat_id, size: row.size, mime: row.mime, createdAt: row.created_at, downloadUrl: `/api/work/chats/${row.chat_id}/artifacts/${row.id}/download` });
 const tokens = value => Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
 function redactObject(value, secrets) {
   if (typeof value === 'string') return redactCredentials(value, secrets);
@@ -227,12 +228,37 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
       const skill = store.get('SELECT * FROM work_skills WHERE id=?', req.params.id); if (!skill) throw fault('技能不存在。', 404);
       res.set('Content-Security-Policy', "default-src 'none'; sandbox"); res.type('text/markdown').attachment(`${skill.name}-SKILL.md`).send(skill.content);
     });
-    app.get('/api/work/chats/:id/artifacts', auth, (req, res) => { ownedChat(req.user.id, req.params.id); res.json({ artifacts: store.all('SELECT id,name,size,mime,created_at FROM work_artifacts WHERE user_id=? AND chat_id=? ORDER BY created_at DESC', req.user.id, req.params.id).map(artifactJSON) }); });
-    app.get('/api/work/artifacts/:id/download', auth, (req, res) => {
-      const file = store.get('SELECT * FROM work_artifacts WHERE id=? AND user_id=?', req.params.id, req.user.id); if (!file) throw fault('文件不存在或无权访问。', 404);
-      res.set({ 'Content-Security-Policy': "default-src 'none'; sandbox", 'X-Content-Type-Options': 'nosniff' });
-      res.type(file.mime).attachment(file.name).send(Buffer.from(file.body));
+    app.get('/api/work/chats/:id/artifacts', auth, (req, res) => { ownedChat(req.user.id, req.params.id); res.json({ artifacts: store.all('SELECT id,name,path,chat_id,size,mime,created_at FROM work_artifacts WHERE user_id=? AND chat_id=? ORDER BY created_at DESC', req.user.id, req.params.id).map(artifactJSON) }); });
+    app.get('/api/work/chats/:id/artifacts/download', auth, (req, res) => {
+      ownedChat(req.user.id, req.params.id);
+      const prefix = req.query.path === undefined ? '' : safeRelativePath(req.query.path);
+      const files = store.all('SELECT id,path,size FROM work_artifacts WHERE user_id=? AND chat_id=? ORDER BY path', req.user.id, req.params.id).filter(file => !prefix || file.path.startsWith(`${prefix}/`));
+      if (!files.length) throw fault('尚未生成可下载的任务文件，请让 Work 将文件保存到 output/。', 404, 'WORK_FILES_NOT_FOUND');
+      if (files.length > 500 || files.reduce((sum, file) => sum + file.size, 0) > MAX_ARTIFACT_TOTAL) throw fault('打包文件超过 30 MB，请按目录分别下载，或让 Work 创建压缩包。', 413, 'WORK_ARCHIVE_LIMIT');
+      // Only persisted, owner-scoped blobs are added. Never open model-written
+      // paths on the host or follow a filesystem link while building archives.
+      for (const file of files) safeRelativePath(file.path);
+      const archive = archiver('zip', { zlib: { level: 6 } });
+      archive.on('error', error => res.destroy(error));
+      res.on('close', () => archive.abort());
+      res.set({ 'Content-Security-Policy': "default-src 'none'; sandbox", 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' });
+      res.type('application/zip').attachment(`${prefix ? basename(prefix) : 'work-files'}.zip`);
+      archive.pipe(res);
+      for (const file of files) {
+        const saved = store.get('SELECT body FROM work_artifacts WHERE id=? AND user_id=? AND chat_id=?', file.id, req.user.id, req.params.id);
+        archive.append(Buffer.from(saved.body), { name: file.path });
+      }
+      void archive.finalize().catch(error => res.destroy(error));
     });
+    function sendArtifact(req, res) {
+      if (req.params.chatId) ownedChat(req.user.id, req.params.chatId);
+      const file = store.get('SELECT * FROM work_artifacts WHERE id=? AND user_id=?', req.params.id, req.user.id);
+      if (!file || (req.params.chatId && file.chat_id !== req.params.chatId)) throw fault('文件不存在或无权访问。', 404);
+      res.set({ 'Content-Security-Policy': "default-src 'none'; sandbox", 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' });
+      res.type(file.mime).attachment(file.name).send(Buffer.from(file.body));
+    }
+    app.get('/api/work/chats/:chatId/artifacts/:id/download', auth, sendArtifact);
+    app.get('/api/work/artifacts/:id/download', auth, sendArtifact);
     app.get('/api/admin/work/settings', auth, admin, async (_req, res) => res.json({ configured: isConfigured(), ...(await capabilities()), settings: settings(), limits: LIMIT_BOUNDS }));
     app.patch('/api/admin/work/settings', auth, csrf, admin, async (req, res) => {
       const updated = validateLimits(req.body, settings()); store.setSetting('workSettings', updated); statusCache = null;

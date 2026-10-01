@@ -5,6 +5,7 @@ import rateLimit from 'express-rate-limit';
 import { id, now, digest, verifyPassword } from './store.mjs';
 import { validateBaseUrl, openUpstream, readJson, sanitizeUpstreamError } from './net.mjs';
 import { responseProfiles } from './responses-compat.mjs';
+import { variantName } from './model-catalog.mjs';
 
 const derive = promisify(scrypt);
 const fail = (status, message) => Object.assign(new Error(message), { status });
@@ -33,6 +34,11 @@ function modelDefinition(value) {
   const reasoningEfforts = value.reasoningEfforts ?? [];
   if (!Array.isArray(reasoningEfforts) || reasoningEfforts.length > 5 || new Set(reasoningEfforts).size !== reasoningEfforts.length || reasoningEfforts.some(effort => !['low', 'medium', 'high', 'xhigh', 'max'].includes(effort))) throw fail(400, '模型思考强度配置无效。');
   return { modelId, name: text(value.name ?? modelId, '模型名称'), routeKey: text(value.routeKey ?? value.route_key ?? modelId, '统一模型名'), reasoningEfforts,
+    variantName: variantName(value.variantName ?? value.variant_name ?? ''),
+    catalogAssigned: bool(value.catalogAssigned ?? value.enabled ?? false, '目录分配状态'),
+    failureProtectionEnabled: value.failureProtectionEnabled == null ? null : bool(value.failureProtectionEnabled, '模型失败保护'),
+    failureThreshold: value.failureThreshold == null ? null : integer(value.failureThreshold, 1, 1000, '模型失败阈值'),
+    cooldownSeconds: value.cooldownSeconds == null ? null : integer(value.cooldownSeconds, 1, 2592000, '模型冷却时间'),
     contextWindow: value.contextWindow == null ? null : integer(value.contextWindow, 1024, 10_000_000, '模型上下文容量'),
     maxOutputTokens: value.maxOutputTokens == null ? null : integer(value.maxOutputTokens, 128, 1_000_000, '模型输出容量'),
     enabled: bool(value.enabled ?? false, '模型启用状态'), vision: bool(value.vision ?? false, '图片输入'), manual: bool(value.manual ?? true, '手动模型'), available: bool(value.available ?? true, '可用状态') };
@@ -60,7 +66,8 @@ export function normalizeProvider(value, warnings = []) {
     responsesProfile: choice(value.responsesProfile ?? 'auto', responseProfiles, 'Responses 请求格式'),
     authMode: choice(value.authMode ?? value.auth_mode ?? (env.ANTHROPIC_AUTH_TOKEN || anyrouter ? 'bearer' : 'auto'), ['auto', 'bearer', 'x-api-key'], '认证方式'),
     enabled: bool(value.enabled ?? true, '连接启用状态'), priority: integer(value.priority ?? 0, 0, 1000, '优先级'),
-    failureThreshold: integer(value.failureThreshold ?? value.failure_threshold ?? 3, 1, 10, '失败阈值'), cooldownSeconds: integer(value.cooldownSeconds ?? value.cooldown_seconds ?? 60, 5, 86400, '冷却时间'),
+    failureProtectionEnabled: bool(value.failureProtectionEnabled ?? true, '失败保护'),
+    failureThreshold: integer(value.failureThreshold ?? value.failure_threshold ?? 3, 1, 1000, '失败阈值'), cooldownSeconds: integer(value.cooldownSeconds ?? value.cooldown_seconds ?? 60, 1, 2592000, '冷却时间'),
     balanceAdapter: choice(value.balanceAdapter ?? 'none', adapters, '余额查询接口'), models };
 }
 function normalizeBatch(values, warnings = []) {
@@ -173,10 +180,10 @@ export function createProviderTools({ store, providerJSON, ensureProviderIdle = 
         if (existing.has(signature)) { skipped++; continue; }
         existing.add(signature);
         const providerId = id();
-        store.run('INSERT INTO providers(id,name,base_url,protocol,encrypted_key,key_hint,enabled,created_at,priority,failure_threshold,cooldown_seconds,auth_mode,runtime,responses_profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', providerId, provider.name, provider.baseUrl, provider.protocol, store.encrypt(provider.apiKey), `••••${provider.apiKey.slice(-4)}`, Number(provider.enabled), now(), provider.priority, provider.failureThreshold, provider.cooldownSeconds, provider.authMode, provider.runtime, provider.responsesProfile);
+        store.run('INSERT INTO providers(id,name,base_url,protocol,encrypted_key,key_hint,enabled,created_at,priority,failure_threshold,cooldown_seconds,auth_mode,runtime,responses_profile,failure_protection_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', providerId, provider.name, provider.baseUrl, provider.protocol, store.encrypt(provider.apiKey), `••••${provider.apiKey.slice(-4)}`, Number(provider.enabled), now(), provider.priority, provider.failureThreshold, provider.cooldownSeconds, provider.authMode, provider.runtime, provider.responsesProfile, Number(provider.failureProtectionEnabled));
         store.run('INSERT INTO provider_tools(provider_id,balance_adapter) VALUES (?,?)', providerId, provider.balanceAdapter);
         for (const model of provider.models) {
-          store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,enabled,vision,manual,available,reasoning_efforts,context_window,max_output_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', id(), providerId, model.modelId, model.name, model.routeKey, Number(model.enabled), Number(model.vision), Number(model.manual), Number(model.available), JSON.stringify(model.reasoningEfforts), model.contextWindow, model.maxOutputTokens); modelsAdded++;
+          store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,enabled,vision,manual,available,reasoning_efforts,context_window,max_output_tokens,variant_name,catalog_assigned,failure_protection_enabled,failure_threshold_override,cooldown_seconds_override) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', id(), providerId, model.modelId, model.name, model.routeKey, Number(model.enabled), Number(model.vision), Number(model.manual), Number(model.available), JSON.stringify(model.reasoningEfforts), model.contextWindow, model.maxOutputTokens, model.variantName, Number(model.catalogAssigned), model.failureProtectionEnabled == null ? null : Number(model.failureProtectionEnabled), model.failureThreshold, model.cooldownSeconds); modelsAdded++;
         }
         added++;
       }
@@ -184,7 +191,7 @@ export function createProviderTools({ store, providerJSON, ensureProviderIdle = 
     return { added, skipped, modelsAdded };
   }
   function exportDocument() {
-    return { _type: envelopeType, version: 1, encrypted: false, exportedAt: now(), providers: store.all('SELECT * FROM providers ORDER BY created_at,id').map(row => ({ name: row.name, baseUrl: row.base_url, apiKey: store.decrypt(row.encrypted_key), protocol: row.protocol, runtime: row.runtime ?? 'api', responsesProfile: row.responses_profile ?? 'auto', authMode: row.auth_mode, enabled: !!row.enabled, priority: row.priority, failureThreshold: row.failure_threshold, cooldownSeconds: row.cooldown_seconds, balanceAdapter: store.get('SELECT balance_adapter FROM provider_tools WHERE provider_id=?', row.id)?.balance_adapter ?? 'none', models: store.all('SELECT * FROM models WHERE provider_id=? ORDER BY model_id', row.id).map(model => ({ modelId: model.model_id, name: model.name, routeKey: model.route_key, contextWindow: model.context_window ?? null, maxOutputTokens: model.max_output_tokens ?? null, enabled: !!model.enabled, vision: !!model.vision, manual: !!model.manual, available: !!model.available, reasoningEfforts: JSON.parse(model.reasoning_efforts ?? '[]') })) })) };
+    return { _type: envelopeType, version: 1, encrypted: false, exportedAt: now(), providers: store.all('SELECT * FROM providers ORDER BY created_at,id').map(row => ({ name: row.name, baseUrl: row.base_url, apiKey: store.decrypt(row.encrypted_key), protocol: row.protocol, runtime: row.runtime ?? 'api', responsesProfile: row.responses_profile ?? 'auto', authMode: row.auth_mode, enabled: !!row.enabled, priority: row.priority, failureProtectionEnabled: row.failure_protection_enabled !== 0, failureThreshold: row.failure_threshold, cooldownSeconds: row.cooldown_seconds, balanceAdapter: store.get('SELECT balance_adapter FROM provider_tools WHERE provider_id=?', row.id)?.balance_adapter ?? 'none', models: store.all('SELECT * FROM models WHERE provider_id=? ORDER BY model_id', row.id).map(model => ({ modelId: model.model_id, name: model.name, routeKey: model.route_key, variantName: model.variant_name ?? "", catalogAssigned: !!model.catalog_assigned, failureProtectionEnabled: model.failure_protection_enabled == null ? null : !!model.failure_protection_enabled, failureThreshold: model.failure_threshold_override ?? null, cooldownSeconds: model.cooldown_seconds_override ?? null, contextWindow: model.context_window ?? null, maxOutputTokens: model.max_output_tokens ?? null, enabled: !!model.enabled, vision: !!model.vision, manual: !!model.manual, available: !!model.available, reasoningEfforts: JSON.parse(model.reasoning_efforts ?? '[]') })) })) };
   }
   function registerRoutes(app, { auth, admin, csrf }) {
     const router = express.Router();

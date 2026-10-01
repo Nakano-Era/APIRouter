@@ -1,0 +1,4 @@
+.composer-model-picker .model-trigger-name{min-width:36px}
+.model-version-label{min-width:0;max-width:76px;font-size:11px;color:var(--muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;flex-shrink:1}
+.unified-model-menu .model-menu-back>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0}
+@media(max-width:580px){.model-version-label{max-width:48px;font-size:10px}.composer-model-picker .model-trigger-name{min-width:30px}}

@@ -14,6 +14,9 @@ import { createProviderTools } from './provider-tools.mjs';
 import { continuationInstruction, continuationAppender, isContinuationRequest, checkContext } from './continuation.mjs';
 import { reasoningSplitter } from './reasoning.mjs';
 import { responseProfiles } from './responses-compat.mjs';
+import { createModelCatalog, modelRouteId, variantName } from './model-catalog.mjs';
+import { createUserModelAccess } from './user-model-access.mjs';
+import { createChatExport } from './chat-export.mjs';
 
 const protocols = new Set(['openai-chat', 'openai-responses', 'anthropic']);
 const effortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -48,6 +51,8 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   const setupToken = store.get('SELECT id FROM users LIMIT 1') ? null : (suppliedSetupToken || process.env.SETUP_TOKEN || randomBytes(24).toString('base64url'));
   const publicOrigin = process.env.PUBLIC_ORIGIN ? new URL(process.env.PUBLIC_ORIGIN).origin : null;
   const billing = createBilling({ store, publicOrigin, stripeFactory });
+  const catalog = createModelCatalog({ store, ensureProviderIdle });
+  const modelAccess = createUserModelAccess({ store });
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 5, fields: 0, parts: 5 } });
   app.disable('x-powered-by');
   if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
@@ -85,6 +90,9 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   billing.registerRoutes(app, { auth, admin, csrf });
   work.registerRoutes(app, { auth, admin, csrf });
   createProviderTools({ store, providerJSON, ensureProviderIdle }).registerRoutes(app, { auth, admin, csrf });
+  catalog.registerRoutes(app, { auth, admin, csrf });
+  modelAccess.registerRoutes(app, { auth, admin, csrf });
+  createChatExport({ store }).registerRoutes(app, { auth, admin, csrf });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false, message: { error: '登录尝试过多，请 15 分钟后重试。' } });
   function userJSON(row) { return { id: row.id, name: row.name, email: row.email, role: row.role, disabled: !!row.disabled, dailyLimit: row.daily_limit, createdAt: row.created_at }; }
   function createSession(res, user) {
@@ -150,35 +158,35 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     store.transaction(() => { store.run('UPDATE users SET password=? WHERE id=?', password, req.user.id); store.run('DELETE FROM sessions WHERE user_id=? AND token<>?', req.user.id, req.session.token); });
     res.json({ ok: true });
   });
-  function providerJSON(row) { return { id: row.id, name: row.name, baseUrl: row.base_url, protocol: row.protocol, runtime: row.runtime || 'api', responsesProfile: row.responses_profile || 'auto', enabled: !!row.enabled, hasKey: !!row.encrypted_key, keyHint: row.key_hint, lastSyncedAt: row.last_synced_at, lastSyncError: row.last_sync_error, createdAt: row.created_at, priority: row.priority, failureThreshold: row.failure_threshold, cooldownSeconds: row.cooldown_seconds, authMode: row.auth_mode }; }
+  function providerJSON(row) { return { id: row.id, name: row.name, baseUrl: row.base_url, protocol: row.protocol, runtime: row.runtime || 'api', responsesProfile: row.responses_profile || 'auto', enabled: !!row.enabled, hasKey: !!row.encrypted_key, keyHint: row.key_hint, lastSyncedAt: row.last_synced_at, lastSyncError: row.last_sync_error, createdAt: row.created_at, priority: row.priority, failureProtectionEnabled: row.failure_protection_enabled !== 0, failureThreshold: row.failure_threshold, cooldownSeconds: row.cooldown_seconds, authMode: row.auth_mode }; }
   function providerForModel(row) { const provider = store.get('SELECT * FROM providers WHERE id=?', row.provider_id); if (!provider?.enabled) throw fail(400, '该模型的接口已停用。'); return { ...providerJSON(provider), apiKey: store.decrypt(provider.encrypted_key) }; }
   function providerBusy(providerId) { return syncing.has(providerId) || [...testing.values()].includes(providerId) || [...active.values()].some(job => job.providerIds?.includes(providerId)); }
   function ensureProviderIdle(providerId) { if (providerBusy(providerId)) throw fail(409, '该接口正在处理请求，请等待请求完成或停止回复后修改。'); }
-  function modelJSON(row) { return { id: row.id, providerId: row.provider_id, modelId: row.model_id, name: row.name, routeKey: row.route_key, contextWindow: row.context_window ?? null, maxOutputTokens: row.max_output_tokens ?? null, reasoningEfforts: JSON.parse(row.reasoning_efforts || '[]'), failureCount: row.failure_count, cooldownUntil: row.cooldown_until, enabled: !!row.enabled, vision: !!row.vision, available: !!row.available, providerName: row.provider_name || store.get('SELECT name FROM providers WHERE id=?', row.provider_id)?.name, status: row.status, lastCheckedAt: row.last_checked_at, error: row.error }; }
-  const routeId = key => `r_${digest(key).slice(0, 32)}`;
+  function modelJSON(row) { return { id: row.id, providerId: row.provider_id, modelId: row.model_id, name: row.name, routeKey: row.route_key, variantName: row.variant_name || '', contextWindow: row.context_window ?? null, maxOutputTokens: row.max_output_tokens ?? null, reasoningEfforts: JSON.parse(row.reasoning_efforts || '[]'), failureProtectionEnabled: row.failure_protection_enabled == null ? null : !!row.failure_protection_enabled, failureThreshold: row.failure_threshold_override ?? null, cooldownSeconds: row.cooldown_seconds_override ?? null, failureCount: row.failure_count, cooldownUntil: row.cooldown_until, enabled: !!row.enabled, vision: !!row.vision, available: !!row.available, providerName: row.provider_name || store.get('SELECT name FROM providers WHERE id=?', row.provider_id)?.name, status: row.status, lastCheckedAt: row.last_checked_at, error: row.error }; }
+  const routeId = modelRouteId;
   function routeGroups() {
     const groups = new Map();
-    for (const model of store.all('SELECT m.*,p.name AS provider_name,p.protocol,p.runtime FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.enabled=1 AND m.available=1 AND p.enabled=1 ORDER BY p.priority DESC,p.created_at,m.id')) { if (!groups.has(model.route_key)) groups.set(model.route_key, []); groups.get(model.route_key).push(model); }
+    for (const model of store.all('SELECT m.*,p.name AS provider_name,p.protocol,p.runtime FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.enabled=1 AND m.available=1 AND p.enabled=1 ORDER BY p.priority DESC,p.created_at,m.id')) { const key = routeId(model.route_key, model.variant_name); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(model); }
     return groups;
   }
   function usableModel(modelId, user) {
-    const legacy = store.get('SELECT route_key FROM models WHERE id=?', modelId);
+    const legacy = store.get('SELECT route_key,variant_name FROM models WHERE id=?', modelId);
     const groups = routeGroups();
-    const key = [...groups.keys()].find(key => routeId(key) === modelId || key === legacy?.route_key);
-    if (!key) throw fail(400, '模型不可用，请选择其他模型或联系管理员。', 'MODEL_UNAVAILABLE');
+    const key = legacy ? routeId(legacy.route_key, legacy.variant_name) : modelId;
+    const rows = groups.get(key);
+    if (!rows) throw fail(400, '模型或版本不可用，请选择其他模型或联系管理员。', 'MODEL_UNAVAILABLE');
     if (user && user.role !== 'admin') {
       const entitlement = billing.effectiveEntitlement(user.id);
-      if (entitlement.allowedRoutes.length && !entitlement.allowedRoutes.includes(key)) throw fail(403, '当前套餐不包含此模型，请升级套餐或选择其他模型。', 'PLAN_MODEL_RESTRICTED');
+      if (entitlement.allowedRoutes.length && !entitlement.allowedRoutes.includes(rows[0].route_key)) throw fail(403, '当前套餐不包含此模型，请升级套餐或选择其他模型。', 'PLAN_MODEL_RESTRICTED');
     }
-    const rows = groups.get(key);
-    return { ...rows[0], id: routeId(key), name: key, model_id: key, vision: rows.some(row => row.vision) ? 1 : 0, channels: rows };
+    return { ...rows[0], id: key, name: rows[0].route_key, model_id: rows[0].route_key, vision: rows.some(row => row.vision) ? 1 : 0, channels: rows };
   }
-  function publicModels() { return [...routeGroups()].map(([key, rows]) => ({ id: routeId(key), name: key, modelId: key, routeKey: key, vision: rows.some(row => row.vision), enabled: true,
+  function publicModels() { return [...routeGroups()].map(([key, rows]) => ({ id: key, name: rows[0].route_key, modelId: rows[0].route_key, routeKey: rows[0].route_key, variantName: rows[0].variant_name, vision: rows.some(row => row.vision), enabled: true,
     modes: ['chat', ...(work.isConfigured() ? ['work'] : [])],
     contextWindow: rows.some(row => row.context_window) ? Math.max(...rows.map(row => row.context_window || 0)) : null,
     reasoningEfforts: ['auto', ...new Set(rows.flatMap(row => JSON.parse(row.reasoning_efforts || '[]')))],
     status: rows.some(row => row.status === 'ok') ? 'ok' : rows.every(row => row.status === 'error') ? 'error' : 'untested' })); }
-  app.get('/api/models', (req, res) => { const allowed = billing.effectiveEntitlement(req.user.id).allowedRoutes; const models = publicModels().filter(model => req.user.role === 'admin' || !allowed.length || allowed.includes(model.routeKey)), configured = store.settings().defaultModelId; const legacy = configured ? store.get('SELECT route_key FROM models WHERE id=?', configured) : null; const wanted = legacy ? routeId(legacy.route_key) : configured; res.json({ models, defaultModelId: models.some(m => m.id === wanted) ? wanted : (models[0]?.id || null) }); });
+  app.get('/api/models', (req, res) => { const allowed = billing.effectiveEntitlement(req.user.id).allowedRoutes; const models = publicModels().filter(model => req.user.role === 'admin' || !allowed.length || allowed.includes(model.routeKey)), configured = store.settings().defaultModelId; const legacy = configured ? store.get('SELECT route_key,variant_name FROM models WHERE id=?', configured) : null; const wanted = legacy ? routeId(legacy.route_key, legacy.variant_name) : configured; res.json({ models, defaultModelId: models.some(m => m.id === wanted) ? wanted : (models[0]?.id || null) }); });
   app.get('/api/settings', (req, res) => { const settings = store.settings(); if (req.user.role !== 'admin') delete settings.systemPrompt; res.json({ settings }); });
   function attachmentJSON(row) { return { id: row.id, name: row.name, mime: row.mime, size: row.size, kind: row.kind, url: `/api/files/${row.id}/download` }; }
   function chatJSON(row) { return { id: row.id, title: row.title, modelId: row.model_id, generating: active.has(row.id), mode: row.mode || 'chat', effort: row.effort || 'auto', skillIds: JSON.parse(row.skill_ids || '[]'), webSearch: !!row.web_search, pinned: !!row.pinned, archived: !!row.archived, createdAt: row.created_at, updatedAt: row.updated_at }; }
@@ -285,12 +293,13 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     const assistantId = continuing ? tail.id : id(), requestId = id();
     const priorContent = continuing ? tail.content : '';
     store.transaction(() => {
+      modelAccess.assertCanGenerate(req.user.id, modelRow.route_key, modelRow.variant_name, { at: timestamp });
       if (action === 'edit') { const edited = existing.find(m => m.id === req.body.messageId); store.run('DELETE FROM messages WHERE chat_id=? AND rowid>=?', chat.id, edited.sort_index); }
       if (action === 'regenerate') { const lastUser = selected.at(-1); store.run('DELETE FROM messages WHERE chat_id=? AND rowid>?', chat.id, lastUser.sort_index); }
       if (userMessage) store.run('INSERT INTO messages(id,chat_id,role,content,model_id,status,attachment_ids,created_at) VALUES (?,?,?,?,?,?,?,?)', userMessage.id, chat.id, 'user', userMessage.content, model.id, 'complete', userMessage.attachment_ids, userMessage.created_at);
       if (continuing) store.run("UPDATE messages SET status='streaming',error=NULL,model_id=? WHERE id=?", model.id, assistantId);
       else store.run('INSERT INTO messages(id,chat_id,role,content,model_id,status,created_at) VALUES (?,?,?,?,?,?,?)', assistantId, chat.id, 'assistant', '', model.id, 'streaming', timestamp);
-      store.run('INSERT INTO requests(id,user_id,model_id,status,created_at) VALUES (?,?,?,?,?)', requestId, req.user.id, model.id, 'running', timestamp);
+      store.run('INSERT INTO requests(id,user_id,model_id,route_key,variant_name,status,created_at) VALUES (?,?,?,?,?,?,?)', requestId, req.user.id, model.id, modelRow.route_key, modelRow.variant_name, 'running', timestamp);
       const first = selected.find(m => m.role === 'user');
       const title = chat.title === '新对话' ? (first?.content.slice(0, 40) || '文件分析') : chat.title;
       store.run('UPDATE chats SET title=?,model_id=?,updated_at=?,archived=0 WHERE id=?', title, model.id, timestamp, chat.id);
@@ -330,7 +339,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     function separate(events) { for (const event of events) append(event.type === 'reasoning' ? event.text : appender.push(event.text), event.type === 'reasoning' ? 'reasoning' : 'content'); }
     function finishMessage(status, error = null) { store.transaction(() => { store.run('UPDATE messages SET content=?,reasoning=?,status=?,error=? WHERE id=?', content, reasoning, status, error, assistantId); store.run('DELETE FROM message_chunks WHERE message_id=?', assistantId); }); }
     try {
-      for await (const event of router.run({ routeKey: modelRow.route_key, candidateIds, messages: input, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal: controller.signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...execution, context: { userId: req.user.id, chatId: chat.id, assistantId, continuation: continuing, resumeText: priorContent } })) {
+      for await (const event of router.run({ routeKey: modelRow.route_key, variantName: modelRow.variant_name, candidateIds, messages: input, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal: controller.signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...execution, context: { userId: req.user.id, chatId: chat.id, assistantId, continuation: continuing, resumeText: priorContent } })) {
         if (event.type === 'routing') send('routing', { message: '正在重新连接，请稍候…' });
         if (event.type === 'activity') send('activity', { label: event.label });
         if (event.type === 'artifact') send('artifact', { artifact: event.artifact });
@@ -370,14 +379,14 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     if (!['api','claude-code'].includes(runtime)) throw fail(400, '请选择有效的执行方式。');
     if (runtime === 'claude-code' && (body.protocol || row.protocol) !== 'anthropic') throw fail(400, 'Claude Code 执行方式需要 Anthropic Messages 协议。');
     if (!['auto', 'bearer', 'x-api-key'].includes(authMode)) throw fail(400, '请选择有效的认证方式。');
-    return { authMode, runtime, responsesProfile, priority: number(body.priority ?? row.priority ?? 0, 0, 1000, '渠道优先级'), failureThreshold: number(body.failureThreshold ?? row.failure_threshold ?? 3, 1, 10, '连续失败阈值'), cooldownSeconds: number(body.cooldownSeconds ?? row.cooldown_seconds ?? 60, 5, 86400, '冷却秒数') };
+    return { authMode, runtime, responsesProfile, failureProtectionEnabled: body.failureProtectionEnabled === undefined ? row.failure_protection_enabled ?? 1 : bool(body.failureProtectionEnabled, '失败冷却'), priority: number(body.priority ?? row.priority ?? 0, 0, 1000, '渠道优先级'), failureThreshold: number(body.failureThreshold ?? row.failure_threshold ?? 3, 1, 1000, '连续失败阈值'), cooldownSeconds: number(body.cooldownSeconds ?? row.cooldown_seconds ?? 60, 1, 2592000, '冷却秒数') };
   }
   app.post('/api/admin/providers', async (req, res) => {
     const name = requiredText(req.body.name, '接口名称', 80), baseUrl = await validateBaseUrl(requiredText(req.body.baseUrl, '接口地址', 1000)), apiKey = requiredText(req.body.apiKey, 'API Key', 4000);
     if (!protocols.has(req.body.protocol)) throw fail(400, '请选择有效的接口协议。');
     const routing = routingConfig(req.body);
     const providerId = id();
-    store.run('INSERT INTO providers(id,name,base_url,protocol,encrypted_key,key_hint,enabled,created_at,priority,failure_threshold,cooldown_seconds,auth_mode,runtime,responses_profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', providerId, name, baseUrl, req.body.protocol, store.encrypt(apiKey), `••••${apiKey.slice(-4)}`, req.body.enabled === undefined ? 1 : bool(req.body.enabled, '启用'), now(), routing.priority, routing.failureThreshold, routing.cooldownSeconds, routing.authMode, routing.runtime, routing.responsesProfile);
+    store.run('INSERT INTO providers(id,name,base_url,protocol,encrypted_key,key_hint,enabled,created_at,priority,failure_threshold,cooldown_seconds,auth_mode,runtime,responses_profile,failure_protection_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', providerId, name, baseUrl, req.body.protocol, store.encrypt(apiKey), `••••${apiKey.slice(-4)}`, req.body.enabled === undefined ? 1 : bool(req.body.enabled, '启用'), now(), routing.priority, routing.failureThreshold, routing.cooldownSeconds, routing.authMode, routing.runtime, routing.responsesProfile, routing.failureProtectionEnabled);
     res.status(201).json({ provider: providerJSON(store.get('SELECT * FROM providers WHERE id=?', providerId)) });
   });
   function getProvider(providerId) { const row = store.get('SELECT * FROM providers WHERE id=?', providerId); if (!row) throw fail(404, '接口不存在。'); return row; }
@@ -395,7 +404,8 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     const apiKey = req.body.apiKey ? requiredText(req.body.apiKey, 'API Key', 4000) : null;
     const routing = routingConfig(req.body, row);
     ensureProviderIdle(row.id);
-    store.run('UPDATE providers SET name=?,base_url=?,protocol=?,encrypted_key=?,key_hint=?,enabled=?,priority=?,failure_threshold=?,cooldown_seconds=?,auth_mode=?,runtime=?,responses_profile=? WHERE id=?', name, baseUrl, protocol, apiKey ? store.encrypt(apiKey) : row.encrypted_key, apiKey ? `••••${apiKey.slice(-4)}` : row.key_hint, req.body.enabled === undefined ? row.enabled : bool(req.body.enabled, '启用'), routing.priority, routing.failureThreshold, routing.cooldownSeconds, routing.authMode, routing.runtime, routing.responsesProfile, row.id);
+    store.run('UPDATE providers SET name=?,base_url=?,protocol=?,encrypted_key=?,key_hint=?,enabled=?,priority=?,failure_threshold=?,cooldown_seconds=?,auth_mode=?,runtime=?,responses_profile=?,failure_protection_enabled=? WHERE id=?', name, baseUrl, protocol, apiKey ? store.encrypt(apiKey) : row.encrypted_key, apiKey ? `••••${apiKey.slice(-4)}` : row.key_hint, req.body.enabled === undefined ? row.enabled : bool(req.body.enabled, '启用'), routing.priority, routing.failureThreshold, routing.cooldownSeconds, routing.authMode, routing.runtime, routing.responsesProfile, routing.failureProtectionEnabled, row.id);
+    if (routing.failureProtectionEnabled !== row.failure_protection_enabled || routing.failureThreshold !== row.failure_threshold || routing.cooldownSeconds !== row.cooldown_seconds) store.run('UPDATE models SET failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1 WHERE provider_id=?', row.id);
     if (baseUrl !== row.base_url || protocol !== row.protocol || apiKey || routing.authMode !== row.auth_mode || routing.runtime !== row.runtime || routing.responsesProfile !== row.responses_profile) store.run("UPDATE models SET status='untested',last_checked_at=NULL,error=NULL,failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1 WHERE provider_id=?", row.id);
     res.json({ provider: providerJSON(getProvider(row.id)) });
   });
@@ -414,20 +424,30 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     } catch (error) { const message = sanitizeUpstreamError(error); store.run('UPDATE providers SET last_sync_error=? WHERE id=?', message, row.id); auditAdminFailure(error, row.id, '[模型同步]', 'sync'); throw fail(error.status || 502, message); } finally { syncing.delete(row.id); }
   });
   app.get('/api/admin/models', (_req, res) => res.json({ models: store.all('SELECT m.*,p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id ORDER BY p.name,m.name').map(modelJSON), defaultModelId: store.settings().defaultModelId }));
+  function modelProtection(body, row = {}) {
+    return {
+      enabled: body.failureProtectionEnabled === undefined ? row.failure_protection_enabled ?? null : body.failureProtectionEnabled === null ? null : bool(body.failureProtectionEnabled, '失败冷却'),
+      threshold: body.failureThreshold === undefined ? row.failure_threshold_override ?? null : body.failureThreshold === null ? null : number(body.failureThreshold, 1, 1000, '连续失败阈值'),
+      seconds: body.cooldownSeconds === undefined ? row.cooldown_seconds_override ?? null : body.cooldownSeconds === null ? null : number(body.cooldownSeconds, 1, 2592000, '冷却秒数'),
+    };
+  }
   app.post('/api/admin/models', (req, res) => {
     const provider = getProvider(req.body.providerId), modelId = requiredText(req.body.modelId, '模型 ID', 300);
     if (store.get('SELECT id FROM models WHERE provider_id=? AND model_id=?', provider.id, modelId)) throw fail(409, '该模型已存在。');
-    const modelInternalId = id(), routeKey = req.body.routeKey ? requiredText(req.body.routeKey, '统一模型名', 300) : modelId;
-    store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,vision,reasoning_efforts,context_window,max_output_tokens,manual) VALUES (?,?,?,?,?,?,?,?,?,1)', modelInternalId, provider.id, modelId, cleanText(req.body.name, 300) || modelId, routeKey, req.body.vision === undefined ? 0 : bool(req.body.vision, '图片输入'), JSON.stringify(req.body.reasoningEfforts === undefined ? initialEfforts(modelId) : reasoningEfforts(req.body.reasoningEfforts)), req.body.contextWindow === undefined ? null : capacityValue(req.body.contextWindow, '上下文容量', 1024, 10_000_000), req.body.maxOutputTokens === undefined ? null : capacityValue(req.body.maxOutputTokens, '模型最大输出', 128, 1_000_000));
+    const modelInternalId = id(), routeKey = req.body.routeKey ? requiredText(req.body.routeKey, '统一模型名', 300) : modelId, protection = modelProtection(req.body);
+    store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,vision,reasoning_efforts,context_window,max_output_tokens,manual,variant_name,catalog_assigned,failure_protection_enabled,failure_threshold_override,cooldown_seconds_override) VALUES (?,?,?,?,?,?,?,?,?,1,?,1,?,?,?)', modelInternalId, provider.id, modelId, cleanText(req.body.name, 300) || modelId, routeKey, req.body.vision === undefined ? 0 : bool(req.body.vision, '图片输入'), JSON.stringify(req.body.reasoningEfforts === undefined ? initialEfforts(modelId) : reasoningEfforts(req.body.reasoningEfforts)), req.body.contextWindow === undefined ? null : capacityValue(req.body.contextWindow, '上下文容量', 1024, 10_000_000), req.body.maxOutputTokens === undefined ? null : capacityValue(req.body.maxOutputTokens, '模型最大输出', 128, 1_000_000), variantName(req.body.variantName), protection.enabled, protection.threshold, protection.seconds);
     res.status(201).json({ model: modelJSON(store.get('SELECT * FROM models WHERE id=?', modelInternalId)) });
   });
   app.patch('/api/admin/models/:id', (req, res) => {
     const row = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (!row) throw fail(404, '模型不存在。'); ensureProviderIdle(row.provider_id);
     const enabled = req.body.enabled === undefined ? row.enabled : bool(req.body.enabled, '启用');
     const routeKey = req.body.routeKey === undefined ? row.route_key : requiredText(req.body.routeKey, '统一模型名', 300);
+    const version = req.body.variantName === undefined ? row.variant_name : variantName(req.body.variantName), protection = modelProtection(req.body, row);
     if (req.body.isDefault === true && !enabled) throw fail(400, '请先启用该模型再设为默认。');
     store.transaction(() => {
       store.run('UPDATE models SET name=?,enabled=?,vision=?,route_key=?,reasoning_efforts=?,context_window=?,max_output_tokens=? WHERE id=?', req.body.name === undefined ? row.name : requiredText(req.body.name, '显示名称', 300), enabled, req.body.vision === undefined ? row.vision : bool(req.body.vision, '图片输入'), routeKey, req.body.reasoningEfforts === undefined ? row.reasoning_efforts : JSON.stringify(reasoningEfforts(req.body.reasoningEfforts)), req.body.contextWindow === undefined ? row.context_window : capacityValue(req.body.contextWindow, '上下文容量', 1024, 10_000_000), req.body.maxOutputTokens === undefined ? row.max_output_tokens : capacityValue(req.body.maxOutputTokens, '模型最大输出', 128, 1_000_000), row.id);
+      store.run('UPDATE models SET variant_name=?,catalog_assigned=1,failure_protection_enabled=?,failure_threshold_override=?,cooldown_seconds_override=? WHERE id=?', version, protection.enabled, protection.threshold, protection.seconds, row.id);
+      if (protection.enabled !== row.failure_protection_enabled || protection.threshold !== row.failure_threshold_override || protection.seconds !== row.cooldown_seconds_override) store.run('UPDATE models SET failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1 WHERE id=?', row.id);
       if (req.body.isDefault === true) { usableModel(row.id); store.setSetting('defaultModelId', row.id); }
       if (!enabled && store.settings().defaultModelId === row.id) store.setSetting('defaultModelId', null);
     });

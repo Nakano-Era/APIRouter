@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { createServer } from 'node:http';
 import { once, EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
+import { inflateRawSync } from 'node:zlib';
 import express from 'express';
 import { createStore } from '../server/store.mjs';
 import { createWorkService, buildContext } from '../server/work.mjs';
@@ -235,6 +236,56 @@ test('work routes enforce admin skill edits and owner-only attachment downloads'
   assert.equal((await request(`/api/work/skills/${skill.skill.id}/download`, 'owner')).status, 200);
   assert.equal((await request('/api/admin/work/settings', 'owner')).status, 403);
   assert.equal((await request('/api/admin/work/settings', 'admin', { method: 'PATCH', body: JSON.stringify({ memoryMb: 10 }) })).status, 400);
+});
+
+test('work file and ZIP downloads are scoped to the conversation and contain only saved files', async t => {
+  const sourceFiles = [{ path: '源码/index.js', data: Buffer.from('export const answer = 42;').toString('base64') }, { path: '源码/README.md', data: Buffer.from('真实源码说明').toString('base64') }, { path: 'report.txt', data: Buffer.from('单个文件').toString('base64') }];
+  const { service, store } = fixture(t, { fetcher: async () => eventsResponse([...sourceFiles.map(file => ({ type: 'file', file })), { type: 'done' }]) });
+  const artifacts = (await collect(service.stream(options()))).map(event => event.artifact);
+  const stamp = new Date().toISOString();
+  store.run('INSERT INTO chats(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)', 'second-chat', 'owner', 'other conversation', stamp, stamp);
+  const app = express();
+  const auth = (req, res, next) => { const user = req.get('x-test-user'); if (!['owner', 'other'].includes(user)) return res.sendStatus(401); req.user = { id: user }; next(); };
+  service.registerRoutes(app, { auth, admin: (_req, _res, next) => next(), csrf: (_req, _res, next) => next() });
+  app.use((error, _req, res, _next) => res.status(error.status || 500).json({ error: error.message }));
+  const server = createServer(app), base = await listen(server); t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const get = (path, user = 'owner') => fetch(base + path, { headers: { 'x-test-user': user } });
+  const list = await (await get('/api/work/chats/chat/artifacts')).json();
+  assert.equal(list.artifacts.find(file => file.id === artifacts[0].id).path, '源码/index.js');
+  assert.equal(artifacts[0].chatId, 'chat');
+  assert.equal((await get(artifacts[0].downloadUrl.replace('/chats/chat/', '/chats/second-chat/'))).status, 404);
+  assert.equal((await get('/api/work/chats/chat/artifacts/download', 'other')).status, 404);
+  assert.equal((await get('/api/work/chats/chat/artifacts/download', '')).status, 401);
+  assert.equal((await get('/api/work/chats/second-chat/artifacts/download')).status, 404);
+  assert.equal((await get('/api/work/chats/chat/artifacts/download?path=../')).status, 400);
+  assert.equal((await get('/api/work/chats/chat/artifacts/download?path=missing')).status, 404);
+  const download = await get('/api/work/chats/chat/artifacts/download?path=' + encodeURIComponent('源码'));
+  assert.equal(download.status, 200); assert.match(download.headers.get('content-disposition'), /^attachment/); assert.equal(download.headers.get('cache-control'), 'private, no-store');
+  const zip = Buffer.from(await download.arrayBuffer()), entries = new Map();
+  let cursor = zip.readUInt32LE(zip.length - 6);
+  while (zip.readUInt32LE(cursor) === 0x02014b50) {
+    const size = zip.readUInt32LE(cursor + 20), nameLength = zip.readUInt16LE(cursor + 28), extraLength = zip.readUInt16LE(cursor + 30), commentLength = zip.readUInt16LE(cursor + 32), local = zip.readUInt32LE(cursor + 42);
+    const name = zip.subarray(cursor + 46, cursor + 46 + nameLength).toString('utf8'), start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+    const compressed = zip.subarray(start, start + size);
+    entries.set(name, (zip.readUInt16LE(cursor + 10) === 8 ? inflateRawSync(compressed) : compressed).toString('utf8'));
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  assert.deepEqual(Object.fromEntries(entries), { '源码/README.md': '真实源码说明', '源码/index.js': 'export const answer = 42;' });
+  store.run('UPDATE work_artifacts SET size=? WHERE id=?', 31 * 1024 * 1024, artifacts[0].id);
+  assert.equal((await get('/api/work/chats/chat/artifacts/download')).status, 413);
+});
+
+test('artifact collection reports bounds instead of silently presenting an incomplete source tree', async t => {
+  const directory = temp(t), skipped = [];
+  writeFileSync(join(directory, 'a.txt'), 'small'); writeFileSync(join(directory, 'large.txt'), 'too large for this test');
+  const files = await collectArtifacts(directory, { bytes: 10, onSkip: reason => skipped.push(reason) });
+  assert.equal(files.length, 1); assert.deepEqual(skipped, ['size']);
+  const events = [];
+  await runWorker({ ...job(), gateway: `http://gateway:3210/proxy/${jobId}`, jobToken: token }, { cwd: directory, emit: event => events.push(event), nativeRunner: async (_job, runtime) => {
+    for (let index = 0; index < 31; index++) writeFileSync(join(runtime.cwd, 'output', `file-${index}.txt`), 'source');
+  } });
+  assert.equal(events.filter(event => event.type === 'file').length, 30);
+  assert.match(events.find(event => event.type === 'activity').label, /30 个文件.*ZIP/);
 });
 
 test('work broker never exposes master runner token or API key to worker stdin and cleans Docker objects', async t => {

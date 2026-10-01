@@ -1,7 +1,9 @@
 import { useMemo, useState, type FormEvent } from 'react';
 import { Box, Check, ChevronDown, ChevronRight, Eye, LoaderCircle, Pencil, Plus, RotateCcw, Search, Star, TestTubeDiagonal, Trash2, X } from 'lucide-react';
 import { errorText, patch, post, remove } from '../../api';
-import type { AdminModel, Provider } from '../../types';
+import type { AdminModel, ModelGroup, Provider } from '../../types';
+import ModelGroupsPanel from './ModelGroupsPanel';
+import FailureOverrideFields, { failureOverrideValues } from './FailureOverrideFields';
 import type { RunAction } from './ProvidersPanel';
 import { effortLabels } from '../ChatControls';
 import ModelTestResult, { type ModelTestReport, type ModelTestResponse } from './ModelTestResult';
@@ -12,7 +14,11 @@ function CapacityFields({ model }: { model?: AdminModel }) {
   return <div className="form-grid"><label>上下文容量（tokens）<input name="contextWindow" type="number" min={1024} max={10000000} step={1} defaultValue={model?.contextWindow ?? ''} placeholder="未声明，留空"/><span className="field-help">以服务商的实际模型容量为准；留空不会猜测模型限制。</span></label><label>最大输出（tokens）<input name="maxOutputTokens" type="number" min={128} max={1000000} step={1} defaultValue={model?.maxOutputTokens ?? ''} placeholder="未设置，使用站点默认值"/><span className="field-help">单次调用的输出上限，不能超过模型实际支持的限制。</span></label></div>;
 }
 const capacityValues = (form: FormData) => ({ contextWindow: form.get('contextWindow') ? Number(form.get('contextWindow')) : null, maxOutputTokens: form.get('maxOutputTokens') ? Number(form.get('maxOutputTokens')) : null });
-export default function ModelsPanel({ models, providers, defaultModelId, run, busy }: { models: AdminModel[]; providers: Provider[]; defaultModelId: string | null; run: RunAction; busy: string }) {
+export default function ModelsPanel({ groups, ...props }: { groups: ModelGroup[]; models: AdminModel[]; providers: Provider[]; defaultModelId: string | null; run: RunAction; busy: string }) {
+  const [view, setView] = useState<'catalog' | 'upstream'>('catalog');
+  return <><div className="model-management-tabs" role="tablist" aria-label="模型管理"><button role="tab" aria-selected={view === 'catalog'} className={view === 'catalog' ? 'active' : ''} onClick={() => setView('catalog')}>模型与版本</button><button role="tab" aria-selected={view === 'upstream'} className={view === 'upstream' ? 'active' : ''} onClick={() => setView('upstream')}>上游模型与测试</button></div>{view === 'catalog' ? <ModelGroupsPanel groups={groups} models={props.models} providers={props.providers} busy={props.busy} run={props.run}/> : <UpstreamModelsPanel {...props}/>}</>;
+}
+function UpstreamModelsPanel({ models, providers, defaultModelId, run, busy }: { models: AdminModel[]; providers: Provider[]; defaultModelId: string | null; run: RunAction; busy: string }) {
   const [editing, setEditing] = useState<AdminModel | null>(null);
   const [testReport, setTestReport] = useState<ModelTestReport | null>(null);
   const [query, setQuery] = useState('');
@@ -44,7 +50,7 @@ export default function ModelsPanel({ models, providers, defaultModelId, run, bu
     }, '模型响应正常，测试通过。');
   }
   return <div className="admin-section">
-    <div className="section-title"><div><h3>模型</h3><p>一个模型，多个渠道。展开模型管理各渠道的连接与能力。</p></div><button className="button small" onClick={() => setAdding(!adding)} disabled={!providers.length}><Plus size={15}/>添加渠道模型</button></div>
+    <div className="section-title"><div><h3>上游模型与测试</h3><p>测试渠道模型并调整能力；模型名称和版本请在“模型与版本”中配置。</p></div><button className="button small" onClick={() => setAdding(!adding)} disabled={!providers.length}><Plus size={15}/>添加渠道模型</button></div>
     {adding && <form className="settings-card stack" onSubmit={add}>
       <div className="card-heading"><strong>添加渠道模型</strong><button className="icon-button" type="button" aria-label="关闭" onClick={() => setAdding(false)}><X size={16}/></button></div>
       <p className="muted small-text">优先从 API 连接中同步模型；需要手动添加时，填写服务商提供的真实 ID。</p>
@@ -57,13 +63,13 @@ export default function ModelsPanel({ models, providers, defaultModelId, run, bu
     </form>}
     {editing && <form className="settings-card stack" key={editing.id} onSubmit={async event => {
       event.preventDefault(); const form = new FormData(event.currentTarget);
-      if (await run('model-edit', () => patch(`/admin/models/${editing.id}`, { name: form.get('name'), routeKey: form.get('routeKey'), reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form) }), '渠道模型设置已保存。')) setEditing(null);
+      if (await run('model-edit', () => patch(`/admin/models/${editing.id}`, { name: form.get('name'), routeKey: form.get('routeKey'), variantName: form.get('variantName'), ...failureOverrideValues(form), reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form) }), '渠道模型设置已保存。')) setEditing(null);
     }}>
       <div className="card-heading"><strong>编辑渠道模型</strong><button type="button" className="icon-button" aria-label="关闭编辑" onClick={() => setEditing(null)}><X size={16}/></button></div>
       <p className="muted small-text">{editing.providerName || providers.find(provider => provider.id === editing.providerId)?.name} · {editing.modelId}</p>
       <label>显示名称<input name="name" defaultValue={editing.name} required maxLength={120}/></label>
       <label>统一模型名<input name="routeKey" defaultValue={editing.routeKey || editing.modelId} required maxLength={120}/><span className="field-help">只合并能力相当、允许相互替代的模型。</span></label>
-      <EffortFields values={editing.reasoningEfforts}/><CapacityFields model={editing}/>
+      <label>版本名称<input name="variantName" defaultValue={editing.variantName || ''} maxLength={100} placeholder="默认版本"/></label><EffortFields values={editing.reasoningEfforts}/><CapacityFields model={editing}/><FailureOverrideFields model={editing}/>
       <div className="form-actions"><button className="button primary" disabled={!!busy}>保存</button></div>
     </form>}
     <div className="search-input bordered"><Search size={16}/><input aria-label="搜索模型或渠道" placeholder="搜索模型或渠道" value={query} onChange={event => setQuery(event.target.value)}/><span className="muted small-text">{groups.length} 个模型</span></div>
@@ -81,7 +87,7 @@ export default function ModelsPanel({ models, providers, defaultModelId, run, bu
           {open && <div className="model-group-channels">{group.channels.map(model => {
             const providerName = model.providerName || providers.find(provider => provider.id === model.providerId)?.name || '已删除的渠道';
             return <div className={`model-admin-row ${model.available === false ? 'unavailable' : ''}`} key={model.id}>
-              <div className="model-admin-main"><div><strong>{providerName}</strong><small>上游 ID：{model.modelId}</small><small>思考：{(model.reasoningEfforts?.length ? ['auto', ...model.reasoningEfforts.filter(value => value !== 'auto')] : ['auto']).map(value => effortLabels[value] || value).join('、')}</small></div><button className={`toggle ${model.enabled ? 'on' : ''}`} role="switch" aria-checked={model.enabled} aria-label={`启用 ${providerName} 的 ${model.modelId}`} disabled={!!busy || model.available === false} onClick={() => void run(`toggle-${model.id}`, () => patch(`/admin/models/${model.id}`, { enabled: !model.enabled }))}><span/></button></div>
+              <div className="model-admin-main"><div><strong>{providerName}</strong><small>上游 ID：{model.modelId}</small><small>版本：{model.variantName || '默认版本'}</small><small>思考：{(model.reasoningEfforts?.length ? ['auto', ...model.reasoningEfforts.filter(value => value !== 'auto')] : ['auto']).map(value => effortLabels[value] || value).join('、')}</small></div><button className={`toggle ${model.enabled ? 'on' : ''}`} role="switch" aria-checked={model.enabled} aria-label={`启用 ${providerName} 的 ${model.modelId}`} disabled={!!busy || model.available === false} onClick={() => void run(`toggle-${model.id}`, () => patch(`/admin/models/${model.id}`, { enabled: !model.enabled }))}><span/></button></div>
               <div className="model-admin-meta"><span className={`model-status ${model.status}`}>{model.available === false ? '上游已不可用' : model.status === 'ok' ? '连接正常' : model.status === 'error' ? '测试失败' : '尚未测试'}</span>
                 <label className="checkbox-label compact"><input type="checkbox" checked={model.vision} disabled={!!busy} onChange={event => void run(`vision-${model.id}`, () => patch(`/admin/models/${model.id}`, { vision: event.target.checked }))}/><Eye size={12}/>识图</label>
                 <div className="model-row-actions">

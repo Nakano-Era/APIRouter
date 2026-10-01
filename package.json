@@ -16,6 +16,7 @@
     "check": "npm run build && npm test"
   },
   "dependencies": {
+    "archiver": "^5.3.2",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.0",

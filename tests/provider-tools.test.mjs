@@ -97,6 +97,27 @@ test('AnyRouter OpenAI environment imports select Responses rather than Claude C
   assert.equal(result.providers[0].responsesProfile, 'auto');
 });
 
+test('provider backup round trip retains version mappings and independent failure policies', t => {
+  const { store, tools } = fixture(t);
+  tools.importProviders([{ ...sample(), failureProtectionEnabled: false, failureThreshold: 1000, cooldownSeconds: 2592000,
+    models: [{ ...sample().models[0], variantName: '高智商版', catalogAssigned: true, failureProtectionEnabled: true, failureThreshold: 5, cooldownSeconds: 600 }] }]);
+  const saved = tools.exportDocument().providers[0];
+  assert.equal(saved.failureProtectionEnabled, false);
+  assert.equal(saved.models[0].variantName, '高智商版');
+  tools.importProviders([{ ...saved, baseUrl: 'https://restored.example.com' }]);
+  const provider = store.get('SELECT * FROM providers WHERE base_url=?', 'https://restored.example.com');
+  const model = store.get('SELECT * FROM models WHERE provider_id=?', provider.id);
+  assert.equal(provider.failure_protection_enabled, 0);
+  assert.equal(provider.cooldown_seconds, 2592000);
+  assert.equal(model.variant_name, '高智商版');
+  assert.equal(model.catalog_assigned, 1);
+  assert.equal(model.failure_protection_enabled, 1);
+  assert.equal(model.failure_threshold_override, 5);
+  assert.equal(model.cooldown_seconds_override, 600);
+  assert.throws(() => normalizeProvider({ ...sample(), failureThreshold: 1001 }), /失败阈值/);
+  assert.throws(() => normalizeProvider({ ...sample(), models: [{ modelId: 'test', variantName: 'a'.repeat(101) }] }), /版本名称/);
+});
+
 test('New API balance uses same service prefix and bearer header, returns raw quota with no credentials', async t => {
   let seen = 0;
   const provider = await mock(t, (req, res) => { seen++; assert.equal(req.url, '/prefix/api/usage/token/'); assert.equal(req.headers.authorization, 'Bearer sk-balance-private-test-value'); assert.equal(req.headers['x-api-key'], undefined); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ code: true, data: { total_granted: 100, total_used: 25, total_available: 75, unlimited_quota: false, expires_at: 0, model_limits_enabled: true, model_limits: { 'model-one': true, 'model-two': false } } })); });

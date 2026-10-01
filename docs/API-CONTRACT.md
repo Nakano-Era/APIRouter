@@ -6,7 +6,7 @@ This document describes the HTTP API implemented by `server/app.mjs`, `server/pr
 
 - Sessions use the HttpOnly, SameSite=Strict `apirouter_session` cookie. Browser requests use same-origin credentials.
 - Authenticated mutations require `X-CSRF-Token`, obtained from the session response. Setup, login, invitation acceptance, and the separately verified Stripe webhook are exceptions. Cross-origin mutations are rejected.
-- User-owned chats, uploaded files, and Work artifacts are isolated by owner, including when the caller is an administrator. Administrator permissions do not grant access to another user's files.
+- Ordinary chat, uploaded-file and Work-artifact endpoints are isolated by owner, including for administrators. The separate administrator export can export all users’ chat text and file metadata, but not attachment/artifact binary bodies.
 - `/api/admin/*` requires the `admin` role. Skill mutations also require that role although their paths begin with `/api/work/skills`.
 - Errors normally return an appropriate 4xx/5xx status and `{error: string, code?: string}`. A completed administrator model probe returns HTTP 200 with `ok:false` when the upstream probe failed. A balance query can return HTTP 200 with `available:false`.
 - API responses have `Cache-Control: no-store`; streaming responses use `no-cache, no-transform`. Clients must not persist API keys or password fields in local storage.
@@ -40,14 +40,14 @@ The setup token is shown in the server startup output and is never exposed by a 
 
 ```text
 PublicModel = {
-  id, name, modelId, routeKey,
+  id, name, modelId, routeKey, variantName,
   vision:boolean, enabled:true, status:'untested'|'ok'|'error',
   modes:('chat'|'work')[], reasoningEfforts:string[],
-  contextWindow:number|null, maxOutputTokens:number|null
+  contextWindow:number|null
 }
 ```
 
-An administrator-defined `routeKey` groups equivalent upstream models. The public ID is a stable `r_<hash>` route ID; `name`, `modelId`, and `routeKey` use the unified route name. This endpoint does not expose provider IDs, provider names, base URLs, channel counts, credentials, or the actual upstream model selected for a response. `Message` likewise omits `sourceProvider` and `sourceModel`.
+An administrator-defined `routeKey` is the parent model name; `variantName` identifies its version (empty string means default). Stable IDs use `r_<hash>` for default versions and `v_<hash>` for named versions. Each record is one version; clients group these under the parent, then offer version and effort selection. Only channels matching both parent and version can fail over to one another. This endpoint does not expose provider IDs, provider names, base URLs, channel counts, credentials, or the actual upstream model selected for a response. `Message` likewise omits `sourceProvider` and `sourceModel`.
 
 `reasoningEfforts` always includes `auto`, followed by configured levels supported by at least one enabled channel. Other accepted levels are `low`, `medium`, `high`, `xhigh`, and `max`. Advertised levels are administrator configuration, not a guarantee that an upstream accepts them. A request filters candidate channels by its chosen effort and mode. Unsupported combinations fail before generation.
 
@@ -118,7 +118,7 @@ A streaming request may first fail with ordinary JSON before SSE headers are sen
 
 SSE comment heartbeats are sent while waiting. Browser disconnects abort generation; explicit stop is also supported. Activity labels do not contain tool arguments, credential values, or private chain-of-thought. Ordinary users receive generic generation errors; administrators inspect detailed failures through the administrator endpoints below.
 
-`content` and `reasoning` are journaled separately before emission and recovered independently after interruption or restart. Existing messages receive an empty `reasoning` field; old unmarked text is not reclassified. Clients default the process panel to collapsed. Copying/exporting an answer uses `content` only. Ordinary conversation history excludes the display-only reasoning field; native Work checkpoints retain protocol-required signed blocks separately.
+`content` and `reasoning` are journaled separately before emission and recovered independently after interruption or restart. Existing messages receive an empty `reasoning` field; old unmarked text is not reclassified. Clients default the process panel to collapsed. Copying and ordinary single-chat export use `content` only; administrator full-chat exports include reasoning separately. Ordinary conversation history excludes the display-only reasoning field; native Work checkpoints retain protocol-required signed blocks separately.
 
 Recognized process output includes Chat `reasoning_content`/`reasoning`, Anthropic thinking, Responses reasoning summaries and explicit `phase:commentary`, and Claude Code thinking events. Opaque signatures, redacted thinking and encrypted content are not displayed. A leading `<think>` or `<thinking>` block is also recognized across text chunk boundaries; quoted code examples and unmarked prose are left intact. Codex-compatible Responses may wait for an item's phase before displaying that item; ordinary Responses without phases continue to stream. Unclassified text is preserved as answer text if a stream ends before declaring a phase. The combined persisted answer and process have a 32 MB safety limit.
 
@@ -131,7 +131,7 @@ Chat with a direct API channel calls its selected protocol. Chat with a `claude-
 ```text
 {id,name,baseUrl,protocol:'openai-chat'|'openai-responses'|'anthropic',
  runtime:'api'|'claude-code',responsesProfile:'auto'|'standard'|'codex',enabled,hasKey,keyHint,lastSyncedAt,lastSyncError,
- createdAt,priority,failureThreshold,cooldownSeconds,authMode}
+ createdAt,priority,failureProtectionEnabled,failureThreshold,cooldownSeconds,authMode}
 ```
 
 Ordinary provider CRUD responses never contain the full saved API key. Parse previews echo only the submitted configuration to an administrator; authenticated export is the explicit exception for saved keys.
@@ -162,7 +162,7 @@ Sync queries the upstream's actual model list, preserves existing administrator 
 
 ### Routing and original failure diagnostics
 
-Provider defaults and ranges: priority 0 (0–1000), failure threshold 3 (1–10), cooldown 60 seconds (5–86400). Workspace routing defaults are six total attempts (1–10) and one extra attempt on the same channel (0–3). Only channels within the same unified route are candidates. Invalid payloads are not retried across paid providers. Failover stops after visible response text or a committed Work tool action/artifact, preventing duplicate execution.
+Provider defaults and ranges: priority 0 (0–1000), failure protection enabled, failure threshold 3 (1–1000), cooldown 60 seconds (1–2592000). Provider create/PATCH accepts `failureProtectionEnabled:boolean`. Each model create/PATCH accepts `variantName` (up to 100 characters) and nullable `failureProtectionEnabled`, `failureThreshold`, `cooldownSeconds` overrides (null inherits the provider); administrator model JSON returns those fields. Disabling protection stops temporary disabling but retains retries, switching and logs. Policy changes reset health counters. Workspace routing defaults are six total attempts (1–10) and one extra attempt on the same channel (0–3). Only channels within the same parent model and version are candidates. Invalid payloads are not retried across paid providers. Failover stops after visible response text or a committed Work tool action/artifact, preventing duplicate execution.
 
 `GET /api/admin/routing-logs` returns the newest 200 attempts:
 
@@ -260,12 +260,14 @@ Only the configured provider origin and service prefix are used. URLs are DNS-ch
 | GET `/api/work/skills/:id/download` | Signed in | Markdown attachment named `<name>-SKILL.md` |
 | GET `/api/work/chats/:id/artifacts` | Chat owner | `{artifacts:WorkArtifact[]}` |
 | GET `/api/work/artifacts/:id/download` | Artifact owner | File attachment |
+| GET `/api/work/chats/:chatId/artifacts/:id/download` | Chat and artifact owner | File attachment scoped to this chat |
+| GET `/api/work/chats/:id/artifacts/download?path=...` | Chat owner; optional saved directory prefix | ZIP of saved files, preserving paths; 30 MB total |
 | GET `/api/admin/work/settings` | Admin | Work status, settings, and bounds |
 | PATCH `/api/admin/work/settings` | Admin; partial `WorkSettings` | Updated status, settings, and bounds |
 
 A skill can be submitted as Markdown or downloaded from a final public HTTPS raw-file URL. Metadata may be read from front matter and explicitly overridden. Skill names use 1–64 lowercase letters, digits, and hyphens; descriptions have a 500-character limit; content is limited to 64 KB; at most 32 skills are installed. URL imports reject private addresses, redirects, and HTML pages. Imports rebuild front matter and reject dynamic `!` plus backtick command syntax; they do not install hooks, MCP servers, executable packages, or referenced auxiliary files.
 
-`WorkArtifact` is `{id,name,size,mime,createdAt,downloadUrl}`. The runner must actually create a file under its output directory before the server stores and exposes an artifact. Downloads use attachment disposition and restrictive response headers; HTML/SVG content is not executed by the artifact endpoint. A task can return up to 30 files, 10 MB each and 30 MB total. Saved Work artifact storage is separately limited to 500 files and 200 MB per user. Replacing an output path in the same chat replaces its saved artifact. Deleting that chat deletes its saved artifacts.
+`WorkArtifact` is `{id,chatId,path,name,size,mime,createdAt,downloadUrl}`. The runner must actually create a file under its output directory before the server stores and exposes an artifact. Downloads use attachment disposition and restrictive response headers; HTML/SVG content is not executed by the artifact endpoint. A task can return up to 30 files, 10 MB each and 30 MB total. Saved Work artifact storage is separately limited to 500 files and 200 MB per user. Replacing an output path in the same chat replaces its saved artifact. Deleting that chat deletes its saved artifacts.
 
 Work settings responses are `{configured,...capabilities,settings:WorkSettings,limits:Bounds}`. Here `limits` contains bounds, overriding the current-value `limits` field used by the capabilities endpoint. Runner URL and authentication token are deployment configuration, not browser-editable fields.
 
@@ -310,3 +312,22 @@ Invitation validity is 1–30 days, default seven. Administrators cannot be disa
 - POST `/api/billing/webhook` accepts raw JSON with Stripe-Signature verification before session/CSRF middleware. Supported events include checkout completion/async payment success, subscription created/updated/deleted, and invoice paid/payment failed. Browser redirects never grant access.
 
 See [MEMBERSHIP.md](MEMBERSHIP.md) for deployment and subscription lifecycle details.
+
+## Model catalog and versions
+
+- GET `/api/admin/model-groups` returns `{groups:[{name,variants:[{name,modelIds:string[]}]}]}`, including empty drafts.
+- PUT `/api/admin/model-groups` accepts one `{name,variants}` and atomically replaces that parent's mapping. Names are up to 300 characters, at most 100 unique versions per parent and 500 channel records per version. Each upstream record belongs to one version. Selected records become enabled and move to the target parent/version; removed records are disabled and retained with their mapping reset. Empty drafts are excluded from public choices. Involved providers must be idle.
+- Channel-level model endpoints remain available. Provider backups retain assigned version mappings and failure overrides; empty catalog drafts and user quotas require a full data backup.
+
+## Per-user, per-version quota
+
+GET and PUT `/api/admin/users/:id/model-limits` require admin access; PUT requires CSRF and atomically replaces `{limits:[{routeKey,variantName,dailyLimit,monthlyLimit}]}` (maximum 500 rules). Variant names are strings, with `''` as the default; legacy incoming null is an alias for `''`, never a shared family rule. Limits are integers 0–1000000000 or null: zero blocks use, null leaves that dimension unlimited.
+
+Both return `{limits:[{routeKey,variantName,dailyLimit,monthlyLimit,usedToday,usedMonth,updatedAt}],timeZone:'Asia/Taipei',resetsAt:{daily,monthly}}`. Versions count independently. Multiple channels inside one version share its counter. Existing account/plan total limits still apply separately. Model/version usage is snapshotted on accepted requests so later channel remapping does not rewrite historical use. Failed/stopped requests count, continuation/regeneration reserve one new request, and internal routing retries do not reserve again. The quota check and reservation are in the same SQLite transaction before history mutation. Errors use `USER_MODEL_DISABLED` (403), `USER_MODEL_DAILY_LIMIT` or `USER_MODEL_MONTHLY_LIMIT` (429).
+
+Day/month boundaries use UTC+8 natural calendar periods; account/plan aggregate daily limits retain UTC boundaries. Existing legacy family rules migrate into independent rules for each existing version, with explicitly configured version rules taking precedence.
+
+## Administrator chat archive
+
+GET `/api/admin/chats/export?format=json|markdown` requires an administrator and returns an attachment ZIP with no-store caching. Default format is JSON. It contains a manifest, user records and every user's chats including archived chats, with messages, separate reasoning, active journal chunks and file metadata. It omits attachment/artifact binary data, service credentials, password hashes and payment configuration; user-written message content is retained. Files are organized by user/chat ID. A dedicated read-only database snapshot keeps an export consistent while writes continue; at most two exports run concurrently (429 when busy). This is a reading/archive export, not a complete application restore backup.
+

@@ -3,7 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { streamReply, UpstreamError, sanitizeUpstreamError } from './upstream.mjs';
 
 const selection = `SELECT m.*,p.name AS provider_name,p.base_url,p.protocol,p.encrypted_key,
-  p.priority,p.failure_threshold,p.cooldown_seconds,p.auth_mode,p.runtime,p.responses_profile,p.enabled AS provider_enabled
+  p.priority,p.failure_threshold,p.cooldown_seconds,p.failure_protection_enabled AS provider_failure_protection_enabled,p.auth_mode,p.runtime,p.responses_profile,p.enabled AS provider_enabled
   FROM models m JOIN providers p ON p.id=m.provider_id`;
 const nonChannelErrors = new Set([
   'INVALID_BASE_URL', 'BLOCKED_UPSTREAM_ADDRESS', 'INVALID_PROTOCOL', 'INVALID_AUTH_MODE',
@@ -33,10 +33,11 @@ function disposition(error, signal) {
 export function createRouter({ store, stream = streamReply, clock = Date.now }) {
   const probes = new Set();
   const timestamp = () => new Date(clock()).toISOString();
-  function readCandidate(modelId, routeKey, needsVision) {
-    return store.get(`${selection} WHERE m.id=? AND m.route_key=? AND m.enabled=1 AND m.available=1 AND p.enabled=1${needsVision ? ' AND m.vision=1' : ''}`, modelId, routeKey);
+  function readCandidate(modelId, routeKey, variantName, needsVision) {
+    return store.get(`${selection} WHERE m.id=? AND m.route_key=? AND COALESCE(m.variant_name,'')=? AND m.enabled=1 AND m.available=1 AND p.enabled=1${needsVision ? ' AND m.vision=1' : ''}`, modelId, routeKey, variantName);
   }
   function cooldown(candidate) {
+    if ((candidate.failure_protection_enabled ?? candidate.provider_failure_protection_enabled) === 0) return 'closed';
     if (!candidate.cooldown_until) return 'closed';
     const until = Date.parse(candidate.cooldown_until);
     // Corrupt persisted state is held closed to traffic until an admin resets it.
@@ -44,10 +45,14 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     return 'half-open';
   }
   function recordFailure(candidate, error) {
+    if ((candidate.failure_protection_enabled ?? candidate.provider_failure_protection_enabled) === 0) {
+      store.run("UPDATE models SET failure_count=failure_count+1,cooldown_until=NULL,status='error',error=?,last_checked_at=? WHERE id=? AND failure_epoch=?", sanitizeUpstreamError(error), timestamp(), candidate.id, candidate.failure_epoch);
+      return;
+    }
     // A recovery probe must reopen the circuit even if the admin raised its
     // threshold during the preceding cooldown.
-    const threshold = candidate.cooldown_until ? 1 : boundedInteger(candidate.failure_threshold, 1, 100, 3);
-    const seconds = boundedInteger(candidate.cooldown_seconds, 1, 86_400, 60);
+    const threshold = candidate.cooldown_until ? 1 : boundedInteger(candidate.failure_threshold_override ?? candidate.failure_threshold, 1, 1000, 3);
+    const seconds = boundedInteger(candidate.cooldown_seconds_override ?? candidate.cooldown_seconds, 1, 2_592_000, 60);
     store.run(`UPDATE models SET failure_count=failure_count+1,status='error',error=?,last_checked_at=?,
       cooldown_until=CASE WHEN failure_count+1>=? THEN ? ELSE cooldown_until END,
       failure_epoch=failure_epoch+CASE WHEN failure_count+1>=? THEN 1 ELSE 0 END
@@ -73,13 +78,13 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     }
   }
 
-  async function* run({ routeKey, candidateIds, messages, maxOutputTokens, systemPrompt, signal, maxAttempts = 6, retriesPerChannel = 1, onAttempt, requestId, mode = 'chat', effort = 'auto', skillIds = [], webSearch = false, context }) {
+  async function* run({ routeKey, variantName = '', candidateIds, messages, maxOutputTokens, systemPrompt, signal, maxAttempts = 6, retriesPerChannel = 1, onAttempt, requestId, mode = 'chat', effort = 'auto', skillIds = [], webSearch = false, context }) {
     signal?.throwIfAborted();
     if (typeof routeKey !== 'string' || !routeKey.trim()) throw new UpstreamError('请选择有效的模型路由。', 'INVALID_ROUTE', 400);
     if (!Array.isArray(messages) || !messages.length) throw new UpstreamError('消息不能为空。', 'INVALID_MESSAGES', 400);
     const needsVision = messages.some(message => message.attachments?.some(attachment => attachment.kind === 'image'));
     const candidates = store.all(`${selection} WHERE m.route_key=? AND m.enabled=1 AND m.available=1 AND p.enabled=1${needsVision ? ' AND m.vision=1' : ''} ORDER BY p.priority DESC,m.id ASC`, routeKey)
-      .filter(candidate => (!candidateIds || candidateIds.includes(candidate.id)) && (effort === 'auto' || JSON.parse(candidate.reasoning_efforts || '[]').includes(effort)));
+      .filter(candidate => (candidate.variant_name || '') === variantName && (!candidateIds || candidateIds.includes(candidate.id)) && (effort === 'auto' || JSON.parse(candidate.reasoning_efforts || '[]').includes(effort)));
     if (!candidates.length) throw new UpstreamError(needsVision ? '该模型路由没有支持图片的可用通道。' : '该模型路由没有可用通道，请联系管理员。', needsVision ? 'VISION_UNSUPPORTED' : 'ROUTE_UNAVAILABLE', 400);
     const attemptLimit = boundedInteger(maxAttempts, 1, 10, 6);
     const retryLimit = boundedInteger(retriesPerChannel, 0, 3, 1);
@@ -89,7 +94,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     for (const initial of candidates) {
       signal?.throwIfAborted();
       if (attempts >= attemptLimit) break;
-      let current = readCandidate(initial.id, routeKey, needsVision);
+      let current = readCandidate(initial.id, routeKey, variantName, needsVision);
       if (!current || cooldown(current) === 'open' || probes.has(current.id)) continue;
       const halfOpen = cooldown(current) === 'half-open';
       if (halfOpen) probes.add(current.id);
@@ -97,7 +102,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
         for (let retry = 0; retry <= (halfOpen ? 0 : retryLimit); retry++) {
           signal?.throwIfAborted();
           if (attempts >= attemptLimit) break;
-          current = readCandidate(initial.id, routeKey, needsVision);
+          current = readCandidate(initial.id, routeKey, variantName, needsVision);
           if (!current || cooldown(current) === 'open' || (!halfOpen && probes.has(current.id))) break;
           // Decryption and local configuration errors are not channel outages.
           const provider = {
@@ -152,7 +157,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
             if (emittedText || committed || !policy.switch) throw error;
             lastError = error;
             if (!policy.retry || retry >= retryLimit || halfOpen || attempts >= attemptLimit) break;
-            const updated = readCandidate(initial.id, routeKey, needsVision);
+            const updated = readCandidate(initial.id, routeKey, variantName, needsVision);
             if (!updated || cooldown(updated) !== 'closed') break;
             await sleep(250 * (2 ** retry), undefined, { signal });
           } finally {

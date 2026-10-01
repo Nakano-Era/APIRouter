@@ -55,6 +55,10 @@ export function createStore(dataDir) {
   addColumns('providers', { priority: 'INTEGER NOT NULL DEFAULT 0', failure_threshold: 'INTEGER NOT NULL DEFAULT 3', cooldown_seconds: 'INTEGER NOT NULL DEFAULT 60', auth_mode: "TEXT NOT NULL DEFAULT 'auto'", runtime: "TEXT NOT NULL DEFAULT 'api'" });
   addColumns('models', { route_key: "TEXT NOT NULL DEFAULT ''", failure_count: 'INTEGER NOT NULL DEFAULT 0', cooldown_until: 'TEXT', failure_epoch: 'INTEGER NOT NULL DEFAULT 0', reasoning_efforts: "TEXT NOT NULL DEFAULT '[]'", context_window: 'INTEGER', max_output_tokens: 'INTEGER' });
   addColumns('providers', { responses_profile: "TEXT NOT NULL DEFAULT 'auto'" });
+  addColumns('providers', { failure_protection_enabled: 'INTEGER NOT NULL DEFAULT 1' });
+  addColumns('models', { variant_name: "TEXT NOT NULL DEFAULT ''", catalog_assigned: 'INTEGER NOT NULL DEFAULT 0', failure_protection_enabled: 'INTEGER', failure_threshold_override: 'INTEGER', cooldown_seconds_override: 'INTEGER' });
+  addColumns('requests', { route_key: 'TEXT', variant_name: "TEXT NOT NULL DEFAULT ''" });
+  db.exec('CREATE INDEX IF NOT EXISTS idx_requests_model_quota ON requests(user_id,route_key,variant_name,created_at); CREATE INDEX IF NOT EXISTS idx_models_variant ON models(route_key,variant_name);');
   addColumns('chats', { mode: "TEXT NOT NULL DEFAULT 'chat'", effort: "TEXT NOT NULL DEFAULT 'auto'", skill_ids: "TEXT NOT NULL DEFAULT '[]'", web_search: 'INTEGER NOT NULL DEFAULT 0' });
   addColumns('messages', { source_provider: 'TEXT', source_model: 'TEXT', reasoning: "TEXT NOT NULL DEFAULT ''" });
   db.exec('CREATE TABLE IF NOT EXISTS message_chunks (seq INTEGER PRIMARY KEY AUTOINCREMENT,message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,content TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_message_chunks ON message_chunks(message_id,seq);');

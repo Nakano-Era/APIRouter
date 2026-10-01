@@ -1,0 +1,10 @@
+.artifact-download-control { display: inline; min-width: 0; }
+.artifact-download-error { display: block; margin-top: 5px; color: var(--danger, #f09b93); font-size: 12px; overflow-wrap: anywhere; }
+.artifact-download-progress, .artifact-unavailable small { font-size: 12px; opacity: .7; }
+.artifact-unavailable { color: inherit; overflow-wrap: anywhere; }
+.artifact-unavailable small { margin-left: 5px; }
+.work-artifacts > .artifact-download-control { display: block; }
+.work-artifact-heading-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; grid-column: 1 / -1; }
+.work-artifact-heading-row .artifact-download-control { font-size: 12px; }
+.work-artifact-heading-row a { display: inline-flex; align-items: center; gap: 5px; color: inherit; }
+.work-artifact-heading-row .work-artifact-heading { margin: 0; }
