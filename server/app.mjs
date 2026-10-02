@@ -17,6 +17,7 @@ import { responseProfiles } from './responses-compat.mjs';
 import { createModelCatalog, modelRouteId, variantName } from './model-catalog.mjs';
 import { createUserModelAccess } from './user-model-access.mjs';
 import { createChatExport } from './chat-export.mjs';
+import { createUserModelRouting } from './user-model-routing.mjs';
 
 const protocols = new Set(['openai-chat', 'openai-responses', 'anthropic']);
 const effortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -53,6 +54,9 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   const billing = createBilling({ store, publicOrigin, stripeFactory });
   const catalog = createModelCatalog({ store, ensureProviderIdle });
   const modelAccess = createUserModelAccess({ store });
+  const userRouting = createUserModelRouting({ store, ensureUserIdle: userId => {
+    if ([...active.values()].some(job => job.userId === userId)) throw fail(409, '此用户还有进行中的任务，请等待完成或停止后修改路由。');
+  } });
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 5, fields: 0, parts: 5 } });
   app.disable('x-powered-by');
   if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
@@ -92,6 +96,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   createProviderTools({ store, providerJSON, ensureProviderIdle }).registerRoutes(app, { auth, admin, csrf });
   catalog.registerRoutes(app, { auth, admin, csrf });
   modelAccess.registerRoutes(app, { auth, admin, csrf });
+  userRouting.registerRoutes(app, { auth, admin, csrf });
   createChatExport({ store }).registerRoutes(app, { auth, admin, csrf });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false, message: { error: '登录尝试过多，请 15 分钟后重试。' } });
   function userJSON(row) { return { id: row.id, name: row.name, email: row.email, role: row.role, disabled: !!row.disabled, dailyLimit: row.daily_limit, createdAt: row.created_at }; }
@@ -253,8 +258,16 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     const modelRow = usableModel(requiredText(req.body.modelId || chat.model_id || store.settings().defaultModelId, '模型', 100), req.user);
     const model = modelJSON(modelRow);
     const execution = executionOptions(req.body, chat);
-    const compatible = modelRow.channels.filter(row => execution.effort === 'auto' || JSON.parse(row.reasoning_efforts || '[]').includes(execution.effort));
-    if (!compatible.length) throw fail(400, '当前模型不支持所选模式或思考强度，请选择自动强度或其他模型。');
+    if (!modelRow.channels.some(row => execution.effort === 'auto' || JSON.parse(row.reasoning_efforts || '[]').includes(execution.effort))) throw fail(400, '当前模型不支持所选模式或思考强度，请选择自动强度或其他模型。');
+    const mapping = userRouting.resolve(req.user.id, modelRow.route_key, modelRow.variant_name);
+    let executionModel = modelRow;
+    if (mapping) {
+      try { executionModel = usableModel(routeId(mapping.targetRouteKey, mapping.targetVariantName)); }
+      catch { throw fail(503, '当前模型暂时不可用，请稍后重试或联系管理员。', 'MODEL_UNAVAILABLE'); }
+    }
+    const actualExecution = { ...execution, effort: mapping ? mapping.effort : execution.effort };
+    const compatible = executionModel.channels.filter(row => actualExecution.effort === 'auto' || JSON.parse(row.reasoning_efforts || '[]').includes(actualExecution.effort));
+    if (!compatible.length) throw fail(503, '当前模型暂时不可用，请稍后重试或联系管理员。', 'MODEL_UNAVAILABLE');
     if ((execution.mode === 'work' || compatible.every(row => row.runtime === 'claude-code')) && !work.isConfigured()) throw fail(503, '工作沙箱尚未配置，请先完成 Work 部署或选择直接 API 的 Chat 模式。');
     const settings = store.settings();
     const dailyLimit = billing.effectiveEntitlement(req.user.id).dailyLimit;
@@ -282,7 +295,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       if (userIndex === -1) throw fail(400, '请先发送一条消息。');
       selected = selected.slice(0, userIndex + 1);
     }
-    const input = modelMessages(selected, req.user.id, model);
+    const input = modelMessages(selected, req.user.id, { ...model, vision: !!model.vision && !!executionModel.vision });
     if (continuing) input.push({ role: 'user', content: continuationInstruction, attachments: [] });
     const resumeCandidates = continuing && work.continuationCandidates ? work.continuationCandidates({ userId: req.user.id, chatId: chat.id, assistantId: tail.id }, compatible) : compatible;
     if (!resumeCandidates.length) throw fail(409, '原工作记录对应的模型或协议当前不可用，请恢复原模型渠道后继续；已保存的内容和文件会保留。', 'WORK_CHECKPOINT_INCOMPATIBLE');
@@ -299,14 +312,14 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       if (userMessage) store.run('INSERT INTO messages(id,chat_id,role,content,model_id,status,attachment_ids,created_at) VALUES (?,?,?,?,?,?,?,?)', userMessage.id, chat.id, 'user', userMessage.content, model.id, 'complete', userMessage.attachment_ids, userMessage.created_at);
       if (continuing) store.run("UPDATE messages SET status='streaming',error=NULL,model_id=? WHERE id=?", model.id, assistantId);
       else store.run('INSERT INTO messages(id,chat_id,role,content,model_id,status,created_at) VALUES (?,?,?,?,?,?,?)', assistantId, chat.id, 'assistant', '', model.id, 'streaming', timestamp);
-      store.run('INSERT INTO requests(id,user_id,model_id,route_key,variant_name,status,created_at) VALUES (?,?,?,?,?,?,?)', requestId, req.user.id, model.id, modelRow.route_key, modelRow.variant_name, 'running', timestamp);
+      store.run('INSERT INTO requests(id,user_id,model_id,route_key,variant_name,status,created_at,execution_route_key,execution_variant_name,requested_effort,execution_effort,user_routing_applied) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', requestId, req.user.id, model.id, modelRow.route_key, modelRow.variant_name, 'running', timestamp, executionModel.route_key, executionModel.variant_name, execution.effort, actualExecution.effort, mapping ? 1 : 0);
       const first = selected.find(m => m.role === 'user');
       const title = chat.title === '新对话' ? (first?.content.slice(0, 40) || '文件分析') : chat.title;
       store.run('UPDATE chats SET title=?,model_id=?,updated_at=?,archived=0 WHERE id=?', title, model.id, timestamp, chat.id);
       saveExecution(chat.id, execution);
     });
     const controller = new AbortController();
-    active.set(chat.id, { controller, userId: req.user.id, providerIds: modelRow.channels.map(row => row.provider_id) });
+    active.set(chat.id, { controller, userId: req.user.id, providerIds: [...new Set([...modelRow.channels, ...executionModel.channels].map(row => row.provider_id))] });
     if (action === 'edit') removeOrphanedAttachments(existing.flatMap(row => JSON.parse(row.attachment_ids)), req.user.id);
     const abort = () => controller.abort();
     res.on('close', abort);
@@ -339,7 +352,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     function separate(events) { for (const event of events) append(event.type === 'reasoning' ? event.text : appender.push(event.text), event.type === 'reasoning' ? 'reasoning' : 'content'); }
     function finishMessage(status, error = null) { store.transaction(() => { store.run('UPDATE messages SET content=?,reasoning=?,status=?,error=? WHERE id=?', content, reasoning, status, error, assistantId); store.run('DELETE FROM message_chunks WHERE message_id=?', assistantId); }); }
     try {
-      for await (const event of router.run({ routeKey: modelRow.route_key, variantName: modelRow.variant_name, candidateIds, messages: input, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal: controller.signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...execution, context: { userId: req.user.id, chatId: chat.id, assistantId, continuation: continuing, resumeText: priorContent } })) {
+      for await (const event of router.run({ routeKey: executionModel.route_key, variantName: executionModel.variant_name, candidateIds, messages: input, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal: controller.signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...actualExecution, context: { userId: req.user.id, chatId: chat.id, assistantId, continuation: continuing, resumeText: priorContent } })) {
         if (event.type === 'routing') send('routing', { message: '正在重新连接，请稍候…' });
         if (event.type === 'activity') send('activity', { label: event.label });
         if (event.type === 'artifact') send('artifact', { artifact: event.artifact });
@@ -455,7 +468,8 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   });
   app.delete('/api/admin/models/:id', (req, res) => { const model = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (model) ensureProviderIdle(model.provider_id); store.run('DELETE FROM models WHERE id=?', req.params.id); if (store.settings().defaultModelId === req.params.id) store.setSetting('defaultModelId', null); res.json({ ok: true }); });
   app.post('/api/admin/models/:id/reset-health', (req, res) => { const model = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (!model) throw fail(404, '模型不存在。'); ensureProviderIdle(model.provider_id); store.run("UPDATE models SET failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1,status='untested',error=NULL WHERE id=?", model.id); res.json({ model: modelJSON(store.get('SELECT * FROM models WHERE id=?', model.id)) }); });
-  app.get('/api/admin/routing-logs', (_req, res) => res.json({ attempts: store.all('SELECT a.*,p.name AS provider_name,m.model_id AS upstream_model_id FROM route_attempts a LEFT JOIN providers p ON p.id=a.provider_id LEFT JOIN models m ON m.id=a.model_id ORDER BY a.rowid DESC LIMIT 200').map(row => ({ id: row.id, requestId: row.request_id, providerName: row.provider_name || '已删除渠道', modelId: row.upstream_model_id || row.model_id, outcome: row.outcome, error: row.error, createdAt: row.created_at, hasDetail: !!row.encrypted_detail })) }));
+  app.get('/api/admin/routing-logs', (_req, res) => res.json({ attempts: store.all('SELECT a.*,p.name AS provider_name,m.model_id AS upstream_model_id,r.user_id,r.route_key AS source_route_key,r.variant_name AS source_variant_name,r.execution_route_key,r.execution_variant_name,r.requested_effort,r.execution_effort,r.user_routing_applied FROM route_attempts a LEFT JOIN providers p ON p.id=a.provider_id LEFT JOIN models m ON m.id=a.model_id LEFT JOIN requests r ON r.id=a.request_id ORDER BY a.rowid DESC LIMIT 200').map(row => ({ id: row.id, requestId: row.request_id, providerName: row.provider_name || '已删除渠道', modelId: row.upstream_model_id || row.model_id, outcome: row.outcome, error: row.error, createdAt: row.created_at, hasDetail: !!row.encrypted_detail,
+    userId: row.user_id ?? null, sourceRouteKey: row.source_route_key ?? null, sourceVariantName: row.source_variant_name ?? null, executionRouteKey: row.execution_route_key ?? null, executionVariantName: row.execution_variant_name ?? null, requestedEffort: row.requested_effort ?? null, executionEffort: row.execution_effort ?? null, userRoutingApplied: !!row.user_routing_applied })) }));
   app.get('/api/admin/routing-logs/:id/detail', (req, res) => { const row = store.get('SELECT encrypted_detail FROM route_attempts WHERE id=?', req.params.id); if (!row?.encrypted_detail) throw fail(404, '原始报错不存在或已清理。'); res.set('Cache-Control','no-store').json({ detail: JSON.parse(store.decrypt(row.encrypted_detail)) }); });
   app.post('/api/admin/models/:id/test', async (req, res) => {
     const row = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (!row) throw fail(404, '模型不存在。'); if (testing.has(row.id) || testing.size >= 2) throw fail(429, '模型测试正在进行，请稍后重试。'); testing.set(row.id, row.provider_id);

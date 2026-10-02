@@ -58,6 +58,7 @@ export function createStore(dataDir) {
   addColumns('providers', { failure_protection_enabled: 'INTEGER NOT NULL DEFAULT 1' });
   addColumns('models', { variant_name: "TEXT NOT NULL DEFAULT ''", catalog_assigned: 'INTEGER NOT NULL DEFAULT 0', failure_protection_enabled: 'INTEGER', failure_threshold_override: 'INTEGER', cooldown_seconds_override: 'INTEGER' });
   addColumns('requests', { route_key: 'TEXT', variant_name: "TEXT NOT NULL DEFAULT ''" });
+  addColumns('requests', { execution_route_key: 'TEXT', execution_variant_name: 'TEXT', requested_effort: 'TEXT', execution_effort: 'TEXT', user_routing_applied: 'INTEGER NOT NULL DEFAULT 0' });
   db.exec('CREATE INDEX IF NOT EXISTS idx_requests_model_quota ON requests(user_id,route_key,variant_name,created_at); CREATE INDEX IF NOT EXISTS idx_models_variant ON models(route_key,variant_name);');
   addColumns('chats', { mode: "TEXT NOT NULL DEFAULT 'chat'", effort: "TEXT NOT NULL DEFAULT 'auto'", skill_ids: "TEXT NOT NULL DEFAULT '[]'", web_search: 'INTEGER NOT NULL DEFAULT 0' });
   addColumns('messages', { source_provider: 'TEXT', source_model: 'TEXT', reasoning: "TEXT NOT NULL DEFAULT ''" });

@@ -1,0 +1,24 @@
+/* KaTeX and its fonts are bundled locally by Vite; no external asset requests. */
+.markdown, .message-content, .reasoning-content { min-width: 0; }
+.markdown .katex { font-size: 1.08em; overflow-wrap: normal; text-indent: 0; }
+.markdown :not(.katex-display) > .katex {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  vertical-align: middle;
+  padding: .15em 0;
+  overscroll-behavior-x: contain;
+}
+.markdown .katex-display {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: .35em 0 .6em;
+  margin: 1em 0;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.markdown .katex-display > .katex { display: block; width: max-content; min-width: 100%; }
+.markdown .katex-error { font-family: Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }

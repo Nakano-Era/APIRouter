@@ -3,6 +3,7 @@ import { CheckCircle2, FileText, LoaderCircle, RefreshCw, Route, XCircle } from 
 import { api, errorText } from '../../api';
 import type { RawDiagnostic, RoutingAttempt } from '../../types';
 import RawDiagnosticDetails from './RawDiagnosticDetails';
+const effortLabels: Record<string, string> = { auto: '自动', low: '轻量', medium: '标准', high: '深入', xhigh: '更深入', max: '最大' };
 export default function RoutingPanel({ attempts, refresh, busy }: { attempts: RoutingAttempt[]; refresh: () => void; busy: boolean }) {
   const [details, setDetails] = useState<Record<string, RawDiagnostic>>({});
   const [loading, setLoading] = useState<string[]>([]);
@@ -22,6 +23,7 @@ export default function RoutingPanel({ attempts, refresh, busy }: { attempts: Ro
       return <div className="routing-log" key={attempt.id}>
         <div className="routing-log-heading">{success ? <CheckCircle2 size={16} className="success-text"/> : <XCircle size={16} className="danger-text"/>}<strong>{attempt.providerName || '已删除的渠道'}</strong><span className={`status-pill ${success ? 'success' : ''}`}>{success ? '成功' : ['aborted', 'stopped'].includes(attempt.outcome) ? '已取消' : attempt.outcome === 'running' ? '进行中' : ['error', 'failure', 'failed'].includes(attempt.outcome) ? '失败' : attempt.outcome}</span></div>
         <div className="routing-log-meta"><span>{attempt.modelId}</span><time>{new Date(attempt.createdAt).toLocaleString('zh-CN')}</time></div><div className="routing-request-id">请求 {attempt.requestId}</div>
+        {attempt.userRoutingApplied && <div className="routing-override-detail"><strong>专属模型路由</strong><span>{attempt.sourceRouteKey || '原模型'} · {attempt.sourceVariantName || '默认版本'} → {attempt.executionRouteKey || '执行模型'} · {attempt.executionVariantName || '默认版本'}</span><small>执行思考强度：{effortLabels[attempt.executionEffort || 'auto'] || attempt.executionEffort}</small></div>}
         {attempt.error && <p className="model-error">{attempt.error}</p>}
         {details[attempt.id] ? <RawDiagnosticDetails detail={details[attempt.id]}/> : attempt.hasDetail && <button className="button small routing-detail-button" disabled={pending} onClick={() => void loadDetail(attempt.id)}>{pending ? <LoaderCircle size={14} className="spin"/> : <FileText size={14}/>}读取原始错误</button>}
         {errors[attempt.id] && <p className="model-error" role="alert">{errors[attempt.id]}</p>}

@@ -22,6 +22,7 @@
     "express-rate-limit": "^8.0.0",
     "highlight.js": "^11.11.1",
     "ipaddr.js": "^2.5.0",
+    "katex": "^0.16.47",
     "lucide-react": "^0.468.0",
     "mammoth": "^1.10.0",
     "multer": "^2.0.2",
@@ -30,9 +31,13 @@
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
     "rehype-highlight": "^7.0.2",
+    "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "remark-parse": "^11.0.0",
     "stripe": "^22.6.2",
-    "undici": "^7.30.0"
+    "undici": "^7.30.0",
+    "unified": "^11.0.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

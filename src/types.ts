@@ -14,7 +14,8 @@ export interface WorkCapabilities { available: boolean; reason?: string; skills:
 export interface WorkArtifact { path?: string; chatId?: string; id: string; name: string; size: number; downloadUrl: string; mime?: string; createdAt?: string }
 export interface StreamEvent { userMessage?: Message; assistantMessage?: Message; chat?: Chat; text?: string; message?: Message | string; error?: string; label?: string; artifact?: WorkArtifact }
 export interface RawDiagnostic { status?: number; method?: string; url?: string; protocol?: string; modelId?: string; headers?: Record<string, string>; body?: string; truncated?: boolean; readNote?: string; [key: string]: unknown }
-export interface RoutingAttempt { id: string; requestId: string; providerName: string; modelId: string; outcome: string; error?: string | null; createdAt: string; hasDetail?: boolean }
+export interface RoutingAttempt { id: string; requestId: string; providerName: string; modelId: string; outcome: string; error?: string | null; createdAt: string; hasDetail?: boolean; sourceRouteKey?: string | null; sourceVariantName?: string | null; executionRouteKey?: string | null; executionVariantName?: string | null; requestedEffort?: string | null; executionEffort?: string | null; userRoutingApplied?: boolean; userId?: string | null }
 
 export interface ModelGroup { name: string; variants: { name: string; modelIds: string[] }[] }
 export interface ModelLimit { routeKey: string; variantName: string | null; dailyLimit: number | null; monthlyLimit: number | null; usedToday?: number; usedMonth?: number }
+export interface UserModelRoutingRule { sourceRouteKey: string; sourceVariantName: string; targetRouteKey: string; targetVariantName: string; enabled: boolean; effort: string }
