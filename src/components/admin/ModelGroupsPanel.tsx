@@ -21,10 +21,10 @@ export default function ModelGroupsPanel({ groups, models, providers, busy, run 
   async function save(event: FormEvent) {
     event.preventDefault(); setError('');
     if (!name.trim()) { setError('请填写用户看到的模型名称。'); return; }
-    if (!editing && groups.some(group => group.name === name.trim())) { setError('此模型名称已存在。请关闭新建表单，并在现有模型上选择“配置”。'); return; }
+    if (groups.some(group => group.name === name.trim() && group.name !== editing)) { setError('此模型名称已存在，请使用其他名称；如需调整已有模型，请关闭表单后选择该模型的“配置”。'); return; }
     const names = variants.map(variant => variant.name.trim());
     if (new Set(names).size !== names.length) { setError('同一模型中的版本名称不能重复；默认版本只能有一个。'); return; }
-    const payload = { name: name.trim(), variants: variants.map(variant => ({ name: variant.name.trim(), modelIds: variant.modelIds })) };
+    const payload = { ...(editing ? { originalName: editing } : {}), name: name.trim(), variants: variants.map(variant => ({ name: variant.name.trim(), modelIds: variant.modelIds })) };
     if (await run('model-group-save', () => api('/admin/model-groups', { method: 'PUT', body: JSON.stringify(payload) }), '模型与版本已保存，所选渠道映射已更新。')) setEditing(null);
   }
   const providerName = (model: AdminModel) => model.providerName || providers.find(provider => provider.id === model.providerId)?.name || '已删除渠道';
@@ -33,8 +33,8 @@ export default function ModelGroupsPanel({ groups, models, providers, busy, run 
     <div className="section-title"><div><h3>模型与版本</h3><p>先定义模型名称，再为各版本选择渠道中的上游模型。</p></div><button className="button small" onClick={() => open()} disabled={!!busy}><Plus size={15}/>新建模型</button></div>
     {editing !== null && <form className="settings-card stack" onSubmit={save}>
       <div className="card-heading"><strong>{editing ? `配置 ${editing}` : '新建模型'}</strong><button className="icon-button" type="button" onClick={() => setEditing(null)} aria-label="关闭模型配置"><X size={16}/></button></div>
-      <label>模型名称<input value={name} onChange={event => setName(event.target.value)} readOnly={!!editing} required maxLength={300} placeholder="例如 GPT 或 Claude"/><span className="field-help">用户先选择此名称，再选择版本。已创建模型不能直接改名，可新建模型后重新分配渠道。</span></label>
-      <p className="field-help">版本名称由你定义，例如高智商、普通、降智；留空表示默认版本。一个上游记录只能绑定到一个版本。保存会启用选中记录，移出的记录会停用并保留。</p>
+      <label>模型名称<input value={name} onChange={event => setName(event.target.value)} required maxLength={300} placeholder="例如 GPT 或 Claude"/><span className="field-help">用户先选择此名称，再选择版本。已有模型可以直接改名，改名会保留已有设置。</span></label>
+      <p className="field-help">版本名称由你定义，例如高智商、普通、降智；留空表示默认版本。一个上游记录只能绑定到一个版本。保存会启用选中记录，移出的记录会停用并保留；仅改模型名称时，保留原绑定的启用状态。</p>
       <label className="search-input bordered"><Search size={15}/><input value={query} onChange={event => setQuery(event.target.value)} aria-label="筛选可绑定的渠道模型" placeholder="筛选渠道或上游模型 ID"/></label>
       <div className="catalog-variant-list">{variants.map(variant => <fieldset className="catalog-variant" key={variant.key}>
         <div className="catalog-variant-title"><label>版本名称<input value={variant.name} onChange={event => update(variant.key, { name: event.target.value })} maxLength={100} placeholder="默认版本"/></label><button type="button" className="icon-button danger-text" aria-label={`移除版本 ${variant.name || '默认'}`} title="移除版本；保存后生效" onClick={() => setVariants(current => current.filter(item => item.key !== variant.key))}><Trash2 size={16}/></button></div>
@@ -42,7 +42,7 @@ export default function ModelGroupsPanel({ groups, models, providers, busy, run 
           const checked = variant.modelIds.includes(model.id);
           const assignedHere = variants.some(other => other.key !== variant.key && other.modelIds.includes(model.id));
           const provider = providers.find(item => item.id === model.providerId);
-          return <label className={`catalog-binding ${model.available === false ? 'unavailable' : ''}`} key={model.id}><input type="checkbox" checked={checked} disabled={!!busy || assignedHere || (!checked && variant.modelIds.length >= 500)} onChange={event => update(variant.key, { modelIds: event.target.checked ? [...variant.modelIds, model.id] : variant.modelIds.filter(id => id !== model.id) })}/><span><strong>{providerName(model)}</strong><small>{model.modelId}</small><small>{assignedHere ? '已绑定到本模型的其他版本' : model.routeKey && model.routeKey !== name ? `当前属于 ${model.routeKey}${model.variantName ? ` / ${model.variantName}` : ''}，选择后会转移` : model.available === false ? '上游不可用，保存后仍不会向用户显示' : provider?.enabled === false ? '渠道已停用' : checked ? '已选中' : '可绑定'}</small></span></label>;
+          return <label className={`catalog-binding ${model.available === false ? 'unavailable' : ''}`} key={model.id}><input type="checkbox" checked={checked} disabled={!!busy || assignedHere || (!checked && variant.modelIds.length >= 500)} onChange={event => update(variant.key, { modelIds: event.target.checked ? [...variant.modelIds, model.id] : variant.modelIds.filter(id => id !== model.id) })}/><span><strong>{providerName(model)}</strong><small>{model.modelId}</small><small>{assignedHere ? '已绑定到本模型的其他版本' : model.routeKey && model.routeKey !== (editing || name.trim()) ? `当前属于 ${model.routeKey}${model.variantName ? ` / ${model.variantName}` : ''}，选择后会转移` : model.available === false ? '上游不可用，保存后仍不会向用户显示' : provider?.enabled === false ? '渠道已停用' : checked ? '已选中' : '可绑定'}</small></span></label>;
         })}{!visibleModels.length && <p className="field-help">没有匹配的上游模型。请先在 API 连接中同步模型。</p>}</div>
         <p className="field-help">已选择 {variant.modelIds.length}/500 个渠道模型；同一版本内按渠道优先级切换。</p>
       </fieldset>)}</div>

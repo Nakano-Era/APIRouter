@@ -1,4 +1,5 @@
 import { digest, now } from './store.mjs';
+import { createModelRename } from './model-rename.mjs';
 
 export const modelRouteId = (name, variant = '') => `${variant ? 'v' : 'r'}_${digest(variant ? JSON.stringify([name, variant]) : name).slice(0, 32)}`;
 export function variantName(value = '') {
@@ -7,9 +8,10 @@ export function variantName(value = '') {
 }
 const bad = (message, status = 400) => Object.assign(new Error(message), { status });
 
-export function createModelCatalog({ store, ensureProviderIdle }) {
+export function createModelCatalog({ store, ensureProviderIdle, ensureRenameIdle = () => {} }) {
   store.db.exec(`CREATE TABLE IF NOT EXISTS model_catalog (name TEXT PRIMARY KEY,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS model_versions (route_key TEXT NOT NULL REFERENCES model_catalog(name) ON DELETE CASCADE,name TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(route_key,name));`);
+  const rename = createModelRename({ store, routeId: modelRouteId });
   // Backfill request labels once for known legacy model IDs. These snapshots
   // remain intact after a channel is renamed, reassigned, disabled or deleted.
   store.transaction(() => {
@@ -32,6 +34,11 @@ export function createModelCatalog({ store, ensureProviderIdle }) {
   function saveGroup(body) {
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name || name.length > 300 || /[\u0000-\u001f\u007f]/.test(name)) throw bad('请输入有效的模型名称（最多 300 个字符）。');
+    const originalName = body.originalName === undefined ? name : typeof body.originalName === 'string' ? body.originalName.trim() : '';
+    if (!originalName || originalName.length > 300 || /[\u0000-\u001f\u007f]/.test(originalName)) throw bad('原模型名称无效，请刷新模型列表后重试。');
+    if (body.originalName !== undefined && !listGroups().some(group => group.name === originalName)) throw bad('原模型已不存在或已改名，请刷新后重试。', 404);
+    const renaming = originalName !== name;
+    if (renaming) rename.assertUnused(name);
     if (!Array.isArray(body.variants) || body.variants.length > 100) throw bad('每个模型最多设置 100 个版本。');
     const names = new Set(), ids = new Set();
     const variants = body.variants.map(item => {
@@ -48,15 +55,23 @@ export function createModelCatalog({ store, ensureProviderIdle }) {
       });
       return { name, models };
     });
-    const prior = store.all('SELECT * FROM models WHERE route_key=? AND (enabled=1 OR catalog_assigned=1)', name);
+    const prior = store.all('SELECT * FROM models WHERE route_key=? AND (enabled=1 OR catalog_assigned=1)', originalName);
+    if (renaming) {
+      ensureRenameIdle(originalName);
+      for (const row of store.all('SELECT DISTINCT provider_id FROM models WHERE route_key=?', originalName)) ensureProviderIdle(row.provider_id);
+    }
     for (const providerId of new Set([...prior, ...variants.flatMap(item => item.models)].map(row => row.provider_id))) ensureProviderIdle(providerId);
     store.transaction(() => {
+      if (renaming) { rename.assertUnused(name); rename.apply(originalName, name); }
       store.run('INSERT OR IGNORE INTO model_catalog(name,created_at) VALUES (?,?)', name, now());
       store.run('DELETE FROM model_versions WHERE route_key=?', name);
       for (const row of prior) if (!ids.has(row.id)) store.run("UPDATE models SET enabled=0,catalog_assigned=0,route_key=model_id,variant_name='' WHERE id=?", row.id);
       variants.forEach((version, index) => {
         store.run('INSERT INTO model_versions(route_key,name,position) VALUES (?,?,?)', name, version.name, index);
-        for (const model of version.models) store.run('UPDATE models SET route_key=?,variant_name=?,catalog_assigned=1,enabled=1 WHERE id=?', name, version.name, model.id);
+        for (const model of version.models) {
+          const enabled = renaming && model.route_key === originalName && model.variant_name === version.name && model.catalog_assigned ? model.enabled : 1;
+          store.run('UPDATE models SET route_key=?,variant_name=?,catalog_assigned=1,enabled=? WHERE id=?', name, version.name, enabled, model.id);
+        }
       });
     });
     return { groups: listGroups() };
@@ -65,5 +80,5 @@ export function createModelCatalog({ store, ensureProviderIdle }) {
     app.get('/api/admin/model-groups', auth, admin, (_req, res) => res.json({ groups: listGroups() }));
     app.put('/api/admin/model-groups', auth, admin, csrf, (req, res) => res.json(saveGroup(req.body)));
   }
-  return { listGroups, saveGroup, registerRoutes };
+  return { listGroups, saveGroup, registerRoutes, resolveRouteId: rename.resolve, routeAliases: rename.aliases };
 }

@@ -31,6 +31,7 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
   const iso = () => new Date(clock()).toISOString();
   const timestamp = () => Math.floor(clock() / 1000);
   const checkoutBusy = new Set();
+  const manualRequestBusy = new Set();
   const queues = new Map();
   store.db.exec(`
     CREATE TABLE IF NOT EXISTS billing_config (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0, encrypted_secret TEXT, secret_hint TEXT, encrypted_webhook TEXT, webhook_hint TEXT, free_routes TEXT NOT NULL DEFAULT '[]');
@@ -235,6 +236,8 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
       if (!canRequestManual(req.user)) throw fail(409, '唯一管理员无需申请会员，可配置自身额度；会员申请需要其他管理员审批。');
       const plan = requirePurchasable(req.body.planId, 'allowManual');
       const note = text(req.body.note ?? '', '申请说明', 1000, true), requestId = id();
+      manualRequestBusy.add(requestId);
+      try {
       const checkout = openCheckout(req.user.id);
       if (checkout?.status === 'open' && checkout.expires_at <= iso()) {
         const current = await safeStripe(() => stripeClient().checkout.sessions.retrieve(checkout.session_id));
@@ -248,6 +251,7 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
         store.run('INSERT INTO billing_requests(id,user_id,plan_id,plan_snapshot,note,created_at) VALUES(?,?,?,?,?,?)', requestId, req.user.id, plan.id, JSON.stringify(plan), note, iso());
       });
       res.status(201).json({ request: requestJSON(store.get('SELECT * FROM billing_requests WHERE id=?', requestId)) });
+      } finally { manualRequestBusy.delete(requestId); }
     });
     userRoutes.post('/checkout', limiter, async (req, res) => res.json(await createCheckout(req.user, req.body.planId, req)));
     userRoutes.post('/portal', limiter, async (req, res) => {
@@ -307,5 +311,8 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
     app.use('/api/billing', auth, csrf, userRoutes);
     app.use('/api/admin', auth, csrf, admin, adminRoutes);
   }
-  return { mountWebhook, registerRoutes, effectiveEntitlement };
+  function ensureModelRenameIdle() {
+    if (checkoutBusy.size || manualRequestBusy.size || queues.size) throw fail(409, '支付操作正在处理中，请稍后再修改模型名称。');
+  }
+  return { mountWebhook, registerRoutes, effectiveEntitlement, ensureModelRenameIdle };
 }

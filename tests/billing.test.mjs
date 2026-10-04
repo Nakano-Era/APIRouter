@@ -9,6 +9,7 @@ import express from 'express';
 import Stripe from 'stripe';
 import { createStore } from '../server/store.mjs';
 import { createBilling, addBillingPeriod } from '../server/billing.mjs';
+import { createModelCatalog } from '../server/model-catalog.mjs';
 
 const secretKey = 'sk_test_localBillingOnly123456';
 const webhookSecret = 'whsec_localWebhookOnly987654';
@@ -22,21 +23,25 @@ async function fixture(t, { publicOrigin = 'https://workspace.example.com' } = {
   let time = Date.parse('2026-01-31T12:34:56.000Z');
   const sessions = new Map(), subscriptions = new Map(), calls = [], sdk = new Stripe(secretKey);
   let sequence = 0, failNextCreate = false, failNextRetrieve = false;
+  let gate;
+  async function waitForGate(type) { if (gate?.type === type) { const current = gate; gate = null; current.entered.resolve(); await current.release.promise; } }
   const mock = {
     webhooks: sdk.webhooks,
     checkout: { sessions: {
       async create(params, options) {
         calls.push({ type: 'create', params: clone(params), options });
+        await waitForGate('create');
         if (failNextCreate) { failNextCreate = false; throw new Error('secret upstream failure sk_test_DO_NOT_LEAK'); }
         const old = [...sessions.values()].find(session => session.metadata.checkoutId === params.metadata.checkoutId);
         if (old) return clone(old);
         const session = { id: `cs_test_${++sequence}`, url: `https://checkout.stripe.com/c/pay/cs_test_${sequence}`, status: 'open', mode: params.mode, client_reference_id: params.client_reference_id, metadata: params.metadata, expires_at: params.expires_at };
         sessions.set(session.id, session); return clone(session);
       },
-      async retrieve(sessionId) { calls.push({ type: 'session', sessionId }); if (!sessions.has(sessionId)) throw new Error('missing session'); return clone(sessions.get(sessionId)); }
+      async retrieve(sessionId) { calls.push({ type: 'session', sessionId }); await waitForGate('session'); if (!sessions.has(sessionId)) throw new Error('missing session'); return clone(sessions.get(sessionId)); }
     } },
     subscriptions: { async retrieve(subscriptionId, params) {
       calls.push({ type: 'subscription', subscriptionId, params });
+      await waitForGate('subscription');
       if (failNextRetrieve) { failNextRetrieve = false; throw new Error('temporary network error with secret'); }
       if (!subscriptions.has(subscriptionId)) throw new Error('missing subscription'); return clone(subscriptions.get(subscriptionId));
     } },
@@ -77,8 +82,33 @@ async function fixture(t, { publicOrigin = 'https://workspace.example.com' } = {
     const result = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Stripe-Signature': signature }, body: payload });
     return { status: result.status, body: await result.json(), eventId };
   }
-  return { store, billing, request, plan, enable, apply, review, checkout, complete, webhook, sessions, subscriptions, calls, setTime: value => { time = new Date(value).getTime(); }, failCreate: () => { failNextCreate = true; }, failRetrieve: () => { failNextRetrieve = true; } };
+  function pauseCall(type) { gate = { type, entered: Promise.withResolvers(), release: Promise.withResolvers() }; const current = gate; t.after(() => current.release.resolve()); return { entered: current.entered.promise, release: () => current.release.resolve() }; }
+  return { store, billing, request, plan, enable, apply, review, checkout, complete, webhook, sessions, subscriptions, calls, pauseCall, setTime: value => { time = new Date(value).getTime(); }, failCreate: () => { failNextCreate = true; }, failRetrieve: () => { failNextRetrieve = true; } };
 }
+
+test('model rename waits for checkout, subscription webhook and manual application network snapshots', async t => {
+  const f = await fixture(t); await f.enable(); const plan = await f.plan();
+  const catalog = createModelCatalog({ store: f.store, ensureProviderIdle() {}, ensureRenameIdle: f.billing.ensureModelRenameIdle });
+  catalog.saveGroup({ name: 'basic', variants: [] });
+  const rename = () => catalog.saveGroup({ originalName: 'basic', name: 'new-basic', variants: [] });
+  function blocked() { assert.throws(rename, error => error.status === 409 && /支付操作/.test(error.message)); assert.deepEqual(JSON.parse(f.store.get('SELECT data FROM billing_plans WHERE id=?', plan.id).data).allowedRoutes, plan.allowedRoutes); }
+  const checkoutGate = f.pauseCall('create'), checkout = f.checkout(plan.id);
+  await checkoutGate.entered; try { blocked(); } finally { checkoutGate.release(); }
+  assert.equal((await checkout).status, 200);
+  const { session } = f.complete(), webhookGate = f.pauseCall('subscription');
+  const webhook = f.webhook('checkout.session.completed', session);
+  await webhookGate.entered; try { blocked(); } finally { webhookGate.release(); }
+  assert.equal((await webhook).status, 200);
+  assert.equal((await f.checkout(plan.id, 'other')).status, 200);
+  const otherSession = [...f.sessions.values()].find(row => row.client_reference_id === 'other'); otherSession.status = 'expired';
+  f.setTime('2026-01-31T14:34:56.000Z');
+  const manualGate = f.pauseCall('session'), application = f.apply(plan.id, 'other');
+  await manualGate.entered; try { blocked(); } finally { manualGate.release(); }
+  await application;
+  rename();
+  assert.deepEqual(JSON.parse(f.store.get('SELECT plan_snapshot FROM billing_memberships WHERE user_id=?', 'user').plan_snapshot).allowedRoutes, ['new-basic', 'advanced']);
+  assert.deepEqual(JSON.parse(f.store.get('SELECT plan_snapshot FROM billing_requests WHERE user_id=?', 'other').plan_snapshot).allowedRoutes, ['new-basic', 'advanced']);
+});
 
 test('calendar subscriptions clamp month ends and leap days in UTC', () => {
   assert.equal(addBillingPeriod('2026-01-31T12:34:56.000Z', 'month'), '2026-02-28T12:34:56.000Z');

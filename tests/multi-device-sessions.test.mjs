@@ -55,12 +55,13 @@ test('independent device cookies and CSRF tokens remain valid and share account 
   assert.equal(current.current, true); assert.equal(current.deviceName, 'Chrome · Windows');
   assert.equal(other.current, false); assert.equal(other.deviceName, 'Safari · iOS');
   for (const row of result.data.sessions) {
-    assert.deepEqual(Object.keys(row).sort(), ['id', 'deviceName', 'createdAt', 'lastSeenAt', 'expiresAt', 'current'].sort());
+    assert.deepEqual(Object.keys(row).sort(), ['id', 'deviceName', 'createdAt', 'lastSeenAt', 'expiresAt', 'current', 'loginIp', 'geoLocation', 'deviceType'].sort());
     assert.match(row.id, /^[a-f0-9]{32}$/); assert.ok(Number.isFinite(Date.parse(row.createdAt)));
-    assert.ok(Date.parse(row.expiresAt) > Date.parse(row.lastSeenAt));
+    assert.equal(row.expiresAt, null); assert.equal(row.loginIp, '127.0.0.1'); assert.equal(typeof row.geoLocation, 'string');
     assert.ok(!JSON.stringify(row).includes(mobile.csrfToken) && !JSON.stringify(row).includes(f.admin.csrfToken));
     assert.notEqual(row.id, digest(mobile.cookie.split('=')[1]));
   }
+  assert.equal(current.deviceType, 'desktop'); assert.equal(other.deviceType, 'mobile');
   assert.equal((await f.request('/api/chats', { session: mobile, method: 'POST', body: { title: '手机创建的对话' }, headers: { 'X-CSRF-Token': f.admin.csrfToken } })).status, 403);
   const chat = await f.request('/api/chats', { session: mobile, method: 'POST', body: { title: '手机创建的对话' } });
   assert.equal(chat.status, 201);
@@ -143,6 +144,7 @@ test('last seen is throttled while device labels contain only coarse browser and
   await f.request('/api/auth/session', { session: f.admin, headers: { 'User-Agent': 'private-user-data' } });
   const after = f.instance.store.get('SELECT * FROM sessions WHERE token=?', token);
   assert.ok(after.last_seen_at > stale); assert.equal(after.device_label, 'Chrome · Windows');
+  assert.equal(after.login_ip, before.login_ip); assert.equal(after.geo_location, before.geo_location); assert.equal(after.device_type, before.device_type);
   await f.request('/api/auth/sessions', { session: f.admin });
   assert.equal(f.instance.store.get('SELECT last_seen_at FROM sessions WHERE token=?', token).last_seen_at, after.last_seen_at);
   assert.equal(deviceName('unrecognized sensitive data'), '未知设备');
@@ -152,21 +154,108 @@ test('last seen is throttled while device labels contain only coarse browser and
 });
 
 test('legacy session migration preserves authentication and stable opaque IDs across restarts', async t => {
-  const token = randomBytes(32).toString('base64url'), expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+  const token = randomBytes(32).toString('base64url'), expiredToken = randomBytes(32).toString('base64url'), expiresAt = new Date(Date.now() + 3_600_000).toISOString();
   let publicId;
   const f = await fixture(t, { seed(directory) {
     const db = new DatabaseSync(join(directory, 'app.sqlite'));
     db.exec('CREATE TABLE users(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE,password TEXT,role TEXT,disabled INTEGER DEFAULT 0,daily_limit INTEGER,created_at TEXT); CREATE TABLE sessions(token TEXT PRIMARY KEY,user_id TEXT,csrf TEXT,expires_at TEXT);');
     db.prepare('INSERT INTO users(id,name,email,password,role,created_at) VALUES (?,?,?,?,?,?)').run('legacy', 'Legacy', 'legacy@example.com', 'unused', 'user', new Date().toISOString());
-    db.prepare('INSERT INTO sessions VALUES (?,?,?,?)').run(digest(token), 'legacy', 'legacy-csrf', expiresAt); db.close();
-    const first = createStore(directory), row = first.get('SELECT * FROM sessions');
+    db.prepare('INSERT INTO sessions VALUES (?,?,?,?)').run(digest(token), 'legacy', 'legacy-csrf', expiresAt);
+    db.prepare('INSERT INTO sessions VALUES (?,?,?,?)').run(digest(expiredToken), 'legacy', 'expired-csrf', '2000-01-01T00:00:00.000Z'); db.close();
+    const first = createStore(directory), row = first.get('SELECT * FROM sessions WHERE token=?', digest(token));
     publicId = row.public_id;
     assert.match(publicId, /^[a-f0-9]{32}$/); assert.notEqual(publicId, digest(token));
     assert.equal(row.expires_at, expiresAt); assert.equal(row.token, digest(token)); assert.equal(row.csrf, 'legacy-csrf');
-    assert.equal(row.device_label, '原有设备'); first.close();
+    assert.equal(row.device_label, '原有设备'); assert.equal(row.persistent, 1);
+    assert.equal(first.get('SELECT persistent FROM sessions WHERE token=?', digest(expiredToken)).persistent, 0); first.close();
   } });
   const session = { cookie: `apirouter_session=${token}`, csrfToken: 'legacy-csrf' };
   const result = await f.request('/api/auth/sessions', { session });
   assert.equal(result.status, 200); assert.equal(result.data.sessions[0].id, publicId); assert.equal(result.data.sessions[0].current, true);
+  assert.equal(result.data.sessions.length, 1);
+  assert.equal(result.data.sessions[0].expiresAt, null); assert.equal(result.cookie, session.cookie, 'migration renews the existing browser cookie without rotating its token');
+  assert.equal(result.data.sessions[0].loginIp, null); assert.equal(result.data.sessions[0].geoLocation, '未记录'); assert.equal(result.data.sessions[0].deviceType, 'unknown');
+  assert.equal((await f.request('/api/chats', { session: { cookie: `apirouter_session=${expiredToken}`, csrfToken: 'expired-csrf' } })).status, 401);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  t.mock.timers.tick(800 * 86400_000);
   assert.equal((await f.request('/api/chats', { session, method: 'POST', body: {} })).status, 201);
+  assert.equal((await f.request('/api/auth/sessions', { session })).data.sessions[0].id, publicId);
+});
+
+test('persistent sessions survive elapsed years and renew a bounded browser cookie without changing credentials', async t => {
+  const f = await fixture(t), token = digest(f.admin.cookie.split('=')[1]);
+  const before = f.instance.store.get('SELECT * FROM sessions WHERE token=?', token);
+  assert.equal(before.persistent, 1);
+  assert.equal((await f.request('/api/auth/session', { session: f.admin })).response.headers.get('set-cookie'), null);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  t.mock.timers.tick(3 * 365 * 86400_000);
+  const renewed = await f.request('/api/auth/session', { session: f.admin });
+  assert.equal(renewed.status, 200); assert.equal(renewed.data.user.id, f.admin.user.id); assert.equal(renewed.data.csrfToken, f.admin.csrfToken); assert.equal(renewed.cookie, f.admin.cookie);
+  const cookie = renewed.response.headers.get('set-cookie');
+  assert.match(cookie, /Max-Age=34560000(?:;|$)/); assert.match(cookie, /HttpOnly/); assert.match(cookie, /SameSite=Strict/); assert.match(cookie, /Path=\//);
+  if (process.env.COOKIE_SECURE === 'true') assert.match(cookie, /Secure/);
+  const after = f.instance.store.get('SELECT * FROM sessions WHERE token=?', token);
+  assert.equal(after.public_id, before.public_id); assert.equal(after.created_at, before.created_at); assert.ok(after.cookie_refreshed_at > before.cookie_refreshed_at);
+  assert.equal((await f.request('/api/auth/session', { session: f.admin })).response.headers.get('set-cookie'), null, 'cookie writes are throttled');
+  assert.equal((await f.request('/api/auth/sessions', { session: f.admin })).data.sessions[0].expiresAt, null);
+  t.mock.timers.tick(2 * 86400_000);
+  const logout = await f.request('/api/auth/logout', { session: f.admin, method: 'POST' });
+  assert.equal(logout.status, 200); assert.equal(logout.cookie, 'apirouter_session=');
+  assert.equal(logout.response.headers.getSetCookie().length, 1, 'logout replaces any renewal header');
+  const rejected = await f.request('/api/chats', { session: f.admin });
+  assert.equal(rejected.status, 401); assert.equal(rejected.response.headers.get('set-cookie'), null, 'revoked credentials cannot renew');
+});
+
+test('invalid and expired cookies never renew and cannot restore an expired session', async t => {
+  const f = await fixture(t), token = randomBytes(32).toString('base64url');
+  f.instance.store.run('INSERT INTO sessions(token,user_id,csrf,expires_at) VALUES (?,?,?,?)', digest(token), f.admin.user.id, 'expired-csrf', '2000-01-01T00:00:00.000Z');
+  for (const cookie of [`apirouter_session=${token}`, 'apirouter_session=not-a-token', `apirouter_session=${randomBytes(32).toString('base64url')}`]) {
+    const result = await f.request('/api/auth/session', { session: { cookie, csrfToken: 'expired-csrf' } });
+    assert.equal(result.data.user, null); assert.equal(result.response.headers.get('set-cookie'), null);
+  }
+  assert.equal(f.instance.store.get('SELECT persistent FROM sessions WHERE token=?', digest(token)).persistent, 0);
+});
+
+test('only admins can inspect another user login devices and metadata without exposing credentials', async t => {
+  const f = await fixture(t), mobile = await f.login('member@example.com', { headers: { 'User-Agent': phone } }), computer = await f.login('member@example.com', { headers: { 'User-Agent': desktop } });
+  const path = '/api/admin/users/member/sessions';
+  assert.equal((await f.request(path)).status, 401);
+  for (const target of ['member', f.admin.user.id, 'missing-user']) {
+    assert.equal((await f.request(`/api/admin/users/${target}/sessions`, { session: mobile })).status, 403);
+  }
+  const result = await f.request(path, { session: f.admin });
+  assert.equal(result.status, 200); assert.equal(result.data.sessions.length, 2);
+  const expectedFields = ['id', 'deviceName', 'createdAt', 'lastSeenAt', 'expiresAt', 'current', 'loginIp', 'geoLocation', 'deviceType'].sort();
+  for (const row of result.data.sessions) {
+    assert.deepEqual(Object.keys(row).sort(), expectedFields); assert.equal(row.current, false);
+    assert.equal(row.loginIp, '127.0.0.1'); assert.equal(typeof row.geoLocation, 'string'); assert.equal(row.expiresAt, null);
+    assert.match(row.id, /^[a-f0-9]{32}$/);
+  }
+  assert.deepEqual(result.data.sessions.map(row => row.deviceType).sort(), ['desktop', 'mobile']);
+  const payload = JSON.stringify(result.data);
+  for (const session of [f.admin, mobile, computer]) {
+    const rawToken = session.cookie.split('=')[1];
+    assert.ok(!payload.includes(rawToken)); assert.ok(!payload.includes(digest(rawToken))); assert.ok(!payload.includes(session.csrfToken));
+  }
+  const own = await f.request('/api/auth/sessions', { session: mobile });
+  assert.deepEqual(new Set(result.data.sessions.map(row => row.id)), new Set(own.data.sessions.map(row => row.id)));
+  const adminOwn = await f.request(`/api/admin/users/${f.admin.user.id}/sessions`, { session: f.admin });
+  assert.equal(adminOwn.data.sessions.length, 1); assert.equal(adminOwn.data.sessions[0].current, true);
+});
+
+test('admin device inspection excludes expired and disabled sessions and handles users without sessions', async t => {
+  const f = await fixture(t), path = '/api/admin/users/member/sessions';
+  assert.deepEqual((await f.request(path, { session: f.admin })).data, { sessions: [] });
+  assert.equal((await f.request('/api/admin/users/missing-user/sessions', { session: f.admin })).status, 404);
+  const member = await f.login('member@example.com'), token = digest(member.cookie.split('=')[1]);
+  const stamp = '2000-01-01T00:00:00.000Z';
+  f.instance.store.run('INSERT INTO sessions(token,user_id,csrf,expires_at) VALUES (?,?,?,?)', 'expired-member-session', 'member', 'expired-secret', stamp);
+  f.instance.store.run('UPDATE sessions SET expires_at=?,last_seen_at=? WHERE token=?', stamp, stamp, token);
+  const result = await f.request(path, { session: f.admin });
+  assert.equal(result.data.sessions.length, 1); assert.equal(result.data.sessions[0].expiresAt, null);
+  assert.equal(result.data.sessions[0].lastSeenAt, stamp, 'admin inspection does not mark the target device active');
+  assert.equal(f.instance.store.get('SELECT last_seen_at FROM sessions WHERE token=?', token).last_seen_at, stamp);
+  f.instance.store.run('UPDATE users SET disabled=1 WHERE id=?', 'member');
+  assert.deepEqual((await f.request(path, { session: f.admin })).data, { sessions: [] }, 'disabled accounts do not expose dormant sessions as signed in');
+  assert.equal((await f.request('/api/chats', { session: member })).status, 401);
 });

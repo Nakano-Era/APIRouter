@@ -54,7 +54,10 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   const setupToken = store.get('SELECT id FROM users LIMIT 1') ? null : (suppliedSetupToken || process.env.SETUP_TOKEN || randomBytes(24).toString('base64url'));
   const publicOrigin = process.env.PUBLIC_ORIGIN ? new URL(process.env.PUBLIC_ORIGIN).origin : null;
   const billing = createBilling({ store, publicOrigin, stripeFactory });
-  const catalog = createModelCatalog({ store, ensureProviderIdle });
+  const catalog = createModelCatalog({ store, ensureProviderIdle, ensureRenameIdle: routeKey => {
+    if ([...active.values()].some(job => job.routeKeys?.includes(routeKey))) throw fail(409, '此模型还有进行中的任务，请等待完成或停止后再改名。');
+    billing.ensureModelRenameIdle();
+  } });
   const modelAccess = createUserModelAccess({ store });
   const userRouting = createUserModelRouting({ store, ensureUserIdle: userId => {
     if ([...active.values()].some(job => job.userId === userId)) throw fail(409, '此用户还有进行中的任务，请等待完成或停止后修改路由。');
@@ -82,18 +85,18 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   app.use((req, res, next) => req.method === 'POST' && longPromptPath.test(req.path) ? next() : standardJSON(req, res, next));
   app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next(); });
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false, message: { error: '请求过于频繁，请稍后再试。' } }));
-  app.use('/api', (req, _res, next) => {
+  app.use('/api', (req, res, next) => {
     const token = req.headers.cookie?.split(';').map(v => v.trim()).find(v => v.startsWith('apirouter_session='))?.slice(18);
     if (token && /^[a-zA-Z0-9_-]{43}$/.test(token)) {
-      const session = store.get('SELECT sessions.*, users.disabled FROM sessions JOIN users ON users.id=sessions.user_id WHERE token=? AND expires_at>?', digest(token), now());
-      if (session && !session.disabled) { req.session = sessions.touch(session); req.user = store.get('SELECT * FROM users WHERE id=?', session.user_id); }
+      const session = store.get('SELECT sessions.*, users.disabled FROM sessions JOIN users ON users.id=sessions.user_id WHERE token=? AND (persistent=1 OR expires_at>?)', digest(token), now());
+      if (session && !session.disabled) { req.session = sessions.touch(session); sessions.renewCookie(req.session, token, res); req.user = store.get('SELECT * FROM users WHERE id=?', session.user_id); }
     }
     next();
   });
   const auth = (req, _res, next) => req.user ? next() : next(fail(401, '请先登录。'));
   const csrf = (req, _res, next) => ['GET', 'HEAD', 'OPTIONS'].includes(req.method) || safeEqual(req.get('x-csrf-token'), req.session?.csrf) ? next() : next(fail(403, '登录状态已更新，请刷新页面后重试。', 'CSRF_INVALID'));
   const admin = (req, _res, next) => req.user?.role === 'admin' ? next() : next(fail(403, '此操作仅限管理员。'));
-  sessions.registerRoutes(app, { auth, csrf });
+  sessions.registerRoutes(app, { auth, csrf, admin });
   billing.registerRoutes(app, { auth, admin, csrf });
   work.registerRoutes(app, { auth, admin, csrf });
   createProviderTools({ store, providerJSON, ensureProviderIdle }).registerRoutes(app, { auth, admin, csrf });
@@ -176,7 +179,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   function usableModel(modelId, user) {
     const legacy = store.get('SELECT route_key,variant_name FROM models WHERE id=?', modelId);
     const groups = routeGroups();
-    const key = legacy ? routeId(legacy.route_key, legacy.variant_name) : modelId;
+    const key = legacy ? routeId(legacy.route_key, legacy.variant_name) : groups.has(modelId) ? modelId : catalog.resolveRouteId(modelId);
     const rows = groups.get(key);
     if (!rows) throw fail(400, '模型或版本不可用，请选择其他模型或联系管理员。', 'MODEL_UNAVAILABLE');
     if (user && user.role !== 'admin') {
@@ -190,7 +193,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     contextWindow: rows.some(row => row.context_window) ? Math.max(...rows.map(row => row.context_window || 0)) : null,
     reasoningEfforts: ['auto', ...new Set(rows.flatMap(row => JSON.parse(row.reasoning_efforts || '[]')))],
     status: rows.some(row => row.status === 'ok') ? 'ok' : rows.every(row => row.status === 'error') ? 'error' : 'untested' })); }
-  app.get('/api/models', (req, res) => { const allowed = billing.effectiveEntitlement(req.user.id).allowedRoutes; const models = publicModels().filter(model => req.user.role === 'admin' || !allowed.length || allowed.includes(model.routeKey)), configured = store.settings().defaultModelId; const legacy = configured ? store.get('SELECT route_key,variant_name FROM models WHERE id=?', configured) : null; const wanted = legacy ? routeId(legacy.route_key, legacy.variant_name) : configured; res.json({ models, defaultModelId: models.some(m => m.id === wanted) ? wanted : (models[0]?.id || null) }); });
+  app.get('/api/models', (req, res) => { const allowed = billing.effectiveEntitlement(req.user.id).allowedRoutes; const models = publicModels().filter(model => req.user.role === 'admin' || !allowed.length || allowed.includes(model.routeKey)), configured = store.settings().defaultModelId; const legacy = configured ? store.get('SELECT route_key,variant_name FROM models WHERE id=?', configured) : null; const wanted = legacy ? routeId(legacy.route_key, legacy.variant_name) : models.some(model => model.id === configured) ? configured : configured && catalog.resolveRouteId(configured); res.json({ models, modelAliases: catalog.routeAliases(models.map(model => model.id)), defaultModelId: models.some(m => m.id === wanted) ? wanted : (models[0]?.id || null) }); });
   app.get('/api/settings', (req, res) => { const settings = store.settings(); if (req.user.role !== 'admin') delete settings.systemPrompt; res.json({ settings }); });
   function attachmentJSON(row) { return { id: row.id, name: row.name, mime: row.mime, size: row.size, kind: row.kind, url: `/api/files/${row.id}/download` }; }
   function chatJSON(row) { return { id: row.id, title: row.title, modelId: row.model_id, generating: active.has(row.id), mode: row.mode || 'chat', effort: row.effort || 'auto', skillIds: JSON.parse(row.skill_ids || '[]'), webSearch: !!row.web_search, pinned: !!row.pinned, archived: !!row.archived, createdAt: row.created_at, updatedAt: row.updated_at }; }
@@ -211,7 +214,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   function ownedChat(req) { const chat = store.get('SELECT * FROM chats WHERE id=? AND user_id=?', req.params.id, req.user.id); if (!chat) throw fail(404, '对话不存在。'); return chat; }
   function ensureInactive(chatId) { if (active.has(chatId)) throw fail(409, '请先停止当前回复，再执行此操作。'); }
   app.get('/api/chats', (req, res) => res.json({ chats: store.all('SELECT * FROM chats WHERE user_id=? ORDER BY pinned DESC,updated_at DESC', req.user.id).map(chatJSON) }));
-  app.post('/api/chats', (req, res) => { const execution = executionOptions(req.body); const chatId = id(), timestamp = now(), modelId = req.body.modelId || null; if (modelId) usableModel(modelId, req.user); store.run('INSERT INTO chats(id,user_id,title,model_id,created_at,updated_at) VALUES (?,?,?,?,?,?)', chatId, req.user.id, cleanText(req.body.title, 120) || '新对话', modelId, timestamp, timestamp); saveExecution(chatId, execution); res.status(201).json({ chat: chatJSON(store.get('SELECT * FROM chats WHERE id=?', chatId)) }); });
+  app.post('/api/chats', (req, res) => { const execution = executionOptions(req.body); const chatId = id(), timestamp = now(), modelId = req.body.modelId ? usableModel(req.body.modelId, req.user).id : null; store.run('INSERT INTO chats(id,user_id,title,model_id,created_at,updated_at) VALUES (?,?,?,?,?,?)', chatId, req.user.id, cleanText(req.body.title, 120) || '新对话', modelId, timestamp, timestamp); saveExecution(chatId, execution); res.status(201).json({ chat: chatJSON(store.get('SELECT * FROM chats WHERE id=?', chatId)) }); });
   app.get('/api/chats/:id', (req, res) => { const chat = ownedChat(req); res.json({ chat: chatJSON(chat), generating: active.has(chat.id), messages: store.all('SELECT * FROM messages WHERE chat_id=? ORDER BY rowid', chat.id).map(messageJSON) }); });
   app.patch('/api/chats/:id', (req, res) => { const chat = ownedChat(req); ensureInactive(chat.id); const execution = executionOptions(req.body, chat); const title = req.body.title === undefined ? chat.title : requiredText(req.body.title, '对话标题', 120); const pinned = req.body.pinned === undefined ? chat.pinned : bool(req.body.pinned, '置顶'); const archived = req.body.archived === undefined ? chat.archived : bool(req.body.archived, '归档'); const modelId = req.body.modelId === undefined ? chat.model_id : usableModel(req.body.modelId, req.user).id; store.run('UPDATE chats SET title=?,pinned=?,archived=?,model_id=?,updated_at=? WHERE id=?', title, pinned, archived, modelId, now(), chat.id); saveExecution(chat.id, execution); res.json({ chat: chatJSON(store.get('SELECT * FROM chats WHERE id=?', chat.id)) }); });
   function removeOrphanedAttachments(candidates, userId) {
@@ -318,7 +321,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       saveExecution(chat.id, execution);
     });
     const controller = new AbortController();
-    active.set(chat.id, { controller, userId: req.user.id, providerIds: [...new Set([...modelRow.channels, ...executionModel.channels].map(row => row.provider_id))] });
+    active.set(chat.id, { controller, userId: req.user.id, routeKeys: [...new Set([modelRow.route_key, executionModel.route_key])], providerIds: [...new Set([...modelRow.channels, ...executionModel.channels].map(row => row.provider_id))] });
     if (action === 'edit') removeOrphanedAttachments(existing.flatMap(row => JSON.parse(row.attachment_ids)), req.user.id);
     const abort = () => controller.abort();
     res.on('close', abort);

@@ -37,13 +37,19 @@ This document describes the HTTP API implemented by `server/app.mjs`, `server/pr
 
 The setup token is shown in the server startup output and is never exposed by a GET endpoint. Passwords must be 12–256 characters; user names have a 60-character limit. Invitation URLs may carry `?invite=...` for the frontend.
 
-`LoginSession` is `{id,deviceName,createdAt,lastSeenAt,expiresAt,current:boolean}`. Device-management endpoints require authentication; mutations require CSRF. The list includes only the caller's unexpired sessions, with the current session first. IDs are random public identifiers, not authentication tokens or token hashes; raw user agents, IP addresses, CSRF secrets and cookie values are never returned in this list. Device names are coarse browser/OS labels and do not identify physical hardware. Recent activity updates at most once per minute.
+`LoginSession` is `{id,deviceName,deviceType:'desktop'|'mobile'|'tablet'|'unknown',loginIp:string|null,geoLocation:string,createdAt,lastSeenAt,expiresAt:string|null,current:boolean}`. Device-management endpoints require authentication; mutations require CSRF. The list includes only the caller's valid sessions, with the current session first. IDs are random public identifiers, not authentication tokens or token hashes; raw user agents, CSRF secrets and cookie values are never returned in this list. Login IP, approximate GeoIP location and device type are snapshots taken at sign-in, not live tracking. Device names are coarse browser/OS labels and do not identify physical hardware. Recent activity updates at most once per minute. Legacy missing metadata is returned as `loginIp:null`, `geoLocation:'未记录'`, `deviceType:'unknown'`.
 
-An account may hold multiple independent seven-day sessions. Signing in with an existing same-account cookie replaces only that browser session; other devices remain signed in. `/auth/logout` deletes only the current session and clears its cookie. Deleting a current session also clears its cookie; a missing or other-user ID returns 404. `logout-others` retains the caller's session and counts only unexpired sessions removed. Password changes revoke other sessions; account disable revokes all of that account's sessions. Revocation blocks subsequent authenticated requests and does not cancel account-wide background tasks. Existing session cookies remain valid after the automatic metadata migration; older unidentified sessions are labeled `原有设备`.
+Administrators may also use `GET /api/admin/users/:id/sessions` to read `{sessions:LoginSession[]}` for a selected user. The endpoint requires the administrator role and returns only that user's valid sessions, never cookie values, token hashes or CSRF secrets. Missing users return 404; disabled users and users without active sessions return an empty list. `current` is true only for the requesting administrator's own current session. This read does not renew or touch the target user's sessions. The administrator UI exposes this read-only view under each member in “成员与邀请”; ordinary users cannot inspect other users' devices. These lists show current sessions rather than a permanent login audit history.
+
+An account may hold multiple independent sessions with no server-side expiry (`expiresAt:null`). A one-time migration promotes still-valid old sessions; expired sessions are not revived. Browser cookies use a 400-day Max-Age and renew on authenticated activity at most once per day, preserving HttpOnly, SameSite=Strict and the deployment's Secure setting. Browser storage can still be cleared or expire independently. Signing in with an existing same-account cookie replaces only that browser session; other devices remain signed in. `/auth/logout` deletes only the current session and clears its cookie. Deleting a current session also clears its cookie; a missing or other-user ID returns 404. `logout-others` retains the caller's session and counts valid sessions removed. Password changes revoke other sessions; account disable revokes all of that account's sessions. Revocation blocks subsequent authenticated requests and does not cancel account-wide background tasks. Existing valid session cookies remain usable after migration; older unidentified sessions are labeled `原有设备`.
+
+IP extraction uses Express's configured trusted-proxy result, normalizes IPv4/IPv6 and does not directly accept arbitrary `X-Forwarded-For` or `X-Real-IP` headers. Cloudflare client-IP headers are accepted only when that result belongs to a verified Cloudflare proxy range. GeoIP lookup uses the bundled local database; no per-login address is sent to third-party lookup services. Nonpublic, missing or unmapped addresses return descriptive local/unknown labels rather than invented locations.
+
+This product includes GeoLite2 data created by [MaxMind](https://www.maxmind.com/), distributed with `geoip-lite` under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
 ## Public models and channel privacy
 
-`GET /api/models` returns `{models:PublicModel[],defaultModelId:string|null}`. Models are filtered by the user's effective plan. There are no built-in demonstration models or simulated production replies.
+`GET /api/models` returns `{models:PublicModel[],defaultModelId:string|null,modelAliases:Record<string,string>}`. Models are filtered by the user's effective plan. Rename aliases map old public IDs to their current IDs and include only targets available to that user; current live model IDs take precedence over aliases. There are no built-in demonstration models or simulated production replies.
 
 ```text
 PublicModel = {
@@ -299,6 +305,7 @@ Unknown settings are rejected. `maxBudgetUsd` applies only to the optional Claud
 | Method and path | Input | Response |
 | --- | --- | --- |
 | GET `/api/admin/users` | — | `{users:User[]}` |
+| GET `/api/admin/users/:id/sessions` | Selected user ID | `{sessions:LoginSession[]}`; read-only current sessions |
 | PATCH `/api/admin/users/:id` | `{disabled?,dailyLimit?:number|null}` | `{user}` |
 | GET `/api/admin/invites` | — | `{invites:[{id,email,expiresAt,usedAt,createdAt}]}` |
 | POST `/api/admin/invites` | `{email?,days?:number}` | `{invite:{id,token,expiresAt}}`, 201 |
@@ -323,8 +330,11 @@ See [MEMBERSHIP.md](MEMBERSHIP.md) for deployment and subscription lifecycle det
 ## Model catalog and versions
 
 - GET `/api/admin/model-groups` returns `{groups:[{name,variants:[{name,modelIds:string[]}]}]}`, including empty drafts.
-- PUT `/api/admin/model-groups` accepts one `{name,variants}` and atomically replaces that parent's mapping. Names are up to 300 characters, at most 100 unique versions per parent and 500 channel records per version. Each upstream record belongs to one version. Selected records become enabled and move to the target parent/version; removed records are disabled and retained with their mapping reset. Empty drafts are excluded from public choices. Involved providers must be idle.
-- Channel-level model endpoints remain available. Provider backups retain assigned version mappings and failure overrides; empty catalog drafts and user quotas require a full data backup.
+- PUT `/api/admin/model-groups` accepts one `{name,variants,originalName?}` and atomically replaces that parent's mapping. When editing, `originalName` identifies the existing parent; a changed `name` renames it in the same transaction. Names are up to 300 characters, at most 100 unique versions per parent and 500 channel records per version. Each upstream record belongs to one version. Selected records become enabled, except that renaming preserves the enabled state of existing bindings retained in their original version. Removed records are disabled and retained with their mapping reset. Empty drafts are excluded from public choices. Involved providers must be idle.
+
+Renaming retains upstream IDs and versions, migrates public model references, default selection, per-user version limits and usage labels, both ends of user routing rules, and allowed model names in free/paid plans and stored membership/application/checkout snapshots. Historical request route labels use the renamed model while request counts, timestamps, token usage and upstream attempt records remain intact. Old public IDs remain accepted through rename aliases, subject to current model availability and plan permissions. The frontend remaps the current selection instead of falling back to another model. Name collisions return 409 without partial changes; a missing original name returns 404. Active related tasks or in-progress payment operations temporarily return 409 so they cannot write back stale routing or plan data.
+
+Channel-level model endpoints remain available. Provider backups retain assigned version mappings and failure overrides; empty catalog drafts and user quotas require a full data backup.
 
 ## Per-user, per-version quota
 

@@ -7,6 +7,7 @@ import FailureOverrideFields, { failureOverrideValues } from './FailureOverrideF
 import type { RunAction } from './ProvidersPanel';
 import { effortLabels } from '../ChatControls';
 import ModelTestResult, { type ModelTestReport, type ModelTestResponse } from './ModelTestResult';
+import { orderedProviders, upstreamModelGroups } from './upstream-model-options';
 function EffortFields({ values = [] }: { values?: string[] }) {
   return <fieldset className="model-effort-fields"><legend>支持的思考强度</legend><p className="field-help">自动始终可用。只勾选此模型和接口实际接受的参数，未勾选的选项不会向用户显示。</p><div className="model-effort-options">{['low', 'medium', 'high', 'xhigh', 'max'].map(value => <label className="checkbox-label compact" key={value}><input type="checkbox" name="reasoningEfforts" value={value} defaultChecked={values.includes(value)}/>{effortLabels[value]} <small>{value}</small></label>)}</div></fieldset>;
 }
@@ -22,16 +23,15 @@ function UpstreamModelsPanel({ models, providers, defaultModelId, run, busy }: {
   const [editing, setEditing] = useState<AdminModel | null>(null);
   const [testReport, setTestReport] = useState<ModelTestReport | null>(null);
   const [query, setQuery] = useState('');
+  const [providerId, setProviderId] = useState('');
   const [adding, setAdding] = useState(false);
   const [testing, setTesting] = useState<AdminModel | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const groups = useMemo(() => {
-    const values = new Map<string, AdminModel[]>();
-    for (const model of models) { const key = model.routeKey || model.modelId; values.set(key, [...(values.get(key) || []), model]); }
-    return [...values.entries()].map(([key, channels]) => ({ key, channels, representative: channels.find(model => model.enabled && model.available !== false) || channels[0] }));
-  }, [models]);
-  const visible = groups.filter(group => group.channels.some(model => `${model.name} ${model.modelId} ${group.key} ${model.providerName || ''} ${providers.find(provider => provider.id === model.providerId)?.name || ''}`.toLowerCase().includes(query.toLowerCase())));
+  const selectedProvider = providers.some(provider => provider.id === providerId) ? providerId : '';
+  const visible = useMemo(() => upstreamModelGroups(models, providers, query, selectedProvider), [models, providers, query, selectedProvider]);
+  const providerOptions = useMemo(() => orderedProviders(providers), [providers]);
+  const visibleChannels = visible.reduce((count, group) => count + group.channels.length, 0);
   async function add(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     const ok = await run('model-add', () => post('/admin/models', { providerId: form.get('providerId'), modelId: form.get('modelId'), name: form.get('name'), routeKey: form.get('routeKey') || undefined, vision: form.get('vision') === 'on', reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form) }), '模型已添加。相同统一模型名的渠道已归入同一模型。');
@@ -72,23 +72,25 @@ function UpstreamModelsPanel({ models, providers, defaultModelId, run, busy }: {
       <label>版本名称<input name="variantName" defaultValue={editing.variantName || ''} maxLength={100} placeholder="默认版本"/></label><EffortFields values={editing.reasoningEfforts}/><CapacityFields model={editing}/><FailureOverrideFields model={editing}/>
       <div className="form-actions"><button className="button primary" disabled={!!busy}>保存</button></div>
     </form>}
-    <div className="search-input bordered"><Search size={16}/><input aria-label="搜索模型或渠道" placeholder="搜索模型或渠道" value={query} onChange={event => setQuery(event.target.value)}/><span className="muted small-text">{groups.length} 个模型</span></div>
-    <p className="muted small-text" style={{ margin: '12px 0 16px' }}>成员只会看到模型名称。各渠道按优先级尝试，支持的思考强度会自动筛选匹配的渠道。</p>
+    <div className="upstream-model-filters"><div className="search-input bordered"><Search size={16}/><input aria-label="搜索模型或渠道" placeholder="搜索模型或渠道" value={query} onChange={event => setQuery(event.target.value)}/></div><label className="upstream-provider-filter"><span>渠道</span><select aria-label="筛选渠道" value={selectedProvider} onChange={event => setProviderId(event.target.value)}><option value="">全部渠道</option>{providerOptions.map(provider => <option key={provider.id} value={provider.id}>{provider.name}{provider.enabled ? '' : '（已停用）'}</option>)}</select></label></div>
+    <div className="upstream-model-results"><span>{visible.length} 个模型 · {visibleChannels} 条渠道记录</span>{(query || selectedProvider) && <button type="button" onClick={() => { setQuery(''); setProviderId(''); }}>清除筛选</button>}</div>
+    <p className="muted small-text" style={{ margin: '12px 0 16px' }}>已启用渠道及模型优先显示。搜索与渠道筛选同时生效，只显示匹配的渠道记录；实际请求仍按渠道优先级尝试。</p>
     {models.length === 0 ? <div className="settings-empty"><div className="empty-icon"><Box size={26}/></div><h4>还没有模型</h4><p>先在“API 连接”中同步模型，<br/>也可以根据服务商文档手动添加。</p></div> : <div className="model-group-list">
       {!visible.length && <p className="menu-empty">没有找到匹配的模型或渠道。</p>}
       {visible.map(group => {
-        const open = expanded.has(group.key) || !!query.trim();
-        const enabled = group.channels.filter(model => model.enabled && model.available !== false).length;
+        const open = expanded.has(group.key) || !!query.trim() || !!selectedProvider;
+        const enabled = group.channels.filter(model => model.enabled && model.available !== false && providers.some(provider => provider.id === model.providerId && provider.enabled)).length;
         const isDefault = group.channels.some(model => model.id === defaultModelId);
         return <section className="model-group" key={group.key}>
           <button className="model-group-heading" aria-expanded={open} onClick={() => setExpanded(current => { const next = new Set(current); next.has(group.key) ? next.delete(group.key) : next.add(group.key); return next; })}>
-            <Box size={19}/><span className="model-group-name"><strong>{group.representative.name}</strong>{isDefault && <span className="default-badge">默认</span>}<small>{group.key}</small></span><span className="model-group-count">{enabled}/{group.channels.length} 渠道启用</span>{open ? <ChevronDown size={17}/> : <ChevronRight size={17}/>}
+            <Box size={19}/><span className="model-group-name"><strong>{group.key}</strong>{isDefault && <span className="default-badge">默认</span>}<small>{group.representative.modelId}</small></span><span className="model-group-count">{enabled}/{group.channels.length} 渠道启用</span>{open ? <ChevronDown size={17}/> : <ChevronRight size={17}/>}
           </button>
           {open && <div className="model-group-channels">{group.channels.map(model => {
-            const providerName = model.providerName || providers.find(provider => provider.id === model.providerId)?.name || '已删除的渠道';
+            const provider = providers.find(provider => provider.id === model.providerId);
+            const providerName = provider?.name || model.providerName || '已删除的渠道';
             return <div className={`model-admin-row ${model.available === false ? 'unavailable' : ''}`} key={model.id}>
               <div className="model-admin-main"><div><strong>{providerName}</strong><small>上游 ID：{model.modelId}</small><small>版本：{model.variantName || '默认版本'}</small><small>思考：{(model.reasoningEfforts?.length ? ['auto', ...model.reasoningEfforts.filter(value => value !== 'auto')] : ['auto']).map(value => effortLabels[value] || value).join('、')}</small></div><button className={`toggle ${model.enabled ? 'on' : ''}`} role="switch" aria-checked={model.enabled} aria-label={`启用 ${providerName} 的 ${model.modelId}`} disabled={!!busy || model.available === false} onClick={() => void run(`toggle-${model.id}`, () => patch(`/admin/models/${model.id}`, { enabled: !model.enabled }))}><span/></button></div>
-              <div className="model-admin-meta"><span className={`model-status ${model.status}`}>{model.available === false ? '上游已不可用' : model.status === 'ok' ? '连接正常' : model.status === 'error' ? '测试失败' : '尚未测试'}</span>
+              <div className="model-admin-meta"><span className={`model-status ${model.status}`}>{provider?.enabled === false ? '渠道已停用' : model.available === false ? '上游已不可用' : model.status === 'ok' ? '连接正常' : model.status === 'error' ? '测试失败' : '尚未测试'}</span>
                 <label className="checkbox-label compact"><input type="checkbox" checked={model.vision} disabled={!!busy} onChange={event => void run(`vision-${model.id}`, () => patch(`/admin/models/${model.id}`, { vision: event.target.checked }))}/><Eye size={12}/>识图</label>
                 <div className="model-row-actions">
                   <button className="icon-button" title="编辑名称、路由、思考强度与容量" aria-label={`编辑 ${providerName} 的模型`} disabled={!!busy} onClick={() => setEditing(model)}><Pencil size={14}/></button>

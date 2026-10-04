@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, errorText, patch, post, remove, stream } from '../api';
 import type { Attachment, Chat, ChatMode, Message, Model, Settings, WorkArtifact, WorkCapabilities } from '../types';
 import { interrupted, mergeSnapshot, upsertMessage } from './chat-state';
+import { remapChatModel, resolveAvailableModelId, selectModelId, type ModelAliases } from './model-selection';
 
 interface ChatView { messages: Message[]; artifacts: WorkArtifact[]; activity: string[]; error: string; routingNotice: string; generating: boolean }
 interface ChatResponse { chat: Chat; messages: Message[]; generating?: boolean }
@@ -31,6 +32,8 @@ export function useChat() {
   const restored = useRef(false);
   const creating = useRef(false);
   const loadSequence = useRef(0);
+  const modelRefreshSequence = useRef(0);
+  const modelCatalog = useRef<{ models: Model[]; aliases: ModelAliases }>({ models: [], aliases: {} });
   const live = useRef(true);
   const currentView = views[selectedId || ''] || emptyView();
   const { messages, artifacts, activity, generating, error, routingNotice } = currentView;
@@ -43,7 +46,8 @@ export function useChat() {
     viewsRef.current = next; setViews(next);
   }, []);
   const setError = useCallback((value: string) => updateView(selectedRef.current, current => ({ ...current, error: value })), [updateView]);
-  const refreshChats = useCallback(async () => { const data = await api<{ chats: Chat[] }>('/chats'); if (live.current) setChats(data.chats); }, []);
+  const normalizeChat = useCallback((chat: Chat) => remapChatModel(chat, modelCatalog.current.models, modelCatalog.current.aliases), []);
+  const refreshChats = useCallback(async () => { const data = await api<{ chats: Chat[] }>('/chats'); if (live.current) setChats(data.chats.map(normalizeChat)); }, [normalizeChat]);
   const refreshCapabilities = useCallback(async () => {
     try {
       const data = await api<WorkCapabilities>('/work/capabilities');
@@ -53,23 +57,27 @@ export function useChat() {
     } catch { if (live.current) setCapabilities({ available: false, reason: '暂时无法连接 Work 服务，请稍后重试。', skills: [] }); }
   }, []);
   const refreshModels = useCallback(async () => {
-    const [data, config] = await Promise.all([api<{ models: Model[]; defaultModelId: string | null }>('/models'), api<{ settings: Settings }>('/settings')]);
-    if (!live.current) return;
+    const sequence = ++modelRefreshSequence.current;
+    const [data, config] = await Promise.all([api<{ models: Model[]; modelAliases?: ModelAliases; defaultModelId: string | null }>('/models'), api<{ settings: Settings }>('/settings')]);
+    if (!live.current || sequence !== modelRefreshSequence.current) return;
+    modelCatalog.current = { models: data.models, aliases: data.modelAliases || {} };
     setModels(data.models); setSettings(config.settings);
-    setModelId(current => data.models.some(model => model.id === current) ? current : data.models.some(model => model.id === data.defaultModelId) ? data.defaultModelId! : data.models[0]?.id || '');
+    setChats(current => current.map(normalizeChat));
+    setModelId(current => selectModelId(data.models, data.modelAliases || {}, current, data.defaultModelId));
     void refreshCapabilities();
-  }, [refreshCapabilities]);
+  }, [normalizeChat, refreshCapabilities]);
   const availableModels = models.filter(model => (model.modes || ['chat']).includes(mode));
   useEffect(() => {
     if (loading || chatLoading || generating) return;
-    if (!availableModels.some(model => model.id === modelId)) setModelId(availableModels[0]?.id || '');
-    const current = availableModels.find(model => model.id === modelId);
+    const resolved = selectModelId(availableModels, modelCatalog.current.aliases, modelId);
+    if (resolved !== modelId) setModelId(resolved);
+    const current = availableModels.find(model => model.id === resolved);
     if (effort !== 'auto' && !current?.reasoningEfforts?.includes(effort)) setEffort('auto');
   }, [models, mode, modelId, effort, loading, chatLoading, generating]);
   useEffect(() => {
     live.current = true;
     Promise.all([refreshChats(), refreshModels()]).catch(err => setError(errorText(err))).finally(() => { if (live.current) setLoading(false); });
-    return () => { live.current = false; for (const task of running.current.values()) task.controller.abort(); };
+    return () => { live.current = false; modelRefreshSequence.current++; for (const task of running.current.values()) task.controller.abort(); };
   }, [refreshChats, refreshModels, setError]);
 
   const refreshArtifacts = useCallback(async (id: string) => {
@@ -85,8 +93,8 @@ export function useChat() {
     if (!data.generating) recovering.current.delete(id);
     updateView(id, current => ({ ...current, messages: local ? current.messages : mergeSnapshot(current.messages, data.messages), generating: local || !!data.generating,
       routingNotice: !local && data.generating ? '正在恢复连接，任务仍在继续…' : local ? current.routingNotice : '' }));
-    if (live.current) setChats(current => [data.chat, ...current.filter(chat => chat.id !== id)]);
-  }, [updateView]);
+    if (live.current) setChats(current => [normalizeChat(data.chat), ...current.filter(chat => chat.id !== id)]);
+  }, [normalizeChat, updateView]);
   const recover = useCallback(async (id: string) => {
     if (polling.current.has(id) || running.current.has(id)) return;
     polling.current.add(id);
@@ -118,14 +126,19 @@ export function useChat() {
     try {
       const data = await api<ChatResponse>(`/chats/${id}`); applySnapshot(id, data);
       if (sequence !== loadSequence.current) return false;
+      if (!resolveAvailableModelId(data.chat.modelId, modelCatalog.current.models, modelCatalog.current.aliases)) {
+        // Another device may have renamed this model since our last catalog refresh.
+        try { await refreshModels(); } catch { /* Existing available options remain usable while offline. */ }
+      }
+      if (!live.current || sequence !== loadSequence.current) return false;
       setMode(data.chat.mode || 'chat'); setEffort(data.chat.effort || 'auto');
       setSkillIds(data.chat.skillIds || []); setWebSearch(!!data.chat.webSearch);
-      const candidates = models.filter(model => (model.modes || ['chat']).includes(data.chat.mode || 'chat'));
-      setModelId(current => candidates.some(model => model.id === data.chat.modelId) ? data.chat.modelId : candidates.some(model => model.id === current) ? current : candidates[0]?.id || '');
+      const candidates = modelCatalog.current.models.filter(model => (model.modes || ['chat']).includes(data.chat.mode || 'chat'));
+      setModelId(current => selectModelId(candidates, modelCatalog.current.aliases, data.chat.modelId, current));
       void refreshArtifacts(id); return true;
     } catch (err) { updateView(id, current => ({ ...current, error: errorText(err) })); return false; }
     finally { if (sequence === loadSequence.current) setChatLoading(false); }
-  }, [applySnapshot, models, refreshArtifacts, updateView]);
+  }, [applySnapshot, refreshModels, refreshArtifacts, updateView]);
   useEffect(() => {
     if (loading || restored.current) return;
     restored.current = true;
@@ -138,7 +151,7 @@ export function useChat() {
     updateView(null, () => emptyView());
   }, [updateView]);
   async function updateChat(id: string, values: Partial<Chat>) {
-    try { const data = await patch<{ chat: Chat }>(`/chats/${id}`, values); setChats(current => current.map(chat => chat.id === id ? data.chat : chat)); if (id === selectedRef.current && values.archived) newChat(); }
+    try { const data = await patch<{ chat: Chat }>(`/chats/${id}`, values); setChats(current => current.map(chat => chat.id === id ? normalizeChat(data.chat) : chat)); if (id === selectedRef.current && values.archived) newChat(); }
     catch (err) { setError(errorText(err)); }
   }
   async function deleteChat(id: string) {
@@ -162,7 +175,7 @@ export function useChat() {
       if (!chatId) {
         const result = await post<{ chat: Chat }>('/chats', options);
         chatId = result.chat.id; onChatCreated?.(chatId); running.current.set(chatId, task);
-        updateView(chatId, current => ({ ...current, generating: true })); setChats(current => [result.chat, ...current]);
+        updateView(chatId, current => ({ ...current, generating: true })); setChats(current => [normalizeChat(result.chat), ...current]);
         if (sequence === loadSequence.current && selectedRef.current === null) { selectedRef.current = chatId; setSelectedId(chatId); sessionStorage.setItem('apirouter-selected-chat', chatId); }
         updateView(null, current => ({ ...current, generating: false })); creating.current = false;
       }
@@ -171,7 +184,7 @@ export function useChat() {
       await stream(`/chats/${id}/${action}`, body, task.controller.signal, (event, data) => {
         if (event === 'meta') {
           accepted = true;
-          if (data.chat) setChats(current => [data.chat!, ...current.filter(chat => chat.id !== data.chat!.id)]);
+          if (data.chat) setChats(current => [normalizeChat(data.chat!), ...current.filter(chat => chat.id !== data.chat!.id)]);
           if (data.assistantMessage) { task.assistantId = data.assistantMessage.id; task.text = data.assistantMessage.content; task.reasoning = data.assistantMessage.reasoning || ''; }
           updateView(id, current => {
             let previous = current.messages;

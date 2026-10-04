@@ -4,6 +4,7 @@ import type { Provider } from '../../types';
 import { patch, post, remove } from '../../api';
 import ProviderTools, { ProviderBalance } from './ProviderTools';
 import ResponsesProfileField from './ResponsesProfileField';
+import { orderedProviders } from './upstream-model-options';
 export type RunAction = (key: string, action: () => Promise<unknown>, success?: string) => Promise<boolean>;
 export default function ProvidersPanel({ providers, run, busy }: { providers: Provider[]; run: RunAction; busy: string }) {
   const [editing, setEditing] = useState<Provider | 'new' | null>(null), [reveal, setReveal] = useState(false), [deleting, setDeleting] = useState<string | null>(null), [search, setSearch] = useState('');
@@ -18,7 +19,7 @@ export default function ProvidersPanel({ providers, run, busy }: { providers: Pr
     const ok = await run('provider-save', () => item ? patch(`/admin/providers/${item.id}`, body) : post('/admin/providers', body), '连接设置已保存。现在可以同步并测试模型。');
     if (ok) { setEditing(null); setReveal(false); }
   }
-  const visible = providers.filter(provider => `${provider.name} ${provider.baseUrl}`.toLowerCase().includes(search.toLowerCase()));
+  const visible = orderedProviders(providers).filter(provider => `${provider.name} ${provider.baseUrl}`.toLowerCase().includes(search.trim().toLowerCase()));
   return <div className="admin-section">
     <div className="section-title"><div><h3>API 连接</h3><p>集中管理渠道和密钥，普通用户只看到统一模型。</p></div><button className="button primary small" onClick={() => edit('new')}><Plus size={15}/>添加连接</button></div>
     <p className="provider-workflow"><span>① 添加或导入连接</span><span>→</span><span>② 同步模型</span><span>→</span><span>③ 在模型页测试并启用</span></p>

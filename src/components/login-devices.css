@@ -7,5 +7,8 @@
 .login-device-icon{display:flex;align-items:center;justify-content:center;flex:none;width:34px;height:34px;border-radius:9px;background:var(--hover);color:var(--muted)}
 .login-device-details{min-width:0;flex:1}.login-device-name{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px}.login-device-name strong{font-size:13px;font-weight:500;overflow-wrap:anywhere}
 .login-device-details>span{display:block;font-size:11px;color:var(--muted);line-height:1.85;overflow-wrap:anywhere}.login-device-revoke{flex-shrink:0}
+.login-device-ip{font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.login-devices>.login-devices-location-note{margin-top:-8px}
 .login-devices-footer{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-top:14px}.login-devices-footer>span{font-size:11px;color:var(--muted)}
-@media(max-width:580px){.login-device{padding:13px 11px;gap:9px;flex-wrap:wrap}.login-device-details{min-width:140px}.login-device-icon{width:28px;height:28px}.login-device-revoke{margin-left:37px}.login-devices-footer{gap:10px}.login-devices-footer .button{font-size:12px}}
+.member-login-devices{width:100%;min-width:0;padding-left:45px}.member-login-devices>summary{cursor:pointer;color:var(--muted);font-size:13px;padding:10px 0}.member-login-devices>.login-devices{margin-top:0;padding-top:8px;border-top:0}.member-login-devices .login-devices-heading h4{min-width:0;overflow-wrap:anywhere}.member-login-devices .login-devices-heading>.button{flex-shrink:0}
+@media(max-width:580px){.member-login-devices{padding-left:0}}
+@media(max-width:580px){.login-device{padding:13px 11px;gap:9px;flex-wrap:wrap}.login-device-details{min-width:0;flex-basis:calc(100% - 37px)}.login-device-icon{width:28px;height:28px}.login-device-revoke{margin-left:37px}.login-devices-footer{gap:10px}.login-devices-footer .button{font-size:12px}}
