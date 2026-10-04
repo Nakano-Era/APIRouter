@@ -11,7 +11,7 @@ import { createRouter } from './router.mjs';
 import { createBilling } from './billing.mjs';
 import { createWorkService } from './work.mjs';
 import { createProviderTools } from './provider-tools.mjs';
-import { continuationInstruction, continuationAppender, isContinuationRequest, checkContext } from './continuation.mjs';
+import { continuationAppender, isContinuationRequest, checkContext } from './continuation.mjs';
 import { reasoningSplitter } from './reasoning.mjs';
 import { responseProfiles } from './responses-compat.mjs';
 import { createModelCatalog, modelRouteId, variantName } from './model-catalog.mjs';
@@ -19,6 +19,9 @@ import { createUserModelAccess } from './user-model-access.mjs';
 import { createChatExport } from './chat-export.mjs';
 import { createUserModelRouting } from './user-model-routing.mjs';
 import { createSessionManager } from './sessions.mjs';
+import { executionTargets, continuationMessages, mayFallback } from './generation-fallback.mjs';
+import { createAnnouncements } from './announcements.mjs';
+import { createApiExports } from './api-exports.mjs';
 
 const protocols = new Set(['openai-chat', 'openai-responses', 'anthropic']);
 const effortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -54,6 +57,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   const setupToken = store.get('SELECT id FROM users LIMIT 1') ? null : (suppliedSetupToken || process.env.SETUP_TOKEN || randomBytes(24).toString('base64url'));
   const publicOrigin = process.env.PUBLIC_ORIGIN ? new URL(process.env.PUBLIC_ORIGIN).origin : null;
   const billing = createBilling({ store, publicOrigin, stripeFactory });
+  const apiExports = createApiExports({ store });
   const catalog = createModelCatalog({ store, ensureProviderIdle, ensureRenameIdle: routeKey => {
     if ([...active.values()].some(job => job.routeKeys?.includes(routeKey))) throw fail(409, '此模型还有进行中的任务，请等待完成或停止后再改名。');
     billing.ensureModelRenameIdle();
@@ -77,6 +81,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     next();
   });
   billing.mountWebhook(app);
+  apiExports.mountPublic(app);
   app.use(['/api/admin/providers/parse', '/api/admin/providers/import'], express.json({ limit: '8mb' }));
   // Authenticate before buffering long prompts. Other endpoints retain their
   // smaller JSON limit, including public sign-in and setup requests.
@@ -97,7 +102,9 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   const csrf = (req, _res, next) => ['GET', 'HEAD', 'OPTIONS'].includes(req.method) || safeEqual(req.get('x-csrf-token'), req.session?.csrf) ? next() : next(fail(403, '登录状态已更新，请刷新页面后重试。', 'CSRF_INVALID'));
   const admin = (req, _res, next) => req.user?.role === 'admin' ? next() : next(fail(403, '此操作仅限管理员。'));
   sessions.registerRoutes(app, { auth, csrf, admin });
+  apiExports.registerRoutes(app, { auth, admin, csrf });
   billing.registerRoutes(app, { auth, admin, csrf });
+  createAnnouncements({ store }).registerRoutes(app, { auth, admin, csrf });
   work.registerRoutes(app, { auth, admin, csrf });
   createProviderTools({ store, providerJSON, ensureProviderIdle }).registerRoutes(app, { auth, admin, csrf });
   catalog.registerRoutes(app, { auth, admin, csrf });
@@ -169,7 +176,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   function providerForModel(row) { const provider = store.get('SELECT * FROM providers WHERE id=?', row.provider_id); if (!provider?.enabled) throw fail(400, '该模型的接口已停用。'); return { ...providerJSON(provider), apiKey: store.decrypt(provider.encrypted_key) }; }
   function providerBusy(providerId) { return syncing.has(providerId) || [...testing.values()].includes(providerId) || [...active.values()].some(job => job.providerIds?.includes(providerId)); }
   function ensureProviderIdle(providerId) { if (providerBusy(providerId)) throw fail(409, '该接口正在处理请求，请等待请求完成或停止回复后修改。'); }
-  function modelJSON(row) { return { id: row.id, providerId: row.provider_id, modelId: row.model_id, name: row.name, routeKey: row.route_key, variantName: row.variant_name || '', contextWindow: row.context_window ?? null, maxOutputTokens: row.max_output_tokens ?? null, reasoningEfforts: JSON.parse(row.reasoning_efforts || '[]'), failureProtectionEnabled: row.failure_protection_enabled == null ? null : !!row.failure_protection_enabled, failureThreshold: row.failure_threshold_override ?? null, cooldownSeconds: row.cooldown_seconds_override ?? null, failureCount: row.failure_count, cooldownUntil: row.cooldown_until, enabled: !!row.enabled, vision: !!row.vision, available: !!row.available, providerName: row.provider_name || store.get('SELECT name FROM providers WHERE id=?', row.provider_id)?.name, status: row.status, lastCheckedAt: row.last_checked_at, error: row.error }; }
+  function modelJSON(row) { return { id: row.id, providerId: row.provider_id, modelId: row.model_id, name: row.name, routeKey: row.route_key, variantName: row.variant_name || '', contextWindow: row.context_window ?? null, maxOutputTokens: row.max_output_tokens ?? null, reasoningEfforts: JSON.parse(row.reasoning_efforts || '[]'), failureProtectionEnabled: row.failure_protection_enabled == null ? null : !!row.failure_protection_enabled, failureThreshold: row.failure_threshold_override ?? null, cooldownSeconds: row.cooldown_seconds_override ?? null, retries: row.retries_override ?? null, failureCount: row.failure_count, cooldownUntil: row.cooldown_until, enabled: !!row.enabled, vision: !!row.vision, available: !!row.available, providerName: row.provider_name || store.get('SELECT name FROM providers WHERE id=?', row.provider_id)?.name, status: row.status, lastCheckedAt: row.last_checked_at, error: row.error }; }
   const routeId = modelRouteId;
   function routeGroups() {
     const groups = new Map();
@@ -262,15 +269,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     const execution = executionOptions(req.body, chat);
     if (!modelRow.channels.some(row => execution.effort === 'auto' || JSON.parse(row.reasoning_efforts || '[]').includes(execution.effort))) throw fail(400, '当前模型不支持所选模式或思考强度，请选择自动强度或其他模型。');
     const mapping = userRouting.resolve(req.user.id, modelRow.route_key, modelRow.variant_name);
-    let executionModel = modelRow;
-    if (mapping) {
-      try { executionModel = usableModel(routeId(mapping.targetRouteKey, mapping.targetVariantName)); }
-      catch { throw fail(503, '当前模型暂时不可用，请稍后重试或联系管理员。', 'MODEL_UNAVAILABLE'); }
-    }
-    const actualExecution = { ...execution, effort: mapping ? mapping.effort : execution.effort };
-    const compatible = executionModel.channels.filter(row => actualExecution.effort === 'auto' || JSON.parse(row.reasoning_efforts || '[]').includes(actualExecution.effort));
-    if (!compatible.length) throw fail(503, '当前模型暂时不可用，请稍后重试或联系管理员。', 'MODEL_UNAVAILABLE');
-    if ((execution.mode === 'work' || compatible.every(row => row.runtime === 'claude-code')) && !work.isConfigured()) throw fail(503, '工作沙箱尚未配置，请先完成 Work 部署或选择直接 API 的 Chat 模式。');
+    const targets = executionTargets(mapping, modelRow, execution.effort);
     const settings = store.settings();
     const dailyLimit = billing.effectiveEntitlement(req.user.id).dailyLimit;
     const count = store.get('SELECT COUNT(*) AS count FROM requests WHERE user_id=? AND created_at>=?', req.user.id, `${now().slice(0, 10)}T00:00:00.000Z`).count;
@@ -297,16 +296,32 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       if (userIndex === -1) throw fail(400, '请先发送一条消息。');
       selected = selected.slice(0, userIndex + 1);
     }
-    const input = modelMessages(selected, req.user.id, { ...model, vision: !!model.vision && !!executionModel.vision });
-    if (continuing) input.push({ role: 'user', content: continuationInstruction, attachments: [] });
-    const resumeCandidates = continuing && work.continuationCandidates ? work.continuationCandidates({ userId: req.user.id, chatId: chat.id, assistantId: tail.id }, compatible) : compatible;
-    if (!resumeCandidates.length) throw fail(409, '原工作记录对应的模型或协议当前不可用，请恢复原模型渠道后继续；已保存的内容和文件会保留。', 'WORK_CHECKPOINT_INCOMPATIBLE');
-    const capacity = checkContext(input, settings.systemPrompt, resumeCandidates, settings.maxOutputTokens);
-    // Unknown metadata must not impose a guessed context ceiling. Prefer a
-    // declared fitting channel; the upstream enforces the actual token count.
-    const candidateIds = capacity.compatible.length ? capacity.compatible.map(row => row.id) : resumeCandidates.map(row => row.id);
+    const input = modelMessages(selected, req.user.id, model);
     const assistantId = continuing ? tail.id : id(), requestId = id();
     const priorContent = continuing ? tail.content : '';
+    const needsVision = input.some(message => message.attachments?.some(file => file.kind === 'image'));
+    function prepareTarget(target, messages, resume, fallback, committedTools = false, fallbackFrom, resumeText = priorContent) {
+      let executionModel;
+      try { executionModel = usableModel(routeId(target.routeKey, target.variantName)); }
+      catch { throw fail(503, '当前模型暂时不可用，请稍后重试或联系管理员。', 'MODEL_UNAVAILABLE'); }
+      let compatible = executionModel.channels.filter(row => (target.effort === 'auto' || JSON.parse(row.reasoning_efforts || '[]').includes(target.effort)) && (!needsVision || row.vision));
+      if (!compatible.length) throw fail(503, '当前模型没有支持本次图片输入或思考强度的可用渠道。', 'MODEL_UNAVAILABLE');
+      if ((execution.mode === 'work' || compatible.every(row => row.runtime === 'claude-code')) && !work.isConfigured()) throw fail(503, '工作沙箱尚未配置，请先完成 Work 部署或选择直接 API 的 Chat 模式。', 'WORK_UNAVAILABLE');
+      const context = { userId: req.user.id, chatId: chat.id, assistantId, continuation: resume, fallback, committedTools, fallbackFrom, resumeText };
+      if (resume && work.continuationCandidates) compatible = work.continuationCandidates(context, compatible);
+      if (!compatible.length) throw fail(409, '原工作记录对应的模型或协议当前不可用，请恢复原模型渠道后继续；已保存的内容和文件会保留。', 'WORK_CHECKPOINT_INCOMPATIBLE');
+      const capacity = checkContext(messages, settings.systemPrompt, compatible, settings.maxOutputTokens);
+      if (mapping && !capacity.compatible.length) throw fail(413, '此方案的上下文容量不足，已有内容会保留。', 'MODEL_CONTEXT_LIMIT');
+      return { executionModel, compatible, candidateIds: (capacity.compatible.length ? capacity.compatible : compatible).map(row => row.id), context };
+    }
+    const initialInput = continuationMessages(input, priorContent, continuing, continuing);
+    const plans = targets.map((target, index) => {
+      try { return { target, ...prepareTarget(target, initialInput, continuing, continuing && index > 0) }; }
+      catch (error) { return { target, error }; }
+    });
+    const firstPlan = plans.find(plan => !plan.error);
+    if (!firstPlan) throw plans.at(-1).error;
+    const executionModel = firstPlan.executionModel, actualExecution = { ...execution, effort: firstPlan.target.effort };
     store.transaction(() => {
       modelAccess.assertCanGenerate(req.user.id, modelRow.route_key, modelRow.variant_name, { at: timestamp });
       if (action === 'edit') { const edited = existing.find(m => m.id === req.body.messageId); store.run('DELETE FROM messages WHERE chat_id=? AND rowid>=?', chat.id, edited.sort_index); }
@@ -321,7 +336,8 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       saveExecution(chat.id, execution);
     });
     const controller = new AbortController();
-    active.set(chat.id, { controller, userId: req.user.id, routeKeys: [...new Set([modelRow.route_key, executionModel.route_key])], providerIds: [...new Set([...modelRow.channels, ...executionModel.channels].map(row => row.provider_id))] });
+    const plannedChannels = targets.flatMap(target => store.all('SELECT provider_id FROM models WHERE route_key=? AND variant_name=?', target.routeKey, target.variantName));
+    active.set(chat.id, { controller, userId: req.user.id, routeKeys: [...new Set([modelRow.route_key, ...targets.map(target => target.routeKey)])], providerIds: [...new Set([...modelRow.channels, ...plannedChannels].map(row => row.provider_id))] });
     if (action === 'edit') removeOrphanedAttachments(existing.flatMap(row => JSON.parse(row.attachment_ids)), req.user.id);
     const abort = () => controller.abort();
     res.on('close', abort);
@@ -329,20 +345,18 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     res.flushHeaders();
     const send = (event, data) => { if (!res.destroyed && !res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
     const heartbeat = setInterval(() => { if (!res.destroyed) res.write(': keepalive\n\n'); }, 15_000);
-    const usesRunner = execution.mode === 'work' || compatible.some(row => row.runtime === 'claude-code');
-    const taskSeconds = usesRunner ? Math.min(1800, Math.max(30, Number(settings.workSettings?.timeoutSeconds) || 600)) + 60 : Math.min(21600, Math.max(60, Number(process.env.CHAT_TIMEOUT_SECONDS) || 3600));
-    const timeout = setTimeout(() => controller.abort(), taskSeconds * 1000);
+    let timeout;
     send('meta', { ...(userMessage ? { userMessage: messageJSON(userMessage) } : {}), assistantMessage: messageJSON(store.get('SELECT * FROM messages WHERE id=?', assistantId)), chat: chatJSON(store.get('SELECT * FROM chats WHERE id=?', chat.id)) });
     let content = priorContent, reasoning = continuing ? tail.reasoning || '' : '';
     let contentBytes = Buffer.byteLength(content) + Buffer.byteLength(reasoning);
-    const appender = continuationAppender(priorContent);
-    const splitter = reasoningSplitter();
+    let appender = continuationAppender(priorContent);
+    let splitter = reasoningSplitter();
     let reasoningStarted = false;
     function append(text, kind = 'content') {
       if (!text) return;
       if (kind === 'reasoning' && !reasoningStarted && reasoning) text = `\n\n${text}`;
       const deltaBytes = Buffer.byteLength(text);
-      if (contentBytes + deltaBytes > 32 * 1024 * 1024) throw fail(413, '已保存的回答与思考过程达到 32 MB 安全上限。');
+      if (contentBytes + deltaBytes > 32 * 1024 * 1024) throw fail(413, '已保存的回答与思考过程达到 32 MB 安全上限。', 'LOCAL_OUTPUT_LIMIT');
       // Append-only chunks make every displayed byte durable without rewriting
       // a growing multi-megabyte answer on every token.
       store.run('INSERT INTO message_chunks(message_id,content,kind) VALUES (?,?,?)', assistantId, text, kind);
@@ -354,23 +368,65 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     function separate(events) { for (const event of events) append(event.type === 'reasoning' ? event.text : appender.push(event.text), event.type === 'reasoning' ? 'reasoning' : 'content'); }
     function finishMessage(status, error = null) { store.transaction(() => { store.run('UPDATE messages SET content=?,reasoning=?,status=?,error=? WHERE id=?', content, reasoning, status, error, assistantId); store.run('DELETE FROM message_chunks WHERE message_id=?', assistantId); }); }
     try {
-      for await (const event of router.run({ routeKey: executionModel.route_key, variantName: executionModel.variant_name, candidateIds, messages: input, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal: controller.signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...actualExecution, context: { userId: req.user.id, chatId: chat.id, assistantId, continuation: continuing, resumeText: priorContent } })) {
-        if (event.type === 'routing') send('routing', { message: '正在重新连接，请稍候…' });
-        if (event.type === 'activity') send('activity', { label: event.label });
-        if (event.type === 'artifact') send('artifact', { artifact: event.artifact });
-        if (event.type === 'selected') store.run('UPDATE messages SET source_provider=?,source_model=? WHERE id=?', event.providerName, event.upstreamModelId, assistantId);
-        if (event.type === 'delta') separate(splitter.push(event.text));
-        if (event.type === 'reasoning') append(event.text, 'reasoning');
-        if (event.type === 'usage') store.run('UPDATE requests SET input_tokens=?,output_tokens=? WHERE id=?', event.inputTokens || 0, event.outputTokens || 0, requestId);
+      let completed = false, lastError, attempted = false, committedTools = false, fallbackFrom;
+      for (const [index, plan] of plans.entries()) {
+        controller.signal.throwIfAborted();
+        const resumed = continuing || attempted;
+        const attemptInput = continuationMessages(input, content, continuing, resumed);
+        let prepared;
+        try { prepared = prepareTarget(plan.target, attemptInput, resumed, attempted || (continuing && index > 0), committedTools, fallbackFrom, content); }
+        catch (error) {
+          lastError = error;
+          store.run('INSERT INTO route_attempts(id,request_id,model_id,outcome,error,created_at,execution_route_key,execution_variant_name,execution_effort) VALUES (?,?,?,?,?,?,?,?,?)', id(), requestId, routeId(plan.target.routeKey, plan.target.variantName), 'skipped', sanitizeUpstreamError(error), now(), plan.target.routeKey, plan.target.variantName, plan.target.effort);
+          if (!mayFallback(error, controller.signal)) throw error;
+          continue;
+        }
+        const { compatible, candidateIds, context } = prepared;
+        if (index > 0) send('routing', { message: content ? '连接中断，正在接续已保存的回答…' : '正在重新连接，请稍候…' });
+        const beforeContent = content;
+        appender = continuationAppender(content); splitter = reasoningSplitter(); reasoningStarted = false;
+        const attemptController = new AbortController();
+        const signal = AbortSignal.any([controller.signal, attemptController.signal]);
+        const usesRunner = execution.mode === 'work' || compatible.some(row => row.runtime === 'claude-code');
+        const taskSeconds = usesRunner ? Math.min(1800, Math.max(30, Number(settings.workSettings?.timeoutSeconds) || 600)) + 60 : Math.min(21600, Math.max(60, Number(process.env.CHAT_TIMEOUT_SECONDS) || 3600));
+        timeout = setTimeout(() => attemptController.abort(fail(504, '当前方案响应超时，已保存已有内容。', 'UPSTREAM_TIMEOUT')), taskSeconds * 1000);
+        store.run('UPDATE requests SET execution_route_key=?,execution_variant_name=?,execution_effort=? WHERE id=?', plan.target.routeKey, plan.target.variantName, plan.target.effort, requestId);
+        let reportedInput = 0, reportedOutput = 0;
+        attempted = true;
+        try {
+          for await (const event of router.run({ routeKey: plan.target.routeKey, variantName: plan.target.variantName, candidateIds, messages: attemptInput, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...execution, effort: plan.target.effort, context: { ...context, resumeText: content } })) {
+            if (event.type === 'routing') send('routing', { message: '正在重新连接，请稍候…' });
+            if (event.type === 'activity') { if (event.committed) committedTools = true; send('activity', { label: event.label }); }
+            if (event.type === 'artifact') { committedTools = true; send('artifact', { artifact: event.artifact }); }
+            if (event.type === 'selected') {
+              store.run('UPDATE messages SET source_provider=?,source_model=? WHERE id=?', event.providerName, event.upstreamModelId, assistantId);
+              const channel = store.get('SELECT p.runtime,p.protocol FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=?', event.modelId);
+              fallbackFrom = { runtime: channel?.runtime || 'api', protocol: channel?.protocol, modelId: event.upstreamModelId };
+            }
+            if (event.type === 'delta') separate(splitter.push(event.text));
+            if (event.type === 'reasoning') append(event.text, 'reasoning');
+            if (event.type === 'usage') {
+              const inputTokens = Math.max(reportedInput, event.inputTokens || 0), outputTokens = Math.max(reportedOutput, event.outputTokens || 0);
+              store.run('UPDATE requests SET input_tokens=input_tokens+?,output_tokens=output_tokens+? WHERE id=?', inputTokens - reportedInput, outputTokens - reportedOutput, requestId);
+              reportedInput = inputTokens; reportedOutput = outputTokens;
+            }
+          }
+          separate(splitter.finish()); append(appender.finish());
+          if (!content.trim() || content === beforeContent) throw fail(502, '上游没有返回新的可显示文字，已保留原内容，可以继续生成。', 'EMPTY_UPSTREAM_OUTPUT');
+          completed = true; break;
+        } catch (error) {
+          try { separate(splitter.finish()); append(appender.finish()); } catch { /* Preserve committed text. */ }
+          lastError = error;
+          if (!mayFallback(error, controller.signal)) throw error;
+        } finally { clearTimeout(timeout); }
       }
-      separate(splitter.finish()); append(appender.finish());
-      if (!content.trim() || content === priorContent) throw fail(502, '上游没有返回新的可显示文字，已保留原内容，可以继续生成。');
+      if (!completed) throw lastError || fail(503, '所有已配置的回复方案均未完成，已保存内容可以继续生成。', 'ROUTE_EXHAUSTED');
       finishMessage('complete');
       store.run("UPDATE requests SET status='complete' WHERE id=?", requestId);
       send('done', { message: messageJSON(store.get('SELECT * FROM messages WHERE id=?', assistantId)) });
     } catch (error) {
       try { separate(splitter.finish()); append(appender.finish()); } catch { /* Preserve committed text when the safety ceiling was reached. */ }
-      const stopped = controller.signal.aborted || error.name === 'AbortError';
+      const stopped = controller.signal.aborted;
       const errorText = stopped ? null : req.user.role === 'admin' ? sanitizeUpstreamError(error) : '本次回答未完成，请稍后重试或联系管理员。';
       finishMessage(stopped ? 'stopped' : 'error', errorText);
       store.run('UPDATE requests SET status=? WHERE id=?', stopped ? 'stopped' : 'error', requestId);
@@ -444,13 +500,14 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       enabled: body.failureProtectionEnabled === undefined ? row.failure_protection_enabled ?? null : body.failureProtectionEnabled === null ? null : bool(body.failureProtectionEnabled, '失败冷却'),
       threshold: body.failureThreshold === undefined ? row.failure_threshold_override ?? null : body.failureThreshold === null ? null : number(body.failureThreshold, 1, 1000, '连续失败阈值'),
       seconds: body.cooldownSeconds === undefined ? row.cooldown_seconds_override ?? null : body.cooldownSeconds === null ? null : number(body.cooldownSeconds, 1, 2592000, '冷却秒数'),
+      retries: body.retries === undefined ? row.retries_override ?? null : body.retries === null ? null : number(body.retries, 0, 10, '模型失败重试次数'),
     };
   }
   app.post('/api/admin/models', (req, res) => {
     const provider = getProvider(req.body.providerId), modelId = requiredText(req.body.modelId, '模型 ID', 300);
     if (store.get('SELECT id FROM models WHERE provider_id=? AND model_id=?', provider.id, modelId)) throw fail(409, '该模型已存在。');
     const modelInternalId = id(), routeKey = req.body.routeKey ? requiredText(req.body.routeKey, '统一模型名', 300) : modelId, protection = modelProtection(req.body);
-    store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,vision,reasoning_efforts,context_window,max_output_tokens,manual,variant_name,catalog_assigned,failure_protection_enabled,failure_threshold_override,cooldown_seconds_override) VALUES (?,?,?,?,?,?,?,?,?,1,?,1,?,?,?)', modelInternalId, provider.id, modelId, cleanText(req.body.name, 300) || modelId, routeKey, req.body.vision === undefined ? 0 : bool(req.body.vision, '图片输入'), JSON.stringify(req.body.reasoningEfforts === undefined ? initialEfforts(modelId) : reasoningEfforts(req.body.reasoningEfforts)), req.body.contextWindow === undefined ? null : capacityValue(req.body.contextWindow, '上下文容量', 1024, 10_000_000), req.body.maxOutputTokens === undefined ? null : capacityValue(req.body.maxOutputTokens, '模型最大输出', 128, 1_000_000), variantName(req.body.variantName), protection.enabled, protection.threshold, protection.seconds);
+    store.run('INSERT INTO models(id,provider_id,model_id,name,route_key,vision,reasoning_efforts,context_window,max_output_tokens,manual,variant_name,catalog_assigned,failure_protection_enabled,failure_threshold_override,cooldown_seconds_override,retries_override) VALUES (?,?,?,?,?,?,?,?,?,1,?,1,?,?,?,?)', modelInternalId, provider.id, modelId, cleanText(req.body.name, 300) || modelId, routeKey, req.body.vision === undefined ? 0 : bool(req.body.vision, '图片输入'), JSON.stringify(req.body.reasoningEfforts === undefined ? initialEfforts(modelId) : reasoningEfforts(req.body.reasoningEfforts)), req.body.contextWindow === undefined ? null : capacityValue(req.body.contextWindow, '上下文容量', 1024, 10_000_000), req.body.maxOutputTokens === undefined ? null : capacityValue(req.body.maxOutputTokens, '模型最大输出', 128, 1_000_000), variantName(req.body.variantName), protection.enabled, protection.threshold, protection.seconds, protection.retries);
     res.status(201).json({ model: modelJSON(store.get('SELECT * FROM models WHERE id=?', modelInternalId)) });
   });
   app.patch('/api/admin/models/:id', (req, res) => {
@@ -461,7 +518,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     if (req.body.isDefault === true && !enabled) throw fail(400, '请先启用该模型再设为默认。');
     store.transaction(() => {
       store.run('UPDATE models SET name=?,enabled=?,vision=?,route_key=?,reasoning_efforts=?,context_window=?,max_output_tokens=? WHERE id=?', req.body.name === undefined ? row.name : requiredText(req.body.name, '显示名称', 300), enabled, req.body.vision === undefined ? row.vision : bool(req.body.vision, '图片输入'), routeKey, req.body.reasoningEfforts === undefined ? row.reasoning_efforts : JSON.stringify(reasoningEfforts(req.body.reasoningEfforts)), req.body.contextWindow === undefined ? row.context_window : capacityValue(req.body.contextWindow, '上下文容量', 1024, 10_000_000), req.body.maxOutputTokens === undefined ? row.max_output_tokens : capacityValue(req.body.maxOutputTokens, '模型最大输出', 128, 1_000_000), row.id);
-      store.run('UPDATE models SET variant_name=?,catalog_assigned=1,failure_protection_enabled=?,failure_threshold_override=?,cooldown_seconds_override=? WHERE id=?', version, protection.enabled, protection.threshold, protection.seconds, row.id);
+      store.run('UPDATE models SET variant_name=?,catalog_assigned=1,failure_protection_enabled=?,failure_threshold_override=?,cooldown_seconds_override=?,retries_override=? WHERE id=?', version, protection.enabled, protection.threshold, protection.seconds, protection.retries, row.id);
       if (protection.enabled !== row.failure_protection_enabled || protection.threshold !== row.failure_threshold_override || protection.seconds !== row.cooldown_seconds_override) store.run('UPDATE models SET failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1 WHERE id=?', row.id);
       if (req.body.isDefault === true) { usableModel(row.id); store.setSetting('defaultModelId', row.id); }
       if (!enabled && store.settings().defaultModelId === row.id) store.setSetting('defaultModelId', null);
@@ -470,8 +527,8 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   });
   app.delete('/api/admin/models/:id', (req, res) => { const model = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (model) ensureProviderIdle(model.provider_id); store.run('DELETE FROM models WHERE id=?', req.params.id); if (store.settings().defaultModelId === req.params.id) store.setSetting('defaultModelId', null); res.json({ ok: true }); });
   app.post('/api/admin/models/:id/reset-health', (req, res) => { const model = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (!model) throw fail(404, '模型不存在。'); ensureProviderIdle(model.provider_id); store.run("UPDATE models SET failure_count=0,cooldown_until=NULL,failure_epoch=failure_epoch+1,status='untested',error=NULL WHERE id=?", model.id); res.json({ model: modelJSON(store.get('SELECT * FROM models WHERE id=?', model.id)) }); });
-  app.get('/api/admin/routing-logs', (_req, res) => res.json({ attempts: store.all('SELECT a.*,p.name AS provider_name,m.model_id AS upstream_model_id,r.user_id,r.route_key AS source_route_key,r.variant_name AS source_variant_name,r.execution_route_key,r.execution_variant_name,r.requested_effort,r.execution_effort,r.user_routing_applied FROM route_attempts a LEFT JOIN providers p ON p.id=a.provider_id LEFT JOIN models m ON m.id=a.model_id LEFT JOIN requests r ON r.id=a.request_id ORDER BY a.rowid DESC LIMIT 200').map(row => ({ id: row.id, requestId: row.request_id, providerName: row.provider_name || '已删除渠道', modelId: row.upstream_model_id || row.model_id, outcome: row.outcome, error: row.error, createdAt: row.created_at, hasDetail: !!row.encrypted_detail,
-    userId: row.user_id ?? null, sourceRouteKey: row.source_route_key ?? null, sourceVariantName: row.source_variant_name ?? null, executionRouteKey: row.execution_route_key ?? null, executionVariantName: row.execution_variant_name ?? null, requestedEffort: row.requested_effort ?? null, executionEffort: row.execution_effort ?? null, userRoutingApplied: !!row.user_routing_applied })) }));
+  app.get('/api/admin/routing-logs', (_req, res) => res.json({ attempts: store.all('SELECT a.*,a.execution_route_key AS attempt_route_key,a.execution_variant_name AS attempt_variant_name,a.execution_effort AS attempt_effort,p.name AS provider_name,m.model_id AS upstream_model_id,r.user_id,r.route_key AS source_route_key,r.variant_name AS source_variant_name,r.execution_route_key,r.execution_variant_name,r.requested_effort,r.execution_effort,r.user_routing_applied FROM route_attempts a LEFT JOIN providers p ON p.id=a.provider_id LEFT JOIN models m ON m.id=a.model_id LEFT JOIN requests r ON r.id=a.request_id ORDER BY a.rowid DESC LIMIT 200').map(row => ({ id: row.id, requestId: row.request_id, providerName: row.provider_name || (row.outcome === 'skipped' ? '未调用渠道' : '已删除渠道'), modelId: row.upstream_model_id || row.model_id, outcome: row.outcome, error: row.error, createdAt: row.created_at, hasDetail: !!row.encrypted_detail,
+    userId: row.user_id ?? null, sourceRouteKey: row.source_route_key ?? null, sourceVariantName: row.source_variant_name ?? null, executionRouteKey: row.attempt_route_key ?? row.execution_route_key ?? null, executionVariantName: row.attempt_variant_name ?? row.execution_variant_name ?? null, requestedEffort: row.requested_effort ?? null, executionEffort: row.attempt_effort ?? row.execution_effort ?? null, userRoutingApplied: !!row.user_routing_applied })) }));
   app.get('/api/admin/routing-logs/:id/detail', (req, res) => { const row = store.get('SELECT encrypted_detail FROM route_attempts WHERE id=?', req.params.id); if (!row?.encrypted_detail) throw fail(404, '原始报错不存在或已清理。'); res.set('Cache-Control','no-store').json({ detail: JSON.parse(store.decrypt(row.encrypted_detail)) }); });
   app.post('/api/admin/models/:id/test', async (req, res) => {
     const row = store.get('SELECT * FROM models WHERE id=?', req.params.id); if (!row) throw fail(404, '模型不存在。'); if (testing.has(row.id) || testing.size >= 2) throw fail(429, '模型测试正在进行，请稍后重试。'); testing.set(row.id, row.provider_id);
@@ -506,7 +563,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     if (req.body.systemPrompt !== undefined) { if (typeof req.body.systemPrompt !== 'string' || req.body.systemPrompt.length > 20_000) throw fail(400, '系统提示词最多 20000 字符。'); values.systemPrompt = req.body.systemPrompt; }
     if (req.body.dailyLimit !== undefined) values.dailyLimit = number(req.body.dailyLimit, 0, 100_000, '每日请求额度');
     if (req.body.maxOutputTokens !== undefined) values.maxOutputTokens = number(req.body.maxOutputTokens, 128, 32768, '最大输出 Token');
-    if (req.body.routingMaxAttempts !== undefined) values.routingMaxAttempts = number(req.body.routingMaxAttempts, 1, 10, '每次请求最多尝试次数');
+    if (req.body.routingMaxAttempts !== undefined) values.routingMaxAttempts = number(req.body.routingMaxAttempts, 1, 100, '每次请求最多尝试次数');
     if (req.body.retriesPerChannel !== undefined) values.retriesPerChannel = number(req.body.retriesPerChannel, 0, 3, '同渠道重试次数');
     if (req.body.defaultModelId !== undefined) values.defaultModelId = req.body.defaultModelId === null ? null : usableModel(req.body.defaultModelId).id;
     store.transaction(() => { for (const [key, value] of Object.entries(values)) store.setSetting(key, value); });
@@ -525,5 +582,5 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   cleanAbandonedUploads();
   const cleanupTimer = setInterval(cleanAbandonedUploads, 3600_000);
   cleanupTimer.unref();
-  return { app, store, setupToken, abortAll: () => { for (const job of active.values()) job.controller.abort(); }, close: () => { clearInterval(cleanupTimer); work.close(); store.close(); } };
+  return { app, store, setupToken, abortAll: () => { for (const job of active.values()) job.controller.abort(); apiExports.abortAll(); }, close: () => { clearInterval(cleanupTimer); apiExports.close(); work.close(); store.close(); } };
 }

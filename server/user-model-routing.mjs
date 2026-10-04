@@ -18,6 +18,9 @@ export function createUserModelRouting({ store, ensureUserIdle }) {
     updated_at TEXT NOT NULL,
     PRIMARY KEY(user_id,source_route_key,source_variant_name)
   );`);
+  if (!store.all('PRAGMA table_info(user_model_routing)').some(column => column.name === 'fallbacks_json')) {
+    store.db.exec("ALTER TABLE user_model_routing ADD COLUMN fallbacks_json TEXT NOT NULL DEFAULT '[]'");
+  }
   function requireUser(userId) {
     if (!store.get('SELECT id FROM users WHERE id=?', userId)) throw fault(404, '用户不存在。');
   }
@@ -30,7 +33,8 @@ export function createUserModelRouting({ store, ensureUserIdle }) {
   }
   function ruleJSON(row) {
     return { sourceRouteKey: row.source_route_key, sourceVariantName: row.source_variant_name, targetRouteKey: row.target_route_key,
-      targetVariantName: row.target_variant_name, enabled: !!row.enabled, effort: row.effort };
+      targetVariantName: row.target_variant_name, enabled: !!row.enabled, effort: row.effort,
+      fallbacks: JSON.parse(row.fallbacks_json || '[]') };
   }
   function listRules(userId) {
     requireUser(userId);
@@ -50,25 +54,45 @@ export function createUserModelRouting({ store, ensureUserIdle }) {
       if (seen.has(key)) throw fault(400, '同一所选模型与版本只能配置一条路由。');
       seen.add(key);
       if (sourceRouteKey === targetRouteKey && sourceVariantName === targetVariantName) throw fault(400, '执行模型与版本需要不同于所选模型与版本。');
+      const fallbacks = value.fallbacks === undefined ? [] : value.fallbacks;
+      if (!Array.isArray(fallbacks)) throw fault(400, '备用模型应为按执行顺序排列的列表。');
+      const targetsSeen = new Set([JSON.stringify([targetRouteKey, targetVariantName, effort])]);
+      // The request's body limit bounds storage; there is no fixed backup count.
+      // Falling back to the originally selected source is allowed and remains
+      // one explicit step, not another lookup of that source's routing rule.
+      const backups = fallbacks.map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) throw fault(400, '备用模型格式无效。');
+        const targetRouteKey = text(item.targetRouteKey, '备用模型'), targetVariantName = text(item.targetVariantName ?? '', '备用版本', true);
+        const effort = item.effort ?? 'auto';
+        if (!efforts.has(effort)) throw fault(400, '备用模型思考强度无效。');
+        const targetKey = JSON.stringify([targetRouteKey, targetVariantName, effort]);
+        if (targetsSeen.has(targetKey)) throw fault(400, '执行列表中不能重复添加相同模型、版本和思考强度。');
+        targetsSeen.add(targetKey);
+        return { targetRouteKey, targetVariantName, effort };
+      });
       // Disabled records can still be removed or retained if a channel was
       // subsequently deleted. Enabling always revalidates both route names.
       if (enabled) {
-        if (!known(sourceRouteKey, sourceVariantName) || !known(targetRouteKey, targetVariantName)) throw fault(400, '所选模型或执行模型的版本不存在，请刷新模型目录。');
-        const targets = usableTargets(targetRouteKey, targetVariantName);
-        if (!targets.length) throw fault(400, '执行模型的版本没有可用渠道，请先配置并启用渠道。');
-        if (effort !== 'auto' && !targets.some(row => JSON.parse(row.reasoning_efforts || '[]').includes(effort))) throw fault(400, '执行模型的版本不支持配置的思考强度。');
+        if (!known(sourceRouteKey, sourceVariantName)) throw fault(400, '所选模型的版本不存在，请刷新模型目录。');
+        for (const step of [{ targetRouteKey, targetVariantName, effort }, ...backups]) {
+          if (!known(step.targetRouteKey, step.targetVariantName)) throw fault(400, '执行模型或备用模型的版本不存在，请刷新模型目录。');
+          const targets = usableTargets(step.targetRouteKey, step.targetVariantName);
+          if (!targets.length) throw fault(400, '执行模型或备用模型的版本没有可用渠道，请先配置并启用渠道。');
+          if (step.effort !== 'auto' && !targets.some(row => JSON.parse(row.reasoning_efforts || '[]').includes(step.effort))) throw fault(400, '执行模型或备用模型的版本不支持配置的思考强度。');
+        }
       }
-      return { sourceRouteKey, sourceVariantName, targetRouteKey, targetVariantName, enabled, effort };
+      return { sourceRouteKey, sourceVariantName, targetRouteKey, targetVariantName, enabled, effort, fallbacks: backups };
     });
     ensureUserIdle(userId);
     store.transaction(() => {
       store.run('DELETE FROM user_model_routing WHERE user_id=?', userId);
-      for (const rule of rules) store.run('INSERT INTO user_model_routing(user_id,source_route_key,source_variant_name,target_route_key,target_variant_name,enabled,effort,updated_at) VALUES (?,?,?,?,?,?,?,?)',
-        userId, rule.sourceRouteKey, rule.sourceVariantName, rule.targetRouteKey, rule.targetVariantName, rule.enabled ? 1 : 0, rule.effort, now());
+      for (const rule of rules) store.run('INSERT INTO user_model_routing(user_id,source_route_key,source_variant_name,target_route_key,target_variant_name,enabled,effort,updated_at,fallbacks_json) VALUES (?,?,?,?,?,?,?,?,?)',
+        userId, rule.sourceRouteKey, rule.sourceVariantName, rule.targetRouteKey, rule.targetVariantName, rule.enabled ? 1 : 0, rule.effort, now(), JSON.stringify(rule.fallbacks));
     });
     return listRules(userId);
   }
-  // Resolve exactly once: A -> B and B -> C never make A execute C.
+  // Resolve exactly once. The caller walks the primary and explicit backups;
+  // routing rules belonging to those targets must not be applied recursively.
   function resolve(userId, routeKey, variantName = '') {
     const row = store.get('SELECT * FROM user_model_routing WHERE user_id=? AND source_route_key=? AND source_variant_name=? AND enabled=1', userId, routeKey, variantName);
     return row ? ruleJSON(row) : null;

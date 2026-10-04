@@ -9,6 +9,7 @@ import Sidebar from './components/Sidebar';
 import Composer, { emptyComposerDraft, type ComposerDraft } from './components/Composer';
 import ModelPicker from './components/ModelPicker';
 import ChatControls from './components/ChatControls';
+import Announcements from './components/Announcements';
 const MessageList = lazy(() => import('./components/MessageList'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
 const BillingModal = lazy(() => import('./components/BillingModal'));
@@ -30,8 +31,8 @@ function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: (
   }
   const [exported, setExported] = useState(false);
   const [billingOpen, setBillingOpen] = useState(() => new URLSearchParams(window.location.search).has('billing'));
-  const [membership, setMembership] = useState<{planName:string;activeUntil:string;source:string} | null>(null);
-  const refreshBilling = useCallback(async () => { const result = await api<{membership:{planName:string;activeUntil:string;source:string}|null}>('/billing'); setMembership(result.membership); }, []);
+  const [membership, setMembership] = useState<{planName:string;activeUntil:string|null;source:string} | null>(null);
+  const refreshBilling = useCallback(async () => { const result = await api<{membership:{planName:string;activeUntil:string|null;source:string}|null}>('/billing'); setMembership(result.membership); }, []);
   const refreshWorkspace = useCallback(async () => { await Promise.all([chat.refreshModels(), refreshBilling()]); }, [chat.refreshModels, refreshBilling]);
   useEffect(() => { void refreshBilling().catch(() => {}); const refresh = () => { void refreshBilling().catch(() => {}); }; window.addEventListener('focus', refresh); const timer = window.setInterval(refresh,60000); return () => { window.removeEventListener('focus',refresh); window.clearInterval(timer); }; }, [refreshBilling]);
   const closeSidebar = useCallback(() => setMobileOpen(false), []);
@@ -64,6 +65,7 @@ function Workspace({ user, onLogout, theme, onTheme }: { user: User; onLogout: (
         {currentChat && <button className="icon-button export-button" onClick={exportChat} aria-label="导出对话" title="导出 Markdown">{exported ? <Check size={18}/> : <ArrowDownToLine size={18}/>}</button>}
         <button className="icon-button mobile-only" onClick={newChat} aria-label="新聊天"><SquarePen size={21}/></button>
       </div></header>
+      <Announcements userId={user.id}/>
       {chat.loading ? <div className="app-loading"><LoaderCircle size={26} className="spin"/><p>正在打开工作空间…</p></div> : <>
         <div className={`chat-layout ${empty ? 'empty-layout' : ''}`}>
           {empty && <div className="welcome-content"><div className="welcome-intro">

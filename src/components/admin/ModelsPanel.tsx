@@ -11,6 +11,9 @@ import { orderedProviders, upstreamModelGroups } from './upstream-model-options'
 function EffortFields({ values = [] }: { values?: string[] }) {
   return <fieldset className="model-effort-fields"><legend>支持的思考强度</legend><p className="field-help">自动始终可用。只勾选此模型和接口实际接受的参数，未勾选的选项不会向用户显示。</p><div className="model-effort-options">{['low', 'medium', 'high', 'xhigh', 'max'].map(value => <label className="checkbox-label compact" key={value}><input type="checkbox" name="reasoningEfforts" value={value} defaultChecked={values.includes(value)}/>{effortLabels[value]} <small>{value}</small></label>)}</div></fieldset>;
 }
+function RetryFields({ model }: { model?: AdminModel }) {
+  return <label>响应失败后的额外重试次数<input name="retries" type="number" min={0} max={10} step={1} defaultValue={model?.retries ?? ''} placeholder="留空继承站点设置"/><span className="field-help">0 表示不在此渠道重试；例如 2 表示首次失败后最多再试 2 次。适用于连接失败、超时等可重试错误，仍受单个方案总尝试上限和失败冷却控制。已输出的内容由备用方案接续。</span></label>;
+}
 function CapacityFields({ model }: { model?: AdminModel }) {
   return <div className="form-grid"><label>上下文容量（tokens）<input name="contextWindow" type="number" min={1024} max={10000000} step={1} defaultValue={model?.contextWindow ?? ''} placeholder="未声明，留空"/><span className="field-help">以服务商的实际模型容量为准；留空不会猜测模型限制。</span></label><label>最大输出（tokens）<input name="maxOutputTokens" type="number" min={128} max={1000000} step={1} defaultValue={model?.maxOutputTokens ?? ''} placeholder="未设置，使用站点默认值"/><span className="field-help">单次调用的输出上限，不能超过模型实际支持的限制。</span></label></div>;
 }
@@ -34,7 +37,7 @@ function UpstreamModelsPanel({ models, providers, defaultModelId, run, busy }: {
   const visibleChannels = visible.reduce((count, group) => count + group.channels.length, 0);
   async function add(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    const ok = await run('model-add', () => post('/admin/models', { providerId: form.get('providerId'), modelId: form.get('modelId'), name: form.get('name'), routeKey: form.get('routeKey') || undefined, vision: form.get('vision') === 'on', reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form) }), '模型已添加。相同统一模型名的渠道已归入同一模型。');
+    const ok = await run('model-add', () => post('/admin/models', { providerId: form.get('providerId'), modelId: form.get('modelId'), name: form.get('name'), routeKey: form.get('routeKey') || undefined, vision: form.get('vision') === 'on', reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form), retries: form.get('retries') === '' ? null : Number(form.get('retries')) }), '模型已添加。相同统一模型名的渠道已归入同一模型。');
     if (ok) setAdding(false);
   }
   async function test(model: AdminModel) {
@@ -58,18 +61,18 @@ function UpstreamModelsPanel({ models, providers, defaultModelId, run, busy }: {
       <label>上游模型 ID<input name="modelId" placeholder="填写服务商提供的模型 ID" required/></label>
       <label>显示名称<input name="name" placeholder="可选，默认使用模型 ID"/></label>
       <label>统一模型名<input name="routeKey" placeholder="留空使用模型 ID" maxLength={120}/><span className="field-help">填写相同统一模型名的渠道会合并；失败时可以相互切换。</span></label>
-      <label className="checkbox-label"><input name="vision" type="checkbox"/>支持图片输入</label><EffortFields/><CapacityFields/>
+      <label className="checkbox-label"><input name="vision" type="checkbox"/>支持图片输入</label><EffortFields/><CapacityFields/><RetryFields/>
       <div className="form-actions"><button className="button primary" disabled={!!busy}>添加模型</button></div>
     </form>}
     {editing && <form className="settings-card stack" key={editing.id} onSubmit={async event => {
       event.preventDefault(); const form = new FormData(event.currentTarget);
-      if (await run('model-edit', () => patch(`/admin/models/${editing.id}`, { name: form.get('name'), routeKey: form.get('routeKey'), variantName: form.get('variantName'), ...failureOverrideValues(form), reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form) }), '渠道模型设置已保存。')) setEditing(null);
+      if (await run('model-edit', () => patch(`/admin/models/${editing.id}`, { name: form.get('name'), routeKey: form.get('routeKey'), variantName: form.get('variantName'), ...failureOverrideValues(form), reasoningEfforts: form.getAll('reasoningEfforts'), ...capacityValues(form), retries: form.get('retries') === '' ? null : Number(form.get('retries')) }), '渠道模型设置已保存。')) setEditing(null);
     }}>
       <div className="card-heading"><strong>编辑渠道模型</strong><button type="button" className="icon-button" aria-label="关闭编辑" onClick={() => setEditing(null)}><X size={16}/></button></div>
       <p className="muted small-text">{editing.providerName || providers.find(provider => provider.id === editing.providerId)?.name} · {editing.modelId}</p>
       <label>显示名称<input name="name" defaultValue={editing.name} required maxLength={120}/></label>
       <label>统一模型名<input name="routeKey" defaultValue={editing.routeKey || editing.modelId} required maxLength={120}/><span className="field-help">只合并能力相当、允许相互替代的模型。</span></label>
-      <label>版本名称<input name="variantName" defaultValue={editing.variantName || ''} maxLength={100} placeholder="默认版本"/></label><EffortFields values={editing.reasoningEfforts}/><CapacityFields model={editing}/><FailureOverrideFields model={editing}/>
+      <label>版本名称<input name="variantName" defaultValue={editing.variantName || ''} maxLength={100} placeholder="默认版本"/></label><EffortFields values={editing.reasoningEfforts}/><CapacityFields model={editing}/><RetryFields model={editing}/><FailureOverrideFields model={editing}/>
       <div className="form-actions"><button className="button primary" disabled={!!busy}>保存</button></div>
     </form>}
     <div className="upstream-model-filters"><div className="search-input bordered"><Search size={16}/><input aria-label="搜索模型或渠道" placeholder="搜索模型或渠道" value={query} onChange={event => setQuery(event.target.value)}/></div><label className="upstream-provider-filter"><span>渠道</span><select aria-label="筛选渠道" value={selectedProvider} onChange={event => setProviderId(event.target.value)}><option value="">全部渠道</option>{providerOptions.map(provider => <option key={provider.id} value={provider.id}>{provider.name}{provider.enabled ? '' : '（已停用）'}</option>)}</select></label></div>

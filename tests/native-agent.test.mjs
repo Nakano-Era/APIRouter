@@ -135,7 +135,8 @@ test('native request respects selected output ceiling, effort and supported sear
     const body = nativeRequest(job, [{ role: 'user', content: 'hello' }]);
     assert.equal(body.max_tokens ?? body.max_completion_tokens ?? body.max_output_tokens, 65536);
     assert.equal(body.output_config?.effort ?? body.reasoning_effort ?? body.reasoning?.effort, 'high');
-    assert.equal(nativeTools(protocol, { webSearch: true }).some(tool => tool.name === 'web_search' || tool.type === 'web_search'), protocol !== 'openai-chat');
+    assert.equal(nativeTools(protocol, { webSearch: true }).some(tool => (tool.name ?? tool.function?.name) === 'web_search'), true);
+    assert.equal(nativeTools(protocol, { webSearch: true }).some(tool => (tool.name ?? tool.function?.name) === 'web_fetch'), true);
     assert.equal(nativeTools(protocol, { delegated: true }).some(tool => (tool.function?.name ?? tool.name) === 'delegate_task'), false);
   }
 });

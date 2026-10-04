@@ -13,7 +13,7 @@ function fixture(t, channels = [{ id: 'a', priority: 10 }, { id: 'b', priority: 
     CREATE TABLE models (id TEXT PRIMARY KEY,provider_id TEXT,model_id TEXT,route_key TEXT,enabled INTEGER,
     available INTEGER,vision INTEGER,failure_count INTEGER,cooldown_until TEXT,failure_epoch INTEGER,
     status TEXT,error TEXT,last_checked_at TEXT,reasoning_efforts TEXT DEFAULT '[]');
-    CREATE TABLE route_attempts (id TEXT PRIMARY KEY,request_id TEXT,provider_id TEXT,model_id TEXT,outcome TEXT,error TEXT,created_at TEXT,encrypted_detail TEXT);`);
+    CREATE TABLE route_attempts (id TEXT PRIMARY KEY,request_id TEXT,provider_id TEXT,model_id TEXT,outcome TEXT,error TEXT,created_at TEXT,encrypted_detail TEXT,execution_route_key TEXT,execution_variant_name TEXT,execution_effort TEXT);`);
   const store = {
     all: (sql, ...args) => db.prepare(sql).all(...args),
     get: (sql, ...args) => db.prepare(sql).get(...args),
@@ -26,6 +26,7 @@ function fixture(t, channels = [{ id: 'a', priority: 10 }, { id: 'b', priority: 
     store.run('INSERT INTO models VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', c.id, c.id, c.upstreamModelId ?? `upstream-${c.id}`, c.routeKey ?? 'shared-model', c.enabled ?? 1, c.available ?? 1, c.vision ?? 0, c.failureCount ?? 0, c.cooldownUntil ?? null, 0, 'untested', null, null, JSON.stringify(c.efforts || []));
   }
   db.exec("ALTER TABLE providers ADD COLUMN responses_profile TEXT DEFAULT 'auto'");
+  db.exec('ALTER TABLE models ADD COLUMN retries_override INTEGER');
   db.exec('ALTER TABLE providers ADD COLUMN failure_protection_enabled INTEGER DEFAULT 1; ALTER TABLE models ADD COLUMN variant_name TEXT DEFAULT \'\'; ALTER TABLE models ADD COLUMN failure_protection_enabled INTEGER; ALTER TABLE models ADD COLUMN failure_threshold_override INTEGER; ALTER TABLE models ADD COLUMN cooldown_seconds_override INTEGER;');
   for (const c of channels) {
     store.run('UPDATE providers SET failure_protection_enabled=? WHERE id=?', c.protection ?? 1, c.id);
@@ -85,6 +86,17 @@ test('equal priority uses stable model ID ordering', async t => {
   const store = fixture(t, [{ id: 'b' }, { id: 'a' }]);
   const router = createRouter({ store, stream: async function* () { yield { type: 'delta', text: 'OK' }; } });
   assert.deepEqual(selected(await collect(router.run(input()))), ['a']);
+});
+
+test('each upstream model overrides retry defaults, respects zero and total attempt budget', async t => {
+  const store = fixture(t, [{ id: 'a', priority: 20, protection: 0 }, { id: 'b', priority: 10, protection: 0 }, { id: 'c', protection: 0 }]);
+  store.run('UPDATE models SET retries_override=0 WHERE id=?', 'a');
+  store.run('UPDATE models SET retries_override=2 WHERE id=?', 'b');
+  const router = createRouter({ store, stream: async function* ({ provider }) { if (provider.id !== 'c') throw failure(); yield { type: 'delta', text: 'success' }; } });
+  assert.deepEqual(selected(await collect(router.run(input({ retriesPerChannel: 1, maxAttempts: 8 })))), ['a', 'b', 'b', 'b', 'c']);
+  const events = [];
+  await assert.rejects(collect(router.run(input({ retriesPerChannel: 1, maxAttempts: 2 })), events));
+  assert.deepEqual(selected(events), ['a', 'b']);
 });
 
 test('transient failures retry same channel then reset its consecutive failure counter', async t => {
@@ -192,12 +204,12 @@ test('attempt budget limits spending across all retries and providers', async t 
   assert.deepEqual(selected(result), ['a']);
 });
 
-test('attempt budget is hard-clamped to ten upstream requests', async t => {
-  const store = fixture(t, Array.from({ length: 15 }, (_, i) => ({ id: String(i).padStart(2, '0') })));
+test('attempt budget is hard-clamped to one hundred upstream requests', async t => {
+  const store = fixture(t, Array.from({ length: 105 }, (_, i) => ({ id: String(i).padStart(2, '0') })));
   let count = 0;
   const router = createRouter({ store, stream: async function* () { count++; throw failure(429); } });
-  await assert.rejects(collect(router.run(input({ maxAttempts: 100 }))), { code: 'ROUTE_EXHAUSTED' });
-  assert.equal(count, 10);
+  await assert.rejects(collect(router.run(input({ maxAttempts: 999 }))), { code: 'ROUTE_EXHAUSTED' });
+  assert.equal(count, 100);
 });
 
 for (const code of ['UPSTREAM_CONNECTION_ERROR', 'UPSTREAM_TIMEOUT']) {

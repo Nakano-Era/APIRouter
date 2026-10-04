@@ -6,14 +6,15 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import { apiUrl, validateBaseUrl } from '../server/net.mjs';
-import { validateJob, dockerArguments, fault, validateCheckpoint } from './protocol.mjs';
+import { validateJob, dockerArguments, fault, validateCheckpoint, MAX_JOB_BYTES, MAX_WORK_EVENT_BYTES } from './protocol.mjs';
 import { safePublicRequest, redactCredentials } from './network.mjs';
 import { prepareResponsesRequest, responseRequestShape, responsesProfile } from '../server/responses-compat.mjs';
+import { createWebAccess } from './web-access.mjs';
 
 const execute = promisify(execFile);
 const same = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const json = (res, status, value) => { if (!res.headersSent) res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
-async function bodyJSON(req, maximum = 128 * 1024 * 1024) {
+async function bodyJSON(req, maximum = MAX_JOB_BYTES) {
   if (Number(req.headers['content-length']) > maximum) throw fault('请求超过大小限制。', 413);
   let length = 0; const chunks = [];
   for await (const chunk of req) { length += chunk.length; if (length > maximum) throw fault('请求超过大小限制。', 413); chunks.push(chunk); }
@@ -39,7 +40,7 @@ export function gatewayHeaders(source, provider) {
   return headers;
 }
 
-export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = process.env.WORK_WORKER_IMAGE || 'apirouter-work:local', claudeImage = process.env.WORK_CLAUDE_IMAGE || null, self = process.env.HOSTNAME, docker = async args => (await execute('docker', args, { timeout: 30_000, maxBuffer: 1024 * 1024 })).stdout.trim(), spawnDocker = args => spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] }), publicRequest = safePublicRequest } = {}) {
+export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = process.env.WORK_WORKER_IMAGE || 'apirouter-work:local', claudeImage = process.env.WORK_CLAUDE_IMAGE || null, self = process.env.HOSTNAME, docker = async args => (await execute('docker', args, { timeout: 30_000, maxBuffer: 1024 * 1024 })).stdout.trim(), spawnDocker = args => spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] }), publicRequest = safePublicRequest, webAccess = createWebAccess() } = {}) {
   if (!token || token.length < 32) throw new Error('WORK_RUNNER_TOKEN must be at least 32 characters');
   if (!/^[a-zA-Z0-9_.-]{1,128}$/.test(self ?? '')) throw new Error('Broker container hostname is required');
   const jobs = new Map();
@@ -73,6 +74,16 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     const job = jobs.get(id);
     const bearer = req.headers.authorization?.replace(/^Bearer /, '') || req.headers['x-api-key'];
     if (!job || !same(bearer, job.jobToken)) return json(res, 401, { error: { type: 'authentication_error', message: 'Job credential expired or invalid' } });
+    const webEndpoint = url.pathname === `/proxy/${id}/web/search` ? 'search' : url.pathname === `/proxy/${id}/web/read` ? 'read' : null;
+    if (webEndpoint) {
+      if (req.method !== 'POST' || url.search || job.config.mode !== 'work' || !job.config.webSearch || job.config.search?.enabled !== true) return json(res, 403, { error: '当前任务未获准使用联网服务。' });
+      job.webCalls = (job.webCalls || 0) + 1;
+      if (job.webCalls > 20) return json(res, 429, { error: '本次任务的联网请求已达到 20 次限制。' });
+      const body = await bodyJSON(req, 16 * 1024);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !(webEndpoint === 'search' ? ['query', 'limit'] : ['url']).includes(key))) return json(res, 400, { error: '联网请求参数无效。' });
+      const result = webEndpoint === 'search' ? await webAccess.search(body, { baseUrl: job.config.search.baseUrl, signal: job.controller.signal }) : await webAccess.read(body, { signal: job.controller.signal });
+      return json(res, 200, result);
+    }
     const endpoint = gatewayEndpoint(url.pathname, id, job.config.protocol ?? job.provider.protocol);
     if (req.method !== 'POST' || !endpoint || [...url.searchParams.keys()].some(key => key !== 'beta')) return json(res, 403, { error: { type: 'permission_error', message: 'Endpoint is not enabled for this job' } });
     if (++job.calls > 160) return json(res, 429, { error: { type: 'rate_limit_error', message: 'Per-job request limit reached' } });
@@ -85,7 +96,8 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     if (!job.config.webSearch && body.tools?.some(tool => /web_search|web_fetch/.test(tool.type ?? ''))) return json(res, 403, { error: { type: 'permission_error', message: 'Network search is disabled for this job' } });
     if (job.config.engine === 'native') {
       const allowed = new Set(['read_file', 'write_file', 'list_files', 'run_command', 'use_skill', 'delegate_task']);
-      if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.some(tool => !(allowed.has(tool.name ?? tool.function?.name) || (job.config.webSearch && ['web_search', 'web_search_20250305'].includes(tool.type)))))) return json(res, 403, { error: { type: 'permission_error', message: 'Tool is not enabled for this job' } });
+      if (job.config.webSearch && job.config.search?.enabled) { allowed.add('web_search'); allowed.add('web_fetch'); }
+      if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.some(tool => !allowed.has(tool.name ?? tool.function?.name)))) return json(res, 403, { error: { type: 'permission_error', message: 'Tool is not enabled for this job' } });
       if (endpoint === 'responses') {
         if (body.background || body.previous_response_id || body.conversation) return json(res, 403, { error: { type: 'permission_error', message: 'Remote persistent sessions are disabled' } });
         body.store = false;
@@ -155,16 +167,15 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
       const workerInput = { engine: config.engine, protocol: config.protocol, responsesProfile: responsesProfile(provider), maxOutputTokens: config.maxOutputTokens, contextWindow: config.contextWindow, resumeState: config.resumeState, resumeText: config.resumeText, continuation: !!config.continuation, mode: config.mode, model: config.model, effort: config.effort, prompt: config.prompt, systemPrompt: config.systemPrompt, skills: config.skills, files: config.files, images: config.images ?? [], webSearch: config.webSearch, limits: config.limits, gateway: `http://gateway:3210/proxy/${id}`, jobToken: job.jobToken };
       child.stdin.on('error', () => {});
       child.stdin.end(JSON.stringify(workerInput));
-      let buffer = '', stderr = '', done = false, outputBytes = 0;
+      let buffer = '', stderr = '', done = false;
       const decoder = new StringDecoder('utf8'), errorDecoder = new StringDecoder('utf8');
       child.stderr.on('data', chunk => { stderr += errorDecoder.write(chunk).slice(0, Math.max(0, 128 * 1024 - stderr.length)); });
       for await (const chunk of child.stdout) {
-        outputBytes += chunk.length;
-        if (outputBytes > 512 * 1024 * 1024) throw fault('任务输出超过大小限制。', 502);
         buffer += decoder.write(chunk);
         let end;
         while ((end = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+          if (Buffer.byteLength(line) > MAX_WORK_EVENT_BYTES) throw fault('单条任务事件超过传输限制。', 502);
           let event; try { event = JSON.parse(line); } catch { continue; }
           if (!['delta', 'reasoning', 'activity', 'usage', 'checkpoint', 'file', 'error', 'done'].includes(event.type)) continue;
           if (event.type === 'checkpoint') validateCheckpoint(event.state, { model: config.model, protocol: config.protocol });
@@ -173,6 +184,7 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
           if (event.type === 'done') done = true;
           send(event);
         }
+        if (Buffer.byteLength(buffer) > MAX_WORK_EVENT_BYTES) throw fault('单条任务事件超过传输限制。', 502);
       }
       const outcome = await exited;
       if (!done) send({ type: 'error', code: 'WORKER_FAILED', error: '工作执行器异常退出，请管理员检查原始日志。', rawDiagnostic: job.lastDiagnostic ?? { status: null, protocol: 'claude-code', modelId: config.model, body: redactCredentials(stderr || outcome.error?.message || `Worker exit code ${outcome.code}`, [provider.apiKey, job.jobToken]), truncated: false } });

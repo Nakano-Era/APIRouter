@@ -175,3 +175,112 @@ test('Work continuation selects actual target candidates and refuses incompatibl
   assert.equal(f.calls.length, 2); assert.equal(f.instance.store.get('SELECT COUNT(*) AS n FROM requests').n, 2);
   assert.deepEqual(await (await f.request(`/api/chats/${chat.id}`)).json(), history);
 });
+
+test('ordered targets continue partial output in one assistant and one quota request with per-attempt execution audits', async t => {
+  const prefix = '这里是已经保存的第一部分内容，后续方案必须接着这段输出继续完成。';
+  const f = await fixture(t, { implementation: async function* (args) {
+    if (args.model.modelId === target.upstream) {
+      yield { type: 'delta', text: prefix }; yield { type: 'usage', inputTokens: 10, outputTokens: 5 };
+      throw new UpstreamError('响应未完成', 'UPSTREAM_INCOMPLETE');
+    }
+    assert.equal(args.model.modelId, third.upstream); assert.equal(args.context.fallback, true); assert.equal(args.context.continuation, true); assert.equal(args.context.resumeText, prefix);
+    assert.equal(args.messages.at(-2).role, 'assistant'); assert.equal(args.messages.at(-2).content, prefix); assert.match(args.messages.at(-1).content, /Continue the same answer/);
+    yield { type: 'delta', text: prefix + '现在接续完成。' }; yield { type: 'usage', inputTokens: 20, outputTokens: 8 };
+  } });
+  assert.equal((await f.save([rule({ effort: 'low', fallbacks: [{ targetRouteKey: third.routeKey, targetVariantName: '', effort: 'low' }] })])).status, 200);
+  // A target's own routing rule must not introduce an implicit next hop.
+  f.instance.store.run('INSERT INTO user_model_routing(user_id,source_route_key,source_variant_name,target_route_key,target_variant_name,effort,updated_at) VALUES(?,?,?,?,?,?,?)', 'member', third.routeKey, '', otherVersion.routeKey, otherVersion.variantName, 'auto', new Date().toISOString());
+  assert.equal((await f.request('/api/admin/users/member/model-limits', { user: 'admin', method: 'PUT', body: { limits: [{ routeKey: source.routeKey, variantName: source.variantName, dailyLimit: 1, monthlyLimit: 1 }] } })).status, 200);
+  const chat = await f.chat();
+  const response = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '连续回答' } });
+  const text = await response.text(); assert.equal(response.status, 200); assert.equal((text.match(/event: done/g) || []).length, 1); assert.ok(!text.includes('event: error'));
+  assert.ok(!text.includes(target.routeKey) && !text.includes(third.routeKey)); assert.equal(f.calls.length, 2);
+  const history = await (await f.request(`/api/chats/${chat.id}`)).json();
+  assert.equal(history.messages.length, 2); assert.equal(history.messages[1].content, prefix + '现在接续完成。'); assert.equal(history.messages[1].status, 'complete'); assert.equal(history.messages[1].modelId, sourceId);
+  const request = f.instance.store.get('SELECT * FROM requests');
+  assert.equal(f.instance.store.get('SELECT COUNT(*) AS count FROM requests').count, 1); assert.equal(request.route_key, source.routeKey); assert.equal(request.variant_name, source.variantName);
+  assert.equal(request.execution_route_key, third.routeKey); assert.equal(request.input_tokens, 30); assert.equal(request.output_tokens, 13);
+  const logs = (await (await f.request('/api/admin/routing-logs', { user: 'admin' })).json()).attempts.reverse();
+  assert.deepEqual(logs.map(row => [row.executionRouteKey, row.executionVariantName, row.executionEffort, row.outcome]), [[target.routeKey, '', 'low', 'error'], [third.routeKey, '', 'low', 'complete']]);
+  assert.ok(logs.every(row => row.requestId === request.id && row.sourceRouteKey === source.routeKey));
+  assert.equal((await f.request(`/api/chats/${chat.id}/continue`, { method: 'POST', body: {} })).status, 429);
+});
+
+test('all failed targets preserve cumulative partial text and remain continuable without falsely completing', async t => {
+  const f = await fixture(t, { implementation: async function* (_args, number) {
+    yield { type: 'delta', text: number === 1 ? '先保存第一部分。' : '第二部分也已保存。' };
+    throw new UpstreamError('输出达到上限', 'OUTPUT_LIMIT_REACHED');
+  } });
+  assert.equal((await f.save([rule({ fallbacks: [{ targetRouteKey: third.routeKey, targetVariantName: '', effort: 'auto' }] })])).status, 200);
+  const chat = await f.chat(), response = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '继续保存' } });
+  const stream = await response.text(); assert.match(stream, /event: error/); assert.ok(!stream.includes('event: done')); assert.equal(f.calls.length, 2);
+  const history = await (await f.request(`/api/chats/${chat.id}`)).json();
+  assert.equal(history.messages[1].content, '先保存第一部分。第二部分也已保存。'); assert.equal(history.messages[1].status, 'error'); assert.equal(history.messages[1].canContinue, true);
+  assert.equal(f.instance.store.get('SELECT COUNT(*) AS count FROM requests').count, 1);
+});
+
+test('failed prechecks skip unavailable effort and context targets before executing the first usable fallback', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.save([rule({ effort: 'low', fallbacks: [
+    { targetRouteKey: third.routeKey, targetVariantName: '', effort: 'low' },
+    { targetRouteKey: otherVersion.routeKey, targetVariantName: otherVersion.variantName, effort: 'low' },
+    { targetRouteKey: source.routeKey, targetVariantName: source.variantName, effort: 'high' }
+  ] })])).status, 200);
+  f.instance.store.run('UPDATE providers SET enabled=0 WHERE id=?', target.id);
+  f.instance.store.run("UPDATE models SET reasoning_efforts='[]' WHERE id=?", third.id);
+  f.instance.store.run('UPDATE models SET context_window=1 WHERE id=?', otherVersion.id);
+  const chat = await f.chat(), response = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '跳过不可用方案' } });
+  assert.equal(response.status, 200); assert.match(await response.text(), /event: done/);
+  assert.deepEqual(f.calls.map(call => call.model.modelId), [source.upstream]); assert.equal(f.calls[0].effort, 'high');
+  assert.equal(f.instance.store.get('SELECT COUNT(*) AS count FROM requests').count, 1);
+  assert.deepEqual(f.instance.store.all('SELECT outcome FROM route_attempts ORDER BY rowid').map(row => row.outcome), ['skipped', 'skipped', 'skipped', 'complete']);
+});
+
+test('target vision mismatch skips to an image-capable fallback without rejecting a valid source image request', async t => {
+  const f = await fixture(t);
+  f.instance.store.run('UPDATE models SET vision=1 WHERE id IN (?,?)', source.id, third.id);
+  assert.equal((await f.save([rule({ fallbacks: [{ targetRouteKey: third.routeKey, targetVariantName: '', effort: 'auto' }] })])).status, 200);
+  const { writeFileSync } = await import('node:fs');
+  f.instance.store.run('INSERT INTO files(id,user_id,name,mime,size,kind,created_at) VALUES(?,?,?,?,?,?,?)', 'image', 'member', 'test.png', 'image/png', 1, 'image', new Date().toISOString());
+  writeFileSync(join(f.instance.store.dataDir, 'files', 'image'), Buffer.from([0]));
+  const chat = await f.chat(), response = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '看图', attachmentIds: ['image'] } });
+  assert.equal(response.status, 200); assert.match(await response.text(), /event: done/);
+  assert.deepEqual(f.calls.map(call => call.model.modelId), [third.upstream]); assert.equal(f.calls[0].messages[0].attachments[0].kind, 'image');
+});
+
+test('active planned backup routes are busy and a user stop never invokes the backup', async t => {
+  const entered = Promise.withResolvers();
+  const f = await fixture(t, { implementation: async function* (args) {
+    yield { type: 'delta', text: '正在执行第一方案' }; entered.resolve();
+    await new Promise((resolve, reject) => args.signal.aborted ? reject(args.signal.reason) : args.signal.addEventListener('abort', () => reject(args.signal.reason), { once: true }));
+  } });
+  assert.equal((await f.save([rule({ fallbacks: [{ targetRouteKey: third.routeKey, targetVariantName: '', effort: 'auto' }] })])).status, 200);
+  const chat = await f.chat(), running = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '执行任务' } });
+  await entered.promise;
+  assert.equal((await f.request(`/api/admin/providers/${third.id}`, { user: 'admin', method: 'PATCH', body: { enabled: false } })).status, 409);
+  assert.equal((await f.request('/api/admin/model-groups', { user: 'admin', method: 'PUT', body: { originalName: third.routeKey, name: '改名', variants: [{ name: '', modelIds: [third.id] }] } })).status, 409);
+  assert.equal((await f.request(`/api/chats/${chat.id}/stop`, { method: 'POST', body: {} })).status, 200);
+  const text = await running.text(); assert.match(text, /event: done/); assert.equal(f.calls.length, 1);
+  assert.equal(f.instance.store.get('SELECT status FROM requests').status, 'stopped');
+  assert.equal((await (await f.request(`/api/chats/${chat.id}`)).json()).messages[1].status, 'stopped');
+});
+
+test('the per-target channel attempt budget does not truncate a longer explicit fallback sequence', async t => {
+  const f = await fixture(t, { implementation: async function* (args) {
+    if (args.model.modelId !== 'backup-7-upstream') throw new UpstreamError('上游响应超时', 'UPSTREAM_TIMEOUT');
+    yield { type: 'delta', text: '最后方案成功完成。' };
+  } });
+  const fallbacks = [];
+  f.instance.store.setSetting('routingMaxAttempts', 1);
+  f.instance.store.setSetting('retriesPerChannel', 0);
+  for (let index = 1; index <= 7; index++) {
+    const routeKey = `备用模型 ${index}`, modelId = `backup-${index}`;
+    f.instance.store.run('INSERT INTO models(id,provider_id,model_id,name,route_key) VALUES(?,?,?,?,?)', modelId, third.id, `${modelId}-upstream`, routeKey, routeKey);
+    fallbacks.push({ targetRouteKey: routeKey, targetVariantName: '', effort: 'auto' });
+  }
+  assert.equal((await f.save([rule({ fallbacks })])).status, 200);
+  const chat = await f.chat(), response = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '依次完成全部方案' } });
+  assert.match(await response.text(), /event: done/); assert.equal(f.calls.length, 8);
+  assert.deepEqual(f.calls.map(call => call.model.modelId), [target.upstream, ...Array.from({ length: 7 }, (_, index) => `backup-${index + 1}-upstream`)]);
+  assert.equal(f.instance.store.get('SELECT COUNT(*) AS count FROM requests').count, 1);
+});

@@ -38,6 +38,9 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
     INSERT OR IGNORE INTO billing_config(id) VALUES(1);
     CREATE TABLE IF NOT EXISTS billing_plans (id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS billing_memberships (user_id TEXT PRIMARY KEY REFERENCES users(id), plan_id TEXT NOT NULL, plan_snapshot TEXT NOT NULL, active_until TEXT NOT NULL, source TEXT NOT NULL, stripe_subscription_id TEXT, status TEXT NOT NULL DEFAULT 'active', cancel_at_period_end INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS billing_entitlement_overrides (user_id TEXT PRIMARY KEY REFERENCES users(id), plan_id TEXT NOT NULL, plan_snapshot TEXT NOT NULL, active_until TEXT, reason TEXT NOT NULL DEFAULT '', admin_id TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS billing_entitlement_audit (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), admin_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL, previous_value TEXT, next_value TEXT, reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_billing_entitlement_audit_user ON billing_entitlement_audit(user_id,created_at);
     CREATE TABLE IF NOT EXISTS billing_requests (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), plan_id TEXT NOT NULL, plan_snapshot TEXT NOT NULL, note TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', review_note TEXT, reviewer_id TEXT REFERENCES users(id), created_at TEXT NOT NULL, reviewed_at TEXT);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_one_pending ON billing_requests(user_id) WHERE status='pending';
     CREATE TABLE IF NOT EXISTS billing_checkouts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), plan_id TEXT NOT NULL, plan_snapshot TEXT NOT NULL, session_id TEXT UNIQUE, subscription_id TEXT UNIQUE, customer_id TEXT, url TEXT, status TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, request_origin TEXT NOT NULL);
@@ -54,6 +57,7 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
   const getPlan = planId => planJSON(store.get('SELECT * FROM billing_plans WHERE id=?', planId));
   const requestJSON = row => ({ id: row.id, userId: row.user_id, userName: row.user_name, userEmail: row.user_email, planId: row.plan_id, planName: parse(row.plan_snapshot).name, plan: parse(row.plan_snapshot), note: row.note, status: row.status, reviewNote: row.review_note, createdAt: row.created_at, reviewedAt: row.reviewed_at });
   const memberRow = userId => store.get('SELECT * FROM billing_memberships WHERE user_id=? AND active_until>?', userId, iso());
+  const overrideRow = userId => store.get('SELECT * FROM billing_entitlement_overrides WHERE user_id=? AND (active_until IS NULL OR active_until>?)', userId, iso());
   const pending = userId => store.get("SELECT id FROM billing_requests WHERE user_id=? AND status='pending'", userId);
   const canRequestManual = user => user.role !== 'admin' || store.get("SELECT COUNT(*) AS count FROM users WHERE role='admin' AND disabled=0").count > 1;
   const openCheckout = userId => store.get("SELECT * FROM billing_checkouts WHERE user_id=? AND status IN ('creating','open','complete') ORDER BY created_at DESC LIMIT 1", userId);
@@ -63,9 +67,39 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
     const plan = parse(row.plan_snapshot);
     return { planId: row.plan_id, planName: plan.name, activeUntil: row.active_until, source: row.source, status: row.status, cancelAtPeriodEnd: !!row.cancel_at_period_end, dailyLimit: plan.dailyLimit, allowedRoutes: plan.allowedRoutes };
   }
+  function overrideJSON(row) {
+    if (!row) return null;
+    const plan = parse(row.plan_snapshot);
+    return { planId: row.plan_id === 'free' ? null : row.plan_id, planName: plan.name, activeUntil: row.active_until, source: 'admin', status: !row.active_until || row.active_until > iso() ? 'active' : 'expired', cancelAtPeriodEnd: false, dailyLimit: plan.dailyLimit, allowedRoutes: plan.allowedRoutes, reason: row.reason, adminId: row.admin_id, updatedAt: row.updated_at };
+  }
+  function effectiveMembership(userId) { return overrideJSON(overrideRow(userId)) || memberJSON(memberRow(userId)); }
+  function requireUser(userId) {
+    if (!store.get('SELECT id FROM users WHERE id=?', userId)) throw fail(404, '成员不存在。');
+  }
+  function requireNoOverride(userId) {
+    if (overrideRow(userId)) throw fail(409, '当前套餐由管理员指定，请先联系管理员恢复原订阅后再申请或支付。');
+  }
+  function publicMembership(userId) {
+    const member = effectiveMembership(userId);
+    if (!member) return null;
+    // Administrative notes and actor IDs are visible only in the admin panel.
+    const { reason, adminId, updatedAt, ...value } = member;
+    return value;
+  }
+  function adminMembership(userId) {
+    requireUser(userId);
+    return {
+      effective: effectiveEntitlement(userId),
+      override: overrideJSON(store.get('SELECT * FROM billing_entitlement_overrides WHERE user_id=?', userId)),
+      underlyingMembership: memberJSON(memberRow(userId)),
+      hasStripeSubscription: !!ongoingStripe(userId),
+      plans: plans(),
+      history: store.all('SELECT a.*,u.name AS admin_name FROM billing_entitlement_audit a LEFT JOIN users u ON u.id=a.admin_id WHERE a.user_id=? ORDER BY a.created_at DESC,a.rowid DESC LIMIT 30', userId).map(row => ({ id: row.id, action: row.action, adminName: row.admin_name, reason: row.reason, createdAt: row.created_at, previous: row.previous_value ? parse(row.previous_value) : null, next: row.next_value ? parse(row.next_value) : null }))
+    };
+  }
   function effectiveEntitlement(userId) {
     const user = store.get('SELECT daily_limit FROM users WHERE id=?', userId);
-    const member = memberJSON(memberRow(userId));
+    const member = effectiveMembership(userId);
     return { planId: member?.planId || 'free', planName: member?.planName || '免费版', dailyLimit: user?.daily_limit ?? member?.dailyLimit ?? store.settings().dailyLimit, allowedRoutes: member?.allowedRoutes || parse(config().free_routes), activeUntil: member?.activeUntil || null, source: member?.source || 'free' };
   }
   function originFor(req) {
@@ -125,6 +159,7 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
     return { mode: 'subscription', client_reference_id: user.id, ...(customer ? { customer: customer.customer_id } : { customer_email: user.email }), metadata, subscription_data: { metadata }, line_items: [{ quantity: 1, price_data: { currency: plan.currency.toLowerCase(), unit_amount: plan.priceCents, recurring: { interval: plan.interval }, product_data: { name: plan.name, ...(plan.description ? { description: plan.description } : {}) } } }], success_url: `${record.request_origin}/?billing=success`, cancel_url: `${record.request_origin}/?billing=cancelled`, expires_at: Math.floor(new Date(record.expires_at).getTime() / 1000) };
   }
   async function createCheckout(user, planId, req) {
+    requireNoOverride(user.id);
     const plan = requirePurchasable(planId, 'allowStripe');
     const client = stripeClient(true), origin = originFor(req);
     if (checkoutBusy.has(user.id)) throw fail(409, '正在创建支付页面，请稍后再试。');
@@ -230,9 +265,10 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
     const limiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false, message: { error: '会员操作过于频繁，请稍后再试。' } });
     userRoutes.get('/', (req, res) => {
       const row = config(), availablePlans = plans().filter(plan => plan.active);
-      res.json({ plans: availablePlans, freePlan: { id: 'free', name: '免费版', dailyLimit: req.user.daily_limit ?? store.settings().dailyLimit, allowedRoutes: parse(row.free_routes) }, membership: memberJSON(memberRow(req.user.id)), requests: store.all('SELECT * FROM billing_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 50', req.user.id).map(requestJSON), paymentMethods: { stripe: !!(row.enabled && row.encrypted_secret && row.encrypted_webhook), manual: availablePlans.some(plan => plan.allowManual) }, canRequestManual: canRequestManual(req.user), canManageSubscription: !!(row.encrypted_secret && store.get('SELECT user_id FROM billing_customers WHERE user_id=?', req.user.id)), effectiveDailyLimit: effectiveEntitlement(req.user.id).dailyLimit });
+      res.json({ plans: availablePlans, freePlan: { id: 'free', name: '免费版', dailyLimit: req.user.daily_limit ?? store.settings().dailyLimit, allowedRoutes: parse(row.free_routes) }, membership: publicMembership(req.user.id), underlyingMembership: memberJSON(memberRow(req.user.id)), hasAdminOverride: !!overrideRow(req.user.id), hasStripeSubscription: !!ongoingStripe(req.user.id), requests: store.all('SELECT * FROM billing_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 50', req.user.id).map(requestJSON), paymentMethods: { stripe: !!(row.enabled && row.encrypted_secret && row.encrypted_webhook), manual: availablePlans.some(plan => plan.allowManual) }, canRequestManual: canRequestManual(req.user) && !overrideRow(req.user.id), canManageSubscription: !!(row.encrypted_secret && store.get('SELECT user_id FROM billing_customers WHERE user_id=?', req.user.id)), effectiveDailyLimit: effectiveEntitlement(req.user.id).dailyLimit });
     });
     userRoutes.post('/requests', limiter, async (req, res) => {
+      requireNoOverride(req.user.id);
       if (!canRequestManual(req.user)) throw fail(409, '唯一管理员无需申请会员，可配置自身额度；会员申请需要其他管理员审批。');
       const plan = requirePurchasable(req.body.planId, 'allowManual');
       const note = text(req.body.note ?? '', '申请说明', 1000, true), requestId = id();
@@ -244,6 +280,7 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
         if (current.status === 'expired') store.run("UPDATE billing_checkouts SET status='expired' WHERE id=? AND status='open'", checkout.id);
       }
       store.transaction(() => {
+        requireNoOverride(req.user.id);
         if (!canRequestManual(req.user)) throw fail(409, '唯一管理员无需申请会员，可配置自身额度；会员申请需要其他管理员审批。');
         if (pending(req.user.id)) throw fail(409, '已有申请正在审核，请等待管理员处理。');
         if (ongoingStripe(req.user.id) || memberRow(req.user.id)?.source === 'stripe') throw fail(409, '请先在订阅管理中取消 Stripe 订阅，并等待当前会员到期。');
@@ -261,6 +298,41 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
       res.json({ url: officialUrl(result.url, 'billing.stripe.com') });
     });
     adminRoutes.get('/plans', (_req, res) => res.json({ plans: plans() }));
+    adminRoutes.get('/users/:id/membership', (req, res) => res.json(adminMembership(req.params.id)));
+    adminRoutes.put('/users/:id/membership', (req, res) => {
+      requireUser(req.params.id);
+      const planId = text(req.body?.planId, '套餐', 100);
+      const plan = planId === 'free' ? { id: 'free', name: '免费版', dailyLimit: store.settings().dailyLimit, allowedRoutes: parse(config().free_routes), interval: 'month' } : getPlan(planId);
+      if (!plan) throw fail(404, '套餐不存在。');
+      const reason = text(req.body.note ?? '', '调整说明', 1000, true);
+      const duration = req.body.duration ?? 'period';
+      if (!['period', 'permanent', 'until'].includes(duration)) throw fail(400, '请选择套餐期限。');
+      let activeUntil = duration === 'period' ? addBillingPeriod(iso(), plan.interval) : null;
+      if (duration === 'until') {
+        const value = req.body.activeUntil;
+        const date = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? new Date(value) : null;
+        if (!date || !Number.isFinite(date.getTime()) || date.getTime() <= clock()) throw fail(400, '截止时间必须是未来的有效时间。');
+        activeUntil = date.toISOString();
+      }
+      store.transaction(() => {
+        const previous = overrideJSON(store.get('SELECT * FROM billing_entitlement_overrides WHERE user_id=?', req.params.id));
+        store.run('INSERT INTO billing_entitlement_overrides(user_id,plan_id,plan_snapshot,active_until,reason,admin_id,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET plan_id=excluded.plan_id,plan_snapshot=excluded.plan_snapshot,active_until=excluded.active_until,reason=excluded.reason,admin_id=excluded.admin_id,updated_at=excluded.updated_at', req.params.id, plan.id, JSON.stringify(plan), activeUntil, reason, req.user.id, iso());
+        const next = overrideJSON(overrideRow(req.params.id));
+        store.run('INSERT INTO billing_entitlement_audit(id,user_id,admin_id,action,previous_value,next_value,reason,created_at) VALUES(?,?,?,?,?,?,?,?)', id(), req.params.id, req.user.id, 'set', previous ? JSON.stringify(previous) : null, JSON.stringify(next), reason, iso());
+      });
+      res.json(adminMembership(req.params.id));
+    });
+    adminRoutes.delete('/users/:id/membership', (req, res) => {
+      requireUser(req.params.id);
+      const reason = text(req.body?.note ?? '', '调整说明', 1000, true);
+      store.transaction(() => {
+        const previous = overrideJSON(store.get('SELECT * FROM billing_entitlement_overrides WHERE user_id=?', req.params.id));
+        if (!previous) return;
+        store.run('DELETE FROM billing_entitlement_overrides WHERE user_id=?', req.params.id);
+        store.run('INSERT INTO billing_entitlement_audit(id,user_id,admin_id,action,previous_value,next_value,reason,created_at) VALUES(?,?,?,?,?,?,?,?)', id(), req.params.id, req.user.id, 'restore', JSON.stringify(previous), null, reason, iso());
+      });
+      res.json(adminMembership(req.params.id));
+    });
     adminRoutes.post('/plans', (req, res) => {
       const data = validatePlan(req.body), planId = id(), time = iso();
       store.run('INSERT INTO billing_plans(id,data,created_at,updated_at) VALUES(?,?,?,?)', planId, JSON.stringify(data), time, time);
@@ -282,6 +354,7 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
         if (request.user_id === req.user.id) throw fail(403, '不能审核自己的申请，请由另一位管理员审核。');
         if (request.status !== 'pending') throw fail(409, '此申请已经审核，请刷新列表。');
         if (req.body.decision === 'approve') {
+          requireNoOverride(request.user_id);
           const user = store.get('SELECT disabled FROM users WHERE id=?', request.user_id);
           if (!user || user.disabled) throw fail(400, '申请账号已停用。');
           if (ongoingStripe(request.user_id) || memberRow(request.user_id)?.source === 'stripe' || openCheckout(request.user_id)) throw fail(409, '此用户已有 Stripe 订阅或待付款订单。');

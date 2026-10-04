@@ -2,7 +2,8 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { BookOpen, Check, Download, LoaderCircle, Plus, RefreshCw, Terminal, Trash2, X } from 'lucide-react';
 import { api, errorText, patch, post, remove } from '../../api';
 import type { WorkSkill } from '../../types';
-interface WorkSettings { enabled: boolean; maxTurns: number; timeoutSeconds: number; memoryMb: number; cpus: number; maxBudgetUsd: number; maxConcurrentJobs: number }
+import WorkSearchSettings from './WorkSearchSettings';
+interface WorkSettings { enabled: boolean; maxTurns: number; timeoutSeconds: number; memoryMb: number; cpus: number; maxBudgetUsd: number; maxConcurrentJobs: number; artifactTotalMb: number; artifactMaxFiles: number; userStorageMb: number }
 interface RuntimeResponse { configured: boolean; available: boolean; reason?: string; settings: WorkSettings; limits?: Record<string, unknown> }
 export default function WorkPanel({ onChanged }: { onChanged: () => Promise<void> }) {
   const [runtime, setRuntime] = useState<RuntimeResponse | null>(null);
@@ -29,7 +30,7 @@ export default function WorkPanel({ onChanged }: { onChanged: () => Promise<void
   }
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    await run('save', () => patch('/admin/work/settings', { enabled: form.get('enabled') === 'on', maxTurns: Number(form.get('maxTurns')), timeoutSeconds: Number(form.get('timeoutSeconds')), memoryMb: Number(form.get('memoryMb')), cpus: Number(form.get('cpus')), maxBudgetUsd: Number(form.get('maxBudgetUsd')), maxConcurrentJobs: Number(form.get('maxConcurrentJobs')) }), 'Work 设置已保存。');
+    await run('save', () => patch('/admin/work/settings', { enabled: form.get('enabled') === 'on', maxTurns: Number(form.get('maxTurns')), timeoutSeconds: Number(form.get('timeoutSeconds')), memoryMb: Number(form.get('memoryMb')), cpus: Number(form.get('cpus')), maxBudgetUsd: Number(form.get('maxBudgetUsd')), maxConcurrentJobs: Number(form.get('maxConcurrentJobs')), artifactTotalMb: Number(form.get('artifactTotalMb')), artifactMaxFiles: Number(form.get('artifactMaxFiles')), userStorageMb: Number(form.get('userStorageMb')) }), 'Work 设置已保存。');
   }
   async function createSkill(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
@@ -48,9 +49,17 @@ export default function WorkPanel({ onChanged }: { onChanged: () => Promise<void
           <div className="form-grid"><label>每次任务最多轮次<input type="number" name="maxTurns" defaultValue={runtime.settings.maxTurns} min={1} max={80} required/><span className="field-help">限制 Agent 循环次数。</span></label><label>任务最长时间（秒）<input type="number" name="timeoutSeconds" defaultValue={runtime.settings.timeoutSeconds} min={30} max={1800} required/></label></div>
           <div className="form-grid"><label>每个任务内存（MB）<input type="number" name="memoryMb" defaultValue={runtime.settings.memoryMb} min={512} max={4096} step={128} required/></label><label>每个任务 CPU 核数<input type="number" name="cpus" defaultValue={runtime.settings.cpus} min={0.25} max={4} step={0.25} required/></label></div>
           <div className="form-grid"><label>单次任务预算（美元）<input type="number" name="maxBudgetUsd" defaultValue={runtime.settings.maxBudgetUsd} min={0.1} max={20} step={0.01} required/><span className="field-help">Claude Code 任务的预算上限；直接 API 任务以轮次和时间限制控制，实际扣费以服务商为准。</span></label><label>同时运行任务数<input type="number" name="maxConcurrentJobs" defaultValue={runtime.settings.maxConcurrentJobs} min={1} max={4} required/></label></div>
+          <div className="settings-card stack">
+            <strong>工作文件额度</strong>
+            <p className="field-help">填写 0 表示不限制该项额度。修改从下次任务生效，已有文件保留并可下载。</p>
+            <div className="form-grid"><label>每个对话文件总量（MB）<input type="number" name="artifactTotalMb" defaultValue={runtime.settings.artifactTotalMb ?? 0} min={0} max={1048576} required/></label><label>每个对话文件数量<input type="number" name="artifactMaxFiles" defaultValue={runtime.settings.artifactMaxFiles ?? 0} min={0} max={1000000} required/></label></div>
+            <label>每位用户文件存储（MB）<input type="number" name="userStorageMb" defaultValue={runtime.settings.userStorageMb ?? 0} min={0} max={1048576} required/></label>
+            <p className="field-help">单个下载文件上限仍为 10 MB；大文件可压缩或拆分。实际容量取决于服务器磁盘和沙箱资源。</p>
+          </div>
           <div className="form-actions"><button className="button primary" disabled={!!busy}><Check size={15}/>保存 Work 设置</button></div>
         </form>
       </>}
+      <WorkSearchSettings onChanged={onChanged}/>
       <div className="section-title" style={{ marginTop: 30 }}><div><h3>技能库</h3><p>以 SKILL.md 文本导入技能。成员可以选择使用，也可以下载到本地。</p></div><button className="button small" disabled={!!busy || skills.length >= 32} onClick={() => setAdding(!adding)}><Plus size={15}/>添加技能</button></div>
       {adding && <form className="settings-card stack" onSubmit={createSkill}>
         <div className="card-heading"><strong>添加技能</strong><button className="icon-button" type="button" aria-label="关闭添加技能" onClick={() => setAdding(false)}><X size={16}/></button></div>

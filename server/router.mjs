@@ -63,11 +63,11 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     store.run(`UPDATE models SET failure_count=0,cooldown_until=NULL,status='ok',error=NULL,
       last_checked_at=?,failure_epoch=failure_epoch+1 WHERE id=? AND failure_epoch=?`, timestamp(), candidate.id, candidate.failure_epoch);
   }
-  function auditStart(requestId, candidate) {
+  function auditStart(requestId, candidate, effort) {
     if (!requestId) return null;
     const auditId = randomUUID();
-    store.run('INSERT INTO route_attempts(id,request_id,provider_id,model_id,outcome,error,created_at) VALUES (?,?,?,?,?,?,?)',
-      auditId, requestId, candidate.provider_id, candidate.id, 'running', null, timestamp());
+    store.run('INSERT INTO route_attempts(id,request_id,provider_id,model_id,outcome,error,created_at,execution_route_key,execution_variant_name,execution_effort) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      auditId, requestId, candidate.provider_id, candidate.id, 'running', null, timestamp(), candidate.route_key, candidate.variant_name || '', effort);
     return auditId;
   }
   function auditEnd(auditId, outcome, error) {
@@ -86,17 +86,24 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     const candidates = store.all(`${selection} WHERE m.route_key=? AND m.enabled=1 AND m.available=1 AND p.enabled=1${needsVision ? ' AND m.vision=1' : ''} ORDER BY p.priority DESC,m.id ASC`, routeKey)
       .filter(candidate => (candidate.variant_name || '') === variantName && (!candidateIds || candidateIds.includes(candidate.id)) && (effort === 'auto' || JSON.parse(candidate.reasoning_efforts || '[]').includes(effort)));
     if (!candidates.length) throw new UpstreamError(needsVision ? '该模型路由没有支持图片的可用通道。' : '该模型路由没有可用通道，请联系管理员。', needsVision ? 'VISION_UNSUPPORTED' : 'ROUTE_UNAVAILABLE', 400);
-    const attemptLimit = boundedInteger(maxAttempts, 1, 10, 6);
-    const retryLimit = boundedInteger(retriesPerChannel, 0, 3, 1);
+    const attemptLimit = boundedInteger(maxAttempts, 1, 100, 6);
+    const defaultRetryLimit = boundedInteger(retriesPerChannel, 0, 3, 1);
     let attempts = 0;
     let lastError;
     let emittedText = false;
+    let knownInput = 0, knownOutput = 0;
+    function accumulatedUsage(event) {
+      const tokens = value => Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+      knownInput += tokens(event.inputTokens); knownOutput += tokens(event.outputTokens);
+      return { type: 'usage', inputTokens: knownInput, outputTokens: knownOutput };
+    }
     for (const initial of candidates) {
       signal?.throwIfAborted();
       if (attempts >= attemptLimit) break;
       let current = readCandidate(initial.id, routeKey, variantName, needsVision);
       if (!current || cooldown(current) === 'open' || probes.has(current.id)) continue;
       const halfOpen = cooldown(current) === 'half-open';
+      const retryLimit = current.retries_override == null ? defaultRetryLimit : boundedInteger(current.retries_override, 0, 10, defaultRetryLimit);
       if (halfOpen) probes.add(current.id);
       try {
         for (let retry = 0; retry <= (halfOpen ? 0 : retryLimit); retry++) {
@@ -119,7 +126,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
           yield selected;
           signal?.throwIfAborted();
           attempts++;
-          const auditId = auditStart(requestId, current);
+          const auditId = auditStart(requestId, current, effort);
           let auditFinished = false;
           let attemptText = false;
           let committed = false;
@@ -145,13 +152,13 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
             if (!attemptText) throw new UpstreamError('模型没有返回可显示的文本。', 'EMPTY_UPSTREAM_OUTPUT');
             recordSuccess(current);
             auditEnd(auditId, 'complete'); auditFinished = true;
-            if (pendingUsage) yield pendingUsage;
+            if (pendingUsage) yield accumulatedUsage(pendingUsage);
             return;
           } catch (error) {
             const policy = disposition(error, signal);
             auditEnd(auditId, policy.cancelled ? 'stopped' : 'error', policy.cancelled ? null : error);
             auditFinished = true;
-            if (pendingUsage && (policy.cancelled || emittedText || committed || !policy.switch)) yield pendingUsage;
+            if (pendingUsage) yield accumulatedUsage(pendingUsage);
             if (policy.cancelled) throw signal?.aborted ? signal.reason : error;
             if (policy.channel) recordFailure(current, error);
             if (emittedText || committed || !policy.switch) throw error;
@@ -159,7 +166,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
             if (!policy.retry || retry >= retryLimit || halfOpen || attempts >= attemptLimit) break;
             const updated = readCandidate(initial.id, routeKey, variantName, needsVision);
             if (!updated || cooldown(updated) !== 'closed') break;
-            await sleep(250 * (2 ** retry), undefined, { signal });
+            await sleep(Math.min(2000, 250 * (2 ** retry)), undefined, { signal });
           } finally {
             // A consumer cancelling iteration closes the attempt without damaging health.
             if (!auditFinished) auditEnd(auditId, 'stopped');

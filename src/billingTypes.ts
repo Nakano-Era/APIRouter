@@ -19,7 +19,7 @@ export interface BillingPlan {
 export interface Membership {
   planId: string | null;
   planName: string;
-  source: 'manual' | 'stripe';
+  source: 'manual' | 'stripe' | 'admin';
   status: string;
   activeUntil: string | null;
   cancelAtPeriodEnd: boolean;
@@ -46,11 +46,29 @@ export interface BillingData {
   plans: BillingPlan[];
   freePlan: { name: string; dailyLimit: number; allowedRoutes: string[] };
   membership: Membership | null;
+  underlyingMembership: Membership | null;
+  hasAdminOverride: boolean;
+  hasStripeSubscription: boolean;
   requests: BillingRequest[];
   paymentMethods: { stripe: boolean; manual: boolean };
   canManageSubscription: boolean;
   canRequestManual: boolean;
   effectiveDailyLimit: number;
+}
+
+export interface AdminMembershipOverride extends Membership {
+  reason: string;
+  adminId: string;
+  updatedAt: string;
+}
+
+export interface AdminMembershipData {
+  effective: { planId: string; planName: string; dailyLimit: number; allowedRoutes: string[]; activeUntil: string | null; source: string };
+  override: AdminMembershipOverride | null;
+  underlyingMembership: Membership | null;
+  hasStripeSubscription: boolean;
+  plans: BillingPlan[];
+  history: { id: string; action: 'set' | 'restore'; adminName: string; reason: string; createdAt: string; previous: AdminMembershipOverride | null; next: AdminMembershipOverride | null }[];
 }
 
 export interface BillingSettings {

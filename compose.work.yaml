@@ -21,6 +21,9 @@ services:
       WORK_RUNNER_TOKEN: ${WORK_RUNNER_TOKEN:?请运行 deploy/work-enable.sh}
       WORK_WORKER_IMAGE: apirouter-work:local
       WORK_CLAUDE_IMAGE: ${WORK_CLAUDE_IMAGE:-}
+    depends_on:
+      work-search:
+        condition: service_started
     # The broker is the only component allowed to create Docker containers.
     # Never mount this socket in app or in a job container.
     volumes:
@@ -36,7 +39,7 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
-    mem_limit: 512m
+    mem_limit: 1g
     stop_grace_period: 45s
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3210/health',{headers:{Authorization:'Bearer '+process.env.WORK_RUNNER_TOKEN}}).then(async r=>{if(!r.ok||!(await r.json()).available)process.exit(1)}).catch(()=>process.exit(1))"]
@@ -49,6 +52,30 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  work-search:
+    image: ${WORK_SEARCH_IMAGE:-docker.io/searxng/searxng:latest}
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: ${WORK_SEARCH_SECRET:?请运行 deploy/work-enable.sh 生成搜索服务凭据}
+      FORCE_OWNERSHIP: "false"
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - work_search_cache:/var/cache/searxng
+    networks:
+      - work-control
+      - work-egress
+    # No published port: only the app and broker can access the search service.
+    mem_limit: 512m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  work_search_cache:
 
 networks:
   work-control:

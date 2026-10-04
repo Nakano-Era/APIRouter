@@ -40,6 +40,15 @@ if grep -Eq '^COMPOSE_FILE=' .env; then
 else
   printf '\nCOMPOSE_FILE=compose.yaml:compose.work.yaml\n' >> .env
 fi
+if ! grep -Eq '^WORK_SEARCH_SECRET=.{32,}$' .env; then
+  if grep -Eq '^WORK_SEARCH_SECRET=' .env; then
+    echo '.env 中已有但无效的 WORK_SEARCH_SECRET；请设为至少 32 个随机字符后重试。' >&2
+    exit 1
+  fi
+  search_secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '\nWORK_SEARCH_SECRET=%s\n' "$search_secret" >> .env
+  unset search_secret
+fi
 chmod 600 .env
 echo '正在构建通用工作沙箱镜像，首次需要下载运行环境。'
 docker build --file runner/Dockerfile --target worker --tag apirouter-work:local .

@@ -1,10 +1,13 @@
 import path from 'node:path';
 
-export const DEFAULT_LIMITS = Object.freeze({ enabled: true, maxTurns: 20, timeoutSeconds: 600, memoryMb: 768, cpus: 1, maxBudgetUsd: 2, maxConcurrentJobs: 2 });
-export const LIMIT_BOUNDS = Object.freeze({ maxTurns: [1, 80], timeoutSeconds: [30, 1800], memoryMb: [512, 4096], cpus: [0.25, 4], maxBudgetUsd: [0.1, 20], maxConcurrentJobs: [1, 4] });
+export const DEFAULT_LIMITS = Object.freeze({ enabled: true, maxTurns: 20, timeoutSeconds: 600, memoryMb: 768, cpus: 1, maxBudgetUsd: 2, maxConcurrentJobs: 2, artifactTotalMb: 0, artifactMaxFiles: 0, userStorageMb: 0 });
+export const LIMIT_BOUNDS = Object.freeze({ maxTurns: [1, 80], timeoutSeconds: [30, 1800], memoryMb: [512, 4096], cpus: [0.25, 4], maxBudgetUsd: [0.1, 20], maxConcurrentJobs: [1, 4], artifactTotalMb: [0, 1048576], artifactMaxFiles: [0, 1000000], userStorageMb: [0, 1048576] });
 export const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
-export const MAX_ARTIFACT_TOTAL = 30 * 1024 * 1024;
-export const MAX_ARTIFACTS = 30;
+export const MAX_ARTIFACT_TOTAL = 0;
+export const MAX_ARTIFACTS = 0;
+// Transport limits bound one JSON allocation, independently of storage quotas.
+export const MAX_JOB_BYTES = 512 * 1024 * 1024;
+export const MAX_WORK_EVENT_BYTES = 48 * 1024 * 1024;
 export const MAX_SKILL_BYTES = 64 * 1024;
 export const MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024;
 export const PROTOCOLS = new Set(['anthropic', 'openai-chat', 'openai-responses']);
@@ -12,7 +15,7 @@ export const EFFORTS = new Set(['auto', 'low', 'medium', 'high', 'xhigh', 'max']
 export const fault = (message, status = 400, code = 'INVALID_WORK_REQUEST') => Object.assign(new Error(message), { status, code });
 
 export function validateLimits(input = {}, base = DEFAULT_LIMITS) {
-  const result = { ...base };
+  const result = { ...DEFAULT_LIMITS, ...base };
   for (const key of Object.keys(input)) {
     if (!(key in DEFAULT_LIMITS)) throw fault(`不支持的沙箱设置：${key}`);
     const value = input[key];
@@ -24,6 +27,16 @@ export function validateLimits(input = {}, base = DEFAULT_LIMITS) {
     result[key] = value;
   }
   return result;
+}
+
+export function artifactPolicy(input = {}) {
+  const limits = validateLimits(input);
+  return { count: limits.artifactMaxFiles, total: limits.artifactTotalMb * 1024 * 1024, bytes: MAX_ARTIFACT_BYTES, userStorage: limits.userStorageMb * 1024 * 1024 };
+}
+
+export function artifactLimitInstructions(input = {}) {
+  const policy = artifactPolicy(input);
+  return `Each downloadable file must be at most 10 MB. ${policy.count ? `At most ${policy.count} files may be saved per conversation.` : 'There is no configured file-count quota.'} ${policy.total ? `The conversation file total must be at most ${policy.total / 1024 / 1024} MB.` : 'There is no configured total-file-size quota.'} Available workspace memory and disk still apply.`;
 }
 
 export function safeRelativePath(value) {
@@ -71,7 +84,8 @@ export function validateJob(job) {
   if (typeof job.webSearch !== 'boolean') throw fault('网络搜索选项无效。');
   if (!Array.isArray(job.skills) || job.skills.length > 10) throw fault('一次最多使用 10 项技能。');
   for (const skill of job.skills) validateSkill(skill);
-  if (!Array.isArray(job.files) || job.files.length > MAX_ARTIFACTS + 5) throw fault('工作文件数量超过限制。');
+  const limits = validateLimits(job.limits), policy = artifactPolicy(limits);
+  if (!Array.isArray(job.files) || (policy.count && job.files.length > policy.count)) throw fault(`工作文件数量超过管理员设置的 ${policy.count} 个上限。`);
   let size = 0;
   const paths = new Set();
   for (const file of job.files) {
@@ -79,16 +93,17 @@ export function validateJob(job) {
     if (paths.has(file.path)) throw fault('工作文件路径重复。');
     paths.add(file.path);
     if (typeof file.data !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(file.data) || file.data.length > Math.ceil(MAX_ARTIFACT_BYTES * 4 / 3) + 4) throw fault('工作文件格式或大小无效。');
-    size += Buffer.from(file.data, 'base64').length;
+    const decodedBytes = Buffer.from(file.data, 'base64').length;
+    if (decodedBytes > MAX_ARTIFACT_BYTES) throw fault('单个工作文件超过 10 MB。');
+    size += decodedBytes;
   }
-  if (size > MAX_ARTIFACT_TOTAL) throw fault('工作文件总大小超过 30 MB。');
+  if (policy.total && size > policy.total) throw fault(`工作文件总大小超过管理员设置的 ${limits.artifactTotalMb} MB 上限。`);
   if (job.images !== undefined && (!Array.isArray(job.images) || job.images.length > 5)) throw fault('一次最多发送 5 张图片。');
   for (const image of job.images ?? []) {
     if (image?.type !== 'image' || image.source?.type !== 'base64' || !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(image.source.media_type) || typeof image.source.data !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(image.source.data) || image.source.data.length > 14 * 1024 * 1024) throw fault('图片输入无效。');
     size += Buffer.from(image.source.data, 'base64').length;
   }
-  if (size > MAX_ARTIFACT_TOTAL) throw fault('工作文件与图片总大小超过 30 MB。');
-  return { ...job, engine, protocol, maxOutputTokens: job.maxOutputTokens ?? 16384, effort: job.effort ?? 'auto', limits: validateLimits(job.limits) };
+  return { ...job, engine, protocol, maxOutputTokens: job.maxOutputTokens ?? 16384, effort: job.effort ?? 'auto', limits };
 }
 
 export function validateCheckpoint(state, { model, protocol }) {
@@ -101,7 +116,7 @@ export function claudeArguments(job) {
     '--max-turns', String(job.mode === 'chat' ? 1 : job.limits.maxTurns), '--max-budget-usd', String(job.limits.maxBudgetUsd),
     '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', 'project',
     '--settings', '{"disableAllHooks":true,"enableAllProjectMcpServers":false,"autoMemoryEnabled":false}',
-    '--append-system-prompt', `${job.systemPrompt}\n${job.mode === 'work' ? 'You can execute tools inside this isolated workspace. Save final deliverables under /workspace/output. Do not claim a file exists before creating it. Files in output are offered as downloads. Link actual files with Markdown [Download name](output/relative/path). For a source directory, use Python zipfile to create an actual ZIP under output/ first. Downloads are limited to 30 files, 10 MB per file and 30 MB total. Never invent download URLs. The workspace has no unrestricted Internet; use WebSearch only when available. Never expose credentials or internal gateway information.' : 'Chat mode has no tools. Answer the user directly. Do not claim to execute code or create files.'}`];
+    '--append-system-prompt', `${job.systemPrompt}\n${job.mode === 'work' ? 'You can execute tools inside this isolated workspace. Save final deliverables under /workspace/output. Do not claim a file exists before creating it. Files in output are offered as downloads. Link actual files with Markdown [Download name](output/relative/path). For a source directory, use Python zipfile to create an actual ZIP under output/ first. ' + artifactLimitInstructions(job.limits) + ' Never invent download URLs. The workspace has no unrestricted Internet; use WebSearch only when available. Never expose credentials or internal gateway information.' : 'Chat mode has no tools. Answer the user directly. Do not claim to execute code or create files.'}`];
   if (job.effort !== 'auto') args.push('--effort', job.effort);
   if (job.mode === 'work') {
     const tools = ['Agent', 'Skill', 'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', ...(job.webSearch ? ['WebSearch'] : [])].join(',');

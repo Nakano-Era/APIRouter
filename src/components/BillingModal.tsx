@@ -45,7 +45,7 @@ export default function BillingModal({ onClose, onChanged }: { onClose: () => vo
     async function check() {
       try {
         const result = await api<BillingData>('/billing'); if (!active) return; setData(result); setError('');
-        if (awaitingPayment && result.membership?.source === 'stripe') { setPaymentNotice('已确认当前 Stripe 会员状态，权益和有效期如下。'); void Promise.resolve(changedRef.current?.()).catch(() => {}); }
+        if (awaitingPayment && (result.membership?.source === 'stripe' || result.underlyingMembership?.source === 'stripe')) { setPaymentNotice('已确认当前 Stripe 会员状态，权益和有效期如下。'); void Promise.resolve(changedRef.current?.()).catch(() => {}); }
         else if (awaitingPayment && Date.now() - started < 60_000) timer = setTimeout(() => void check(), 3000);
         else if (awaitingPayment) setPaymentNotice('暂未收到已完成的付款确认。稍后重新打开此页面查看，或联系管理员核对订单；请勿重复付款。');
         else if (returnFlow === 'return') { setPaymentNotice('已刷新服务器记录的会员状态。支付平台变更可能需要片刻同步。'); void Promise.resolve(changedRef.current?.()).catch(() => {}); }
@@ -77,7 +77,7 @@ export default function BillingModal({ onClose, onChanged }: { onClose: () => vo
   const hasYearly = data?.plans.some(plan => plan.interval === 'year');
   const paidMembership = !!data?.membership?.planId;
   const currentPlanId = data?.membership?.planId;
-  const stripeMembership = data?.membership?.source === 'stripe';
+  const stripeMembership = data?.membership?.source === 'stripe' || !!data?.hasStripeSubscription;
   const pendingRequest = data?.requests.find(request => request.status === 'pending');
 
   return <Modal title="升级你的方案" wide onClose={onClose}><div className="billing-modal-body">
@@ -86,8 +86,9 @@ export default function BillingModal({ onClose, onChanged }: { onClose: () => vo
     {notice && <div className="alert success" role="status"><CheckCircle2 size={16}/>{notice}</div>}
     {paymentNotice && <div className="billing-payment-notice" role="status">{paymentNotice}</div>}
     {loading ? <div className="settings-loading"><LoaderCircle size={23} className="spin"/>正在加载方案…</div> : data ? <>
-      {data.membership && <div className="billing-membership"><div><strong>{data.membership.planName}</strong><span>{data.membership.cancelAtPeriodEnd ? '已取消续订，有效期至' : stripeMembership ? '当前订阅周期至' : '会员有效期至'} {billingDate(data.membership.activeUntil)}</span><span>当前每日额度：{data.effectiveDailyLimit.toLocaleString()} 次</span><span>当前模型范围：{data.membership.allowedRoutes.length ? data.membership.allowedRoutes.join('、') : '本站全部启用模型'}</span>{['past_due', 'unpaid', 'incomplete'].includes(data.membership.status) && <small className="danger-text">付款状态需要处理，请管理订阅。</small>}</div>{data.canManageSubscription && <button className="button small" disabled={!!busy} onClick={() => void portal()}><CreditCard size={15}/>管理订阅<ArrowUpRight size={14}/></button>}</div>}
+      {data.membership && <div className="billing-membership"><div><strong>{data.membership.planName}</strong><span>{data.membership.activeUntil ? `${data.membership.cancelAtPeriodEnd ? '已取消续订，有效期至' : data.membership.source === 'stripe' ? '当前订阅周期至' : '会员有效期至'} ${billingDate(data.membership.activeUntil)}` : '长期有效'}</span><span>当前每日额度：{data.effectiveDailyLimit.toLocaleString()} 次</span><span>当前模型范围：{data.membership.allowedRoutes.length ? data.membership.allowedRoutes.join('、') : '本站全部启用模型'}</span>{['past_due', 'unpaid', 'incomplete'].includes(data.membership.status) && <small className="danger-text">付款状态需要处理，请管理订阅。</small>}</div>{data.canManageSubscription && <button className="button small" disabled={!!busy} onClick={() => void portal()}><CreditCard size={15}/>管理订阅<ArrowUpRight size={14}/></button>}</div>}
       {!data.membership && data.canManageSubscription && <div className="billing-membership"><p>查看付款状态、账单或管理现有订阅。</p><button className="button small" disabled={!!busy} onClick={() => void portal()}><CreditCard size={15}/>管理订阅<ArrowUpRight size={14}/></button></div>}
+      {data.hasAdminOverride && <p className="billing-note">当前套餐由管理员指定，调整或续期请联系管理员。{data.hasStripeSubscription ? '已有 Stripe 订阅继续按原订阅付款和续订，可通过“管理订阅”处理。' : ''}</p>}
       {hasMonthly && hasYearly && <div className="billing-periods" aria-label="计费周期">{([{ value: 'all', label: '全部方案' }, { value: 'month', label: '按月' }, { value: 'year', label: '按年' }] as const).map(option => <button key={option.value} className={interval === option.value ? 'active' : ''} onClick={() => setInterval(option.value)}>{option.label}</button>)}</div>}
       <div className="billing-plan-grid">
         <article className={`billing-plan ${!paidMembership ? 'billing-plan-current' : ''}`}><div className="billing-plan-title"><h4>{data.freePlan.name || '免费'}</h4>{!paidMembership && <span className="billing-current-badge">当前方案</span>}</div><div className="billing-price"><strong>免费</strong></div><p className="billing-plan-description">从日常对话开始，探索更多可能。</p><button className="button billing-plan-action" disabled>{paidMembership ? '基础方案' : '你正在使用此方案'}</button><PlanFeatures dailyLimit={data.freePlan.dailyLimit} allowedRoutes={data.freePlan.allowedRoutes}/></article>
@@ -96,7 +97,7 @@ export default function BillingModal({ onClose, onChanged }: { onClose: () => vo
           const pending = data.requests.some(request => request.planId === plan.id && request.status === 'pending');
           return <article className={`billing-plan ${current ? 'billing-plan-current' : ''}`} key={plan.id}><div className="billing-plan-title"><h4>{plan.name}</h4>{current && <span className="billing-current-badge">当前方案</span>}</div><div className="billing-price"><strong>{formatPrice(plan.priceCents, plan.currency)}</strong><span>/{intervalLabel(plan.interval)}</span></div><p className="billing-plan-description">{plan.description || '按你的需求，获得更多使用额度。'}</p><div className="billing-plan-buttons">
             {current ? <><button className="button billing-plan-action" disabled><Check size={16}/>你正在使用此方案</button>{!stripeMembership && plan.allowManual && data.paymentMethods.manual && <button className="button billing-plan-action" disabled={!!busy || !!pendingRequest || !data.canRequestManual} onClick={() => { setRequestPlan(plan); setError(''); setNotice(''); }}>{pending ? '续期申请审核中' : '申请续期'}</button>}</> : <>
-              {plan.allowStripe && data.paymentMethods.stripe && <button className="button primary billing-plan-action" disabled={!!busy || paidMembership || !!pendingRequest} onClick={() => void checkout(plan)}>{busy === `checkout-${plan.id}` ? <LoaderCircle className="spin" size={16}/> : <CreditCard size={16}/>}订阅 {plan.name}<ArrowUpRight size={15}/></button>}
+              {plan.allowStripe && data.paymentMethods.stripe && <button className="button primary billing-plan-action" disabled={!!busy || paidMembership || !!pendingRequest || data.hasAdminOverride || data.hasStripeSubscription} onClick={() => void checkout(plan)}>{busy === `checkout-${plan.id}` ? <LoaderCircle className="spin" size={16}/> : <CreditCard size={16}/>}订阅 {plan.name}<ArrowUpRight size={15}/></button>}
               {plan.allowManual && data.paymentMethods.manual && <button className={`button billing-plan-action ${!(plan.allowStripe && data.paymentMethods.stripe) ? 'primary' : ''}`} disabled={!!busy || !!pendingRequest || stripeMembership || !data.canRequestManual} onClick={() => { setRequestPlan(plan); setError(''); setNotice(''); }}><MessageSquareText size={16}/>{pending ? '申请审核中' : pendingRequest ? '已有待审核申请' : '申请开通'}</button>}
               {!((plan.allowStripe && data.paymentMethods.stripe) || (plan.allowManual && data.paymentMethods.manual)) && <button className="button billing-plan-action" disabled>暂未开放开通</button>}
             </>}
@@ -104,8 +105,8 @@ export default function BillingModal({ onClose, onChanged }: { onClose: () => vo
         })}
       </div>
       {stripeMembership && <p className="billing-note">你已拥有 Stripe 订阅。请通过“管理订阅”处理付款或取消续订，避免重复开通。</p>}
-      {!data.canRequestManual && <p className="billing-note">管理员无需申请开通，可在后台设置自己的额度。</p>}
-      {paidMembership && !stripeMembership && data.canRequestManual && <p className="billing-note">你当前的会员通过管理员开通，可申请续期或更换套餐。如需改用 Stripe，请在当前会员到期后订阅。</p>}
+      {!data.canRequestManual && !data.hasAdminOverride && <p className="billing-note">管理员无需申请开通，可在后台设置自己的额度。</p>}
+      {paidMembership && !stripeMembership && !data.hasAdminOverride && data.canRequestManual && <p className="billing-note">你当前的会员通过管理员开通，可申请续期或更换套餐。如需改用 Stripe，请在当前会员到期后订阅。</p>}
       {pendingRequest && <p className="billing-note">你有一项开通申请等待审核，处理完成后可以提交新申请或支付。</p>}
       {!data.plans.length && <p className="billing-note">管理员尚未发布付费套餐。你可以继续使用当前方案。</p>}
       {requestPlan && <form className="billing-request-form stack" ref={requestForm} onSubmit={submitRequest}><div className="card-heading"><div><strong>申请开通 {requestPlan.name}</strong><p className="muted">{formatPrice(requestPlan.priceCents, requestPlan.currency)} / {intervalLabel(requestPlan.interval)}</p></div><button className="icon-button" type="button" aria-label="取消开通申请" onClick={() => setRequestPlan(null)}><X size={17}/></button></div><p className="billing-note">申请不会自动扣款。管理员确认后开通一个周期；付款安排请与管理员确认。</p><label>申请说明（选填）<textarea name="note" rows={3} maxLength={1000} placeholder="写下你希望管理员了解的信息"/></label><div className="form-actions"><button className="button" type="button" disabled={!!busy} onClick={() => setRequestPlan(null)}>取消</button><button className="button primary" disabled={!!busy}>{busy === 'request' && <LoaderCircle size={16} className="spin"/>}提交申请</button></div></form>}

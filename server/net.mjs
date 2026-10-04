@@ -211,8 +211,8 @@ async function adminErrorDetail(response, apiKey, signal, rawTarget) {
   }
 }
 
-export async function openUpstream(provider, endpoint, { signal, body, query, timeoutMs, diagnostics = false, idleTimeout = false, sessionId } = {}) {
-  const compatible = endpoint === 'responses' && body ? prepareResponsesRequest(provider, body, { sessionId }) : null;
+export async function openUpstream(provider, endpoint, { signal, body, query, timeoutMs, diagnostics = false, idleTimeout = false, sessionId, nativePassthrough = false, requestHeaders } = {}) {
+  const compatible = !nativePassthrough && endpoint === 'responses' && body ? prepareResponsesRequest(provider, body, { sessionId }) : null;
   if (compatible) body = compatible.body;
   if (!['openai-chat', 'openai-responses', 'anthropic'].includes(provider.protocol)) {
     throw new UpstreamError('请选择受支持的 API 协议。', 'INVALID_PROTOCOL', 400);
@@ -267,9 +267,15 @@ export async function openUpstream(provider, endpoint, { signal, body, query, ti
       },
     });
     const headers = { accept: body ? 'text/event-stream, application/json' : 'application/json', ...compatible?.headers };
+    // Exported APIs preserve native client capabilities without forwarding its
+    // credentials, cookies, destination, or arbitrary proxy headers.
+    if (nativePassthrough) for (const name of ['anthropic-version', 'anthropic-beta', 'openai-beta', 'user-agent', 'originator', 'session-id', 'thread-id', 'x-client-request-id']) {
+      const value = requestHeaders?.[name];
+      if (typeof value === 'string' && value.length <= 4096 && !/[\r\n]/.test(value)) headers[name] = value;
+    }
     if (authMode === 'x-api-key' || (authMode === 'auto' && provider.protocol === 'anthropic')) headers['x-api-key'] = provider.apiKey;
     else headers.Authorization = `Bearer ${provider.apiKey}`;
-    if (provider.protocol === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+    if (provider.protocol === 'anthropic' && !headers['anthropic-version']) headers['anthropic-version'] = '2023-06-01';
     if (body) headers['Content-Type'] = 'application/json';
     response = await fetch(url, {
       method: body ? 'POST' : 'GET', headers,

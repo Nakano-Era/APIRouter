@@ -5,21 +5,29 @@ export function createModelRename({ store, routeId }) {
   const exists = table => !!store.get("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", table);
   const snapshots = [
     ['billing_plans', 'id', 'data'], ['billing_memberships', 'user_id', 'plan_snapshot'],
-    ['billing_requests', 'id', 'plan_snapshot'], ['billing_checkouts', 'id', 'plan_snapshot']
+    ['billing_requests', 'id', 'plan_snapshot'], ['billing_checkouts', 'id', 'plan_snapshot'],
+    ['billing_entitlement_overrides', 'user_id', 'plan_snapshot']
   ];
   const references = [
     ['models', 'route_key'], ['model_catalog', 'name'], ['model_versions', 'route_key'],
     ['user_model_limits', 'route_key'], ['user_model_routing', 'source_route_key'], ['user_model_routing', 'target_route_key'],
     ['requests', 'route_key'], ['requests', 'execution_route_key'], ['model_route_aliases', 'route_key']
   ];
+  function routingFallbacks() {
+    if (!exists('user_model_routing') || !store.all('PRAGMA table_info(user_model_routing)').some(column => column.name === 'fallbacks_json')) return [];
+    return store.all('SELECT rowid AS routing_rowid,fallbacks_json FROM user_model_routing').map(row => ({ ...row, fallbacks: JSON.parse(row.fallbacks_json || '[]') }));
+  }
   function assertUnused(name) {
     const conflict = () => { throw Object.assign(new Error('此模型名称已被使用，请选择其他名称。'), { status: 409 }); };
     for (const [table, column] of references) if (exists(table) && store.get(`SELECT 1 FROM ${table} WHERE ${column}=? LIMIT 1`, name)) conflict();
+    for (const row of routingFallbacks()) if (row.fallbacks.some(step => step.targetRouteKey === name)) conflict();
     if (exists('billing_config')) for (const row of store.all('SELECT free_routes FROM billing_config')) if (JSON.parse(row.free_routes).includes(name)) conflict();
     for (const [table, , column] of snapshots) if (exists(table)) for (const row of store.all(`SELECT ${column} FROM ${table}`)) if (JSON.parse(row[column]).allowedRoutes?.includes(name)) conflict();
   }
   function apply(original, name) {
     const variants = new Set(['']);
+    const routingBackups = routingFallbacks();
+    for (const row of routingBackups) for (const step of row.fallbacks) if (step.targetRouteKey === original) variants.add(step.targetVariantName || '');
     for (const [table, key, variant] of [
       ['models', 'route_key', 'variant_name'], ['model_versions', 'route_key', 'name'],
       ['requests', 'route_key', 'variant_name'], ['requests', 'execution_route_key', 'execution_variant_name'],
@@ -30,6 +38,12 @@ export function createModelRename({ store, routeId }) {
     store.run('INSERT INTO model_catalog(name,created_at) VALUES (?,?)', name, oldCatalog?.created_at || new Date().toISOString());
     store.run('UPDATE model_versions SET route_key=? WHERE route_key=?', name, original);
     for (const [table, column] of references) if (!['model_catalog', 'model_versions'].includes(table) && exists(table)) store.run(`UPDATE ${table} SET ${column}=? WHERE ${column}=?`, name, original);
+    // rowid remains stable even when the source route (part of the primary key)
+    // was renamed above; backup order and per-step reasoning stay unchanged.
+    for (const row of routingBackups) if (row.fallbacks.some(step => step.targetRouteKey === original)) {
+      const fallbacks = row.fallbacks.map(step => step.targetRouteKey === original ? { ...step, targetRouteKey: name } : step);
+      store.run('UPDATE user_model_routing SET fallbacks_json=? WHERE rowid=?', JSON.stringify(fallbacks), row.routing_rowid);
+    }
     for (const variant of variants) {
       const oldId = routeId(original, variant), newId = routeId(name, variant);
       for (const table of ['chats', 'messages', 'requests']) store.run(`UPDATE ${table} SET model_id=? WHERE model_id=?`, newId, oldId);

@@ -1,6 +1,6 @@
 # API contract
 
-This document describes the HTTP API implemented by `server/app.mjs`, `server/provider-tools.mjs`, `server/work.mjs`, and `server/billing.mjs`. Paths below include the `/api` prefix. JSON object examples describe fields; a `?` suffix means optional. Downloads and server-sent events (SSE) are exceptions to JSON responses.
+This document describes the HTTP API implemented by `server/app.mjs` and its provider, Work, billing, announcement and user-routing modules. Paths below include the `/api` prefix. JSON object examples describe fields; a `?` suffix means optional. Downloads and server-sent events (SSE) are exceptions to JSON responses.
 
 ## Authentication and common behavior
 
@@ -60,7 +60,7 @@ PublicModel = {
 }
 ```
 
-An administrator-defined `routeKey` is the parent model name; `variantName` identifies its version (empty string means default). Stable IDs use `r_<hash>` for default versions and `v_<hash>` for named versions. Each record is one version; clients group these under the parent, then offer version and effort selection. Only channels matching both parent and version can fail over to one another. This endpoint does not expose provider IDs, provider names, base URLs, channel counts, credentials, or the actual upstream model selected for a response. `Message` likewise omits `sourceProvider` and `sourceModel`.
+An administrator-defined `routeKey` is the parent model name; `variantName` identifies its version (empty string means default). Stable IDs use `r_<hash>` for default versions and `v_<hash>` for named versions. Each record is one version; clients group these under the parent, then offer version and effort selection. Normal channel retries are confined to that parent/version; an explicitly configured per-user execution list can move between versions/models as described below. This endpoint does not expose provider IDs, provider names, base URLs, channel counts, credentials, or the actual upstream model selected for a response. `Message` likewise omits `sourceProvider` and `sourceModel`.
 
 `reasoningEfforts` always includes `auto`, followed by configured levels supported by at least one enabled channel. Other accepted levels are `low`, `medium`, `high`, `xhigh`, and `max`. Advertised levels are administrator configuration, not a guarantee that an upstream accepts them. A request filters candidate channels by its chosen effort and mode. Unsupported combinations fail before generation.
 
@@ -157,8 +157,8 @@ Ordinary provider CRUD responses never contain the full saved API key. Parse pre
 | DELETE `/api/admin/providers/:id` | — | `{ok:true}` |
 | POST `/api/admin/providers/:id/sync` | — | `{models:AdminModel[],count:number}` |
 | GET `/api/admin/models` | — | `{models:AdminModel[],defaultModelId}` |
-| POST `/api/admin/models` | `{providerId,modelId,name?,routeKey?,vision?,reasoningEfforts?,contextWindow?,maxOutputTokens?}` | `{model}`, 201 |
-| PATCH `/api/admin/models/:id` | `{name?,routeKey?,enabled?,vision?,reasoningEfforts?,contextWindow?,maxOutputTokens?,isDefault?}` | `{model}` |
+| POST `/api/admin/models` | `{providerId,modelId,name?,routeKey?,vision?,reasoningEfforts?,contextWindow?,maxOutputTokens?,retries?:number|null}` | `{model}`, 201 |
+| PATCH `/api/admin/models/:id` | `{name?,routeKey?,enabled?,vision?,reasoningEfforts?,contextWindow?,maxOutputTokens?,isDefault?,retries?:number|null}` | `{model}` |
 | DELETE `/api/admin/models/:id` | — | `{ok:true}` |
 | POST `/api/admin/models/:id/test` | — | `{ok:boolean,latencyMs:number,error?:string,diagnostic?:object}` |
 | POST `/api/admin/models/:id/reset-health` | — | `{model}` |
@@ -175,7 +175,9 @@ Sync queries the upstream's actual model list, preserves existing administrator 
 
 ### Routing and original failure diagnostics
 
-Provider defaults and ranges: priority 0 (0–1000), failure protection enabled, failure threshold 3 (1–1000), cooldown 60 seconds (1–2592000). Provider create/PATCH accepts `failureProtectionEnabled:boolean`. Each model create/PATCH accepts `variantName` (up to 100 characters) and nullable `failureProtectionEnabled`, `failureThreshold`, `cooldownSeconds` overrides (null inherits the provider); administrator model JSON returns those fields. Disabling protection stops temporary disabling but retains retries, switching and logs. Policy changes reset health counters. Workspace routing defaults are six total attempts (1–10) and one extra attempt on the same channel (0–3). Only channels within the same parent model and version are candidates. Invalid payloads are not retried across paid providers. Failover stops after visible response text or a committed Work tool action/artifact, preventing duplicate execution.
+Provider defaults and ranges: priority 0 (0–1000), failure protection enabled, failure threshold 3 (1–1000), cooldown 60 seconds (1–2592000). Provider create/PATCH accepts `failureProtectionEnabled:boolean`. Each model create/PATCH accepts `variantName` (up to 100 characters) and nullable `failureProtectionEnabled`, `failureThreshold`, `cooldownSeconds` overrides (null inherits the provider); administrator model JSON returns those fields. Disabling protection stops temporary disabling but retains retries, switching and logs. Policy changes reset health counters.
+
+Model `retries` is null (inherit the workspace) or an integer 0–10 representing additional attempts on the same channel. It is returned by administrator model APIs and included in provider export/import. The workspace's `retriesPerChannel` is 0–3, default 1; `routingMaxAttempts` is 1–100, default 6, counting initial calls and retries **for each explicit execution target**, not the whole fallback list. Only retryable network/timeout/5xx errors use extra same-channel retries; authorization/rate-limit errors may change channel without same-channel retry, and invalid parameter errors stop that channel-routing invocation. Channel retries are confined to the target version and stop after visible text or committed tools. The outer, explicitly configured per-user fallback list may then continue through another target using preserved text and safe Work state; user cancellation and local safety limits stop the whole request.
 
 `GET /api/admin/routing-logs` returns the newest 200 attempts:
 
@@ -257,10 +259,10 @@ Only the configured provider origin and service prefix are used. URLs are DNS-ch
 ```text
 {available:boolean,reason:string|null,runtime:'sandbox',
  engines?:{native:boolean,'claude-code':boolean},skills:Skill[],
- tools:string[],webSearchSupported:true,webSearchNote:string,limits:WorkSettings}
+ tools:string[],webSearchSupported:boolean,webSearchNote:string,limits:WorkSettings}
 ```
 
-`available` checks configuration, the administrator's enabled flag, and runner health; health is briefly cached. `engines`, when returned by runner health, distinguishes the default native sandbox from the separately installed optional CLI image. The `webSearchSupported` flag means the integration offers a search option: native search uses Anthropic or Responses server tools; Chat Completions has no standard built-in search. Actual availability depends on the selected upstream channel and model. It is not a general-purpose unrestricted browser API.
+`available` checks configuration, the administrator's enabled flag, and runner health; health is briefly cached. `engines`, when returned by runner health, distinguishes the default native sandbox from the separately installed optional CLI image. `webSearchSupported` follows the administrator's search-enabled setting; it does not prove service connectivity. Native Work exposes independent `web_search` and `web_fetch` functions for all three API protocols, requiring ordinary tool calling rather than provider-native search. Searches use the configured SearXNG-compatible service; webpage reads go through the controlled gateway. The optional Claude Code engine retains its own search integration. This is not an unrestricted browser: no authenticated sessions or webpage JavaScript execution, and private destinations are blocked.
 
 `Skill` is `{id,name,description,createdAt,updatedAt,content?:string}`. Skills are workspace-wide administrator-managed Markdown instructions, not arbitrary installed application plugins.
 
@@ -274,13 +276,18 @@ Only the configured provider origin and service prefix are used. URLs are DNS-ch
 | GET `/api/work/chats/:id/artifacts` | Chat owner | `{artifacts:WorkArtifact[]}` |
 | GET `/api/work/artifacts/:id/download` | Artifact owner | File attachment |
 | GET `/api/work/chats/:chatId/artifacts/:id/download` | Chat and artifact owner | File attachment scoped to this chat |
-| GET `/api/work/chats/:id/artifacts/download?path=...` | Chat owner; optional saved directory prefix | ZIP of saved files, preserving paths; 30 MB total |
+| GET `/api/work/chats/:id/artifacts/download?path=...` | Chat owner; optional saved directory prefix | Streamed ZIP of saved files, preserving paths |
 | GET `/api/admin/work/settings` | Admin | Work status, settings, and bounds |
 | PATCH `/api/admin/work/settings` | Admin; partial `WorkSettings` | Updated status, settings, and bounds |
+| GET `/api/admin/work/search` | Admin | `{settings:{enabled:boolean,baseUrl:string}}` |
+| PATCH `/api/admin/work/search` | Admin; `{enabled?,baseUrl?}` | `{settings:{enabled,baseUrl}}` |
+| POST `/api/admin/work/search/test` | Admin; `{query?:string}` | `{ok:true,query,results:[{title,url,snippet}],retrievedAt}` |
+
+Search defaults to enabled with `baseUrl:'http://work-search:8080'`. The bundled service address is the sole private-address exception; custom services must be public HTTPS endpoints without embedded credentials, query strings or fragments and must expose SearXNG JSON `/search`. Unknown setting fields are rejected. Tests use the saved configuration and return at most five actual results, never mock success. Queries are 1–500 characters. Native tool searches accept 1–10 results; fetched pages are public HTTPS text/HTML/JSON with checked redirects, a 2 MB response cap and up to 30000 extracted characters. Search settings are independent of runner resource settings. Local tests use mocked search/network responses; Docker, real search-engine availability and deployment connectivity require environment acceptance.
 
 A skill can be submitted as Markdown or downloaded from a final public HTTPS raw-file URL. Metadata may be read from front matter and explicitly overridden. Skill names use 1–64 lowercase letters, digits, and hyphens; descriptions have a 500-character limit; content is limited to 64 KB; at most 32 skills are installed. URL imports reject private addresses, redirects, and HTML pages. Imports rebuild front matter and reject dynamic `!` plus backtick command syntax; they do not install hooks, MCP servers, executable packages, or referenced auxiliary files.
 
-`WorkArtifact` is `{id,chatId,path,name,size,mime,createdAt,downloadUrl}`. The runner must actually create a file under its output directory before the server stores and exposes an artifact. Downloads use attachment disposition and restrictive response headers; HTML/SVG content is not executed by the artifact endpoint. A task can return up to 30 files, 10 MB each and 30 MB total. Saved Work artifact storage is separately limited to 500 files and 200 MB per user. Replacing an output path in the same chat replaces its saved artifact. Deleting that chat deletes its saved artifacts.
+`WorkArtifact` is `{id,chatId,path,name,size,mime,createdAt,downloadUrl}`. The runner must actually create a file under its output directory before the server stores and exposes an artifact. Downloads use attachment disposition and restrictive response headers; HTML/SVG content is not executed by the artifact endpoint. Each file remains limited to 10 MB. Conversation file count/total and per-user storage are configurable, with zero disabling that quota (the default). Replacing an output path in the same chat counts only the replacement's actual decoded bytes. Deleting that chat deletes its saved artifacts. Restore includes every saved file; it never silently selects only the newest 30. A restore JSON payload is limited to 512 MB, each NDJSON event to 48 MB; repeated file snapshots have no cumulative wire-byte quota. Sandbox memory, 256 MB workspace and disk capacity still apply.
 
 Work settings responses are `{configured,...capabilities,settings:WorkSettings,limits:Bounds}`. Here `limits` contains bounds, overriding the current-value `limits` field used by the capabilities endpoint. Runner URL and authentication token are deployment configuration, not browser-editable fields.
 
@@ -293,14 +300,17 @@ Work settings responses are `{configured,...capabilities,settings:WorkSettings,l
 | `cpus` | 1 | 0.25–4 |
 | `maxBudgetUsd` | 2 | 0.1–20 |
 | `maxConcurrentJobs` | 2 | 1–4 |
+| `artifactTotalMb` | 0 | 0–1048576, per-conversation total; 0 = unlimited quota |
+| `artifactMaxFiles` | 0 | 0–1000000, per-conversation count; 0 = unlimited quota |
+| `userStorageMb` | 0 | 0–1048576, per-user Work storage; 0 = unlimited quota |
 
-Unknown settings are rejected. `maxBudgetUsd` applies only to the optional Claude Code execution budget; native execution enforces rounds/output/time/resources rather than an inferred USD amount. Neither is a prepaid balance reservation or a guarantee about third-party billing. The application's outer streaming deadline uses the configured runner timeout plus 60 seconds for runner-backed requests. Direct API requests use a default one-hour outer limit (`CHAT_TIMEOUT_SECONDS`, 60–21600 seconds) and an independent inactivity timeout (`UPSTREAM_TIMEOUT_MS`, default 180000 ms) refreshed by received data. Work job submission is integrated into chat generation; there is no public standalone `/jobs` API or durable background-task API. See [WORK.md](WORK.md) for runner deployment and sandbox boundaries.
+Unknown settings are rejected. `maxBudgetUsd` applies only to the optional Claude Code execution budget; native execution enforces rounds/output/time/resources rather than an inferred USD amount. Neither is a prepaid balance reservation or a guarantee about third-party billing. Each explicit execution target gets an outer streaming deadline: configured runner timeout plus 60 seconds for runner-backed requests, or the direct-API default one hour (`CHAT_TIMEOUT_SECONDS`, 60–21600 seconds). Direct calls also have an independent inactivity timeout (`UPSTREAM_TIMEOUT_MS`, default 180000 ms) refreshed by received data. Reaching one target's deadline may advance a configured fallback; browser disconnect or manual stop cancels the whole request. Work job submission is integrated into chat generation; there is no public standalone `/jobs` API or durable background-task API. See [WORK.md](WORK.md) for runner deployment and sandbox boundaries.
 
 ## Workspace settings, users, and invitations
 
 `GET /api/settings` returns `{settings}`. Non-admin responses omit `systemPrompt`. Workspace settings include `siteName`, `defaultModelId`, `dailyLimit`, `maxOutputTokens`, `routingMaxAttempts`, and `retriesPerChannel`; stored `workSettings` can also appear. Billing secrets and provider keys are not stored in these public settings.
 
-`PATCH /api/admin/settings` accepts workspace fields above plus `systemPrompt`; use the dedicated Work endpoint to modify runner limits. `siteName` has a 40-character limit, `systemPrompt` 20000 characters, daily quota 0–100000 (zero disables new requests), and direct-API output limit 128–32768. Chat titles have a 120-character limit.
+`PATCH /api/admin/settings` accepts workspace fields above plus `systemPrompt`; use the dedicated Work endpoint to modify runner limits. `siteName` has a 40-character limit, `systemPrompt` 20000 characters, daily quota 0–100000 (zero disables new requests), and direct-API output limit 128–32768. `routingMaxAttempts` is 1–100 and `retriesPerChannel` is 0–3. Chat titles have a 120-character limit.
 
 | Method and path | Input | Response |
 | --- | --- | --- |
@@ -316,7 +326,7 @@ Invitation validity is 1–30 days, default seven. Administrators cannot be disa
 
 ## Membership and billing
 
-`GET /api/billing` returns `{plans,freePlan,membership,requests,paymentMethods:{stripe,manual},canManageSubscription,canRequestManual,effectiveDailyLimit}`. Membership is null when expired. Plans contain `{id,name,description,priceCents,currency,interval,dailyLimit,allowedRoutes,active,allowStripe,allowManual,sortOrder}`; currency is USD/CNY/EUR/HKD, interval is month/year, and `allowedRoutes` contains route keys (empty means all). Administrators bypass model restrictions but not quota.
+`GET /api/billing` returns `{plans,freePlan,membership,underlyingMembership,hasAdminOverride,hasStripeSubscription,requests,paymentMethods:{stripe,manual},canManageSubscription,canRequestManual,effectiveDailyLimit}`. `membership` is the effective administrator override or active purchased membership, null when neither applies. `underlyingMembership` retains an active manual/Stripe membership beneath an override. A membership has `{planId,planName,activeUntil,source:'manual'|'stripe'|'admin',status,cancelAtPeriodEnd,dailyLimit,allowedRoutes}`; administrator-granted free access uses `planId:null`, and permanent access uses `activeUntil:null`. Administrative notes and actor IDs are omitted from user responses. Plans contain `{id,name,description,priceCents,currency,interval,dailyLimit,allowedRoutes,active,allowStripe,allowManual,sortOrder}`; currency is USD/CNY/EUR/HKD, interval is month/year, and `allowedRoutes` contains route keys (empty means all). Administrators bypass model restrictions but not quota.
 
 - POST `/api/billing/requests` `{planId,note?}` returns `{request}`. Only one pending request per user; the sole enabled administrator cannot submit an application requiring their own approval.
 - POST `/api/billing/checkout` `{planId}` and `/api/billing/portal` return `{url}`. The server chooses prices and validates official Stripe destinations.
@@ -327,12 +337,34 @@ Invitation validity is 1–30 days, default seven. Administrators cannot be disa
 
 See [MEMBERSHIP.md](MEMBERSHIP.md) for deployment and subscription lifecycle details.
 
+### Administrator membership assignments
+
+- GET `/api/admin/users/:id/membership` returns `{effective,override,underlyingMembership,hasStripeSubscription,plans,history}`. `plans` includes unpublished plans. `effective` is `{planId,planName,dailyLimit,allowedRoutes,activeUntil,source}`. `override` is null or a membership plus `{reason,adminId,updatedAt}`; it can have `status:'expired'` while the effective entitlement has already reverted. `history` contains up to 30 newest audit records `{id,action:'set'|'restore',adminName,reason,createdAt,previous,next}`.
+- PUT at the same path accepts `{planId:'free'|planId,duration?:'period'|'permanent'|'until',activeUntil?:ISODateTime,note?:string}`. Default `period` starts one month/year from now according to the chosen plan (free uses month); `until` requires a future zoned datetime; `permanent` has no expiry. Notes are at most 1000 characters.
+- DELETE at the same path accepts optional `{note}` and removes the administrator override, restoring the currently valid underlying membership or current free entitlement. It does not extend the original term. Repeated deletion is idempotent.
+
+All three routes require an administrator; mutations require CSRF and an existing user. Assignments save plan rights as a snapshot, never clear usage counters, and retain the precedence of an explicit user daily limit. They neither charge nor cancel Stripe subscriptions. Webhooks continue to update underlying purchased rights without overriding the administrator selection; the customer's payment portal remains available. New manual applications/payments and approving a pending application are blocked while a current override applies. Model renames update current override snapshots but never rewrite historical audit values.
+
+## Announcements
+
+`Announcement` is `{id,title,body,status:'draft'|'published',revision,createdAt,updatedAt,publishedAt}`. Title and Markdown body must be nonempty, capped at 120 and 20000 characters respectively. Rendering uses the existing safe Markdown/math pipeline with HTML disabled; no announcement script execution or external-image loading occurs.
+
+| Method and path | Input / access | Response |
+| --- | --- | --- |
+| GET `/api/announcements` | Signed in | `{announcements:Announcement[]}` containing published revisions unread by this user |
+| POST `/api/announcements/:id/read` | Signed in; `{revision:number}` | `{ok:true}` |
+| GET `/api/admin/announcements` | Admin | `{announcements:Announcement[]}` including drafts |
+| POST `/api/admin/announcements` | Admin; `{title,body,status?:'draft'|'published'}` | `{announcement}`, 201; default draft |
+| PATCH `/api/admin/announcements/:id` | Admin; `{revision,title?,body?,status?}` | `{announcement}` |
+
+Mutations require CSRF. Drafts are not returned to ordinary users. Read records are keyed by the authenticated user and announcement, so closing on one device syncs to the user's other devices on refresh; the frontend refreshes on focus and every 60 seconds. Editing content/status increments its revision, making newly published content unread again; a no-op edit preserves the revision. Unpublishing retains a draft. Stale editor/read revisions return 409 instead of overwriting or dismissing new content. Unknown/unpublished read targets return 404. There is no scheduled publication or public unauthenticated announcement endpoint.
+
 ## Model catalog and versions
 
 - GET `/api/admin/model-groups` returns `{groups:[{name,variants:[{name,modelIds:string[]}]}]}`, including empty drafts.
 - PUT `/api/admin/model-groups` accepts one `{name,variants,originalName?}` and atomically replaces that parent's mapping. When editing, `originalName` identifies the existing parent; a changed `name` renames it in the same transaction. Names are up to 300 characters, at most 100 unique versions per parent and 500 channel records per version. Each upstream record belongs to one version. Selected records become enabled, except that renaming preserves the enabled state of existing bindings retained in their original version. Removed records are disabled and retained with their mapping reset. Empty drafts are excluded from public choices. Involved providers must be idle.
 
-Renaming retains upstream IDs and versions, migrates public model references, default selection, per-user version limits and usage labels, both ends of user routing rules, and allowed model names in free/paid plans and stored membership/application/checkout snapshots. Historical request route labels use the renamed model while request counts, timestamps, token usage and upstream attempt records remain intact. Old public IDs remain accepted through rename aliases, subject to current model availability and plan permissions. The frontend remaps the current selection instead of falling back to another model. Name collisions return 409 without partial changes; a missing original name returns 404. Active related tasks or in-progress payment operations temporarily return 409 so they cannot write back stale routing or plan data.
+Renaming retains upstream IDs and versions, migrates public model references, default selection, per-user version limits and usage labels, both ends of user routing rules including ordered fallback targets, and allowed model names in free/paid plans and stored membership/administrator-override/application/checkout snapshots. Historical request route labels use the renamed model while request counts, timestamps, token usage and upstream attempt records remain intact. Administrator entitlement audit snapshots retain their original values. Old public IDs remain accepted through rename aliases, subject to current model availability and plan permissions. The frontend remaps the current selection instead of falling back to another model. Name collisions return 409 without partial changes; a missing original name returns 404. Active related tasks or in-progress payment operations temporarily return 409 so they cannot write back stale routing or plan data.
 
 Channel-level model endpoints remain available. Provider backups retain assigned version mappings and failure overrides; empty catalog drafts and user quotas require a full data backup.
 
@@ -352,11 +384,21 @@ The archive retains its existing per-user/chat file layout and schema version. `
 
 ## Per-user execution routing
 
-GET and PUT `/api/admin/users/:id/model-routing` require administrator access; PUT also requires CSRF. Both return `{rules:[{sourceRouteKey,sourceVariantName,targetRouteKey,targetVariantName,enabled,effort}]}`. PUT atomically replaces the user's rules, up to 100, with one rule per source model/version. Empty version strings mean the default version. `enabled` defaults to true; `effort` defaults to `auto` and accepts `low`, `medium`, `high`, `xhigh`, `max`. Enabled targets must have available enabled channels supporting the fixed effort. A source cannot equal its target. Disabled stale entries can be retained or removed. Changing rules while that user has an active generation returns 409.
+GET and PUT `/api/admin/users/:id/model-routing` require administrator access; PUT also requires CSRF. Both return `{rules:[{sourceRouteKey,sourceVariantName,targetRouteKey,targetVariantName,enabled,effort,fallbacks:[{targetRouteKey,targetVariantName,effort}]}]}`. PUT atomically replaces the user's rules, up to 100, with one rule per source model/version. The fallback array has no fixed count cap but remains subject to the HTTP body limit. Empty version strings mean the default version. `enabled` defaults to true; each target's `effort` defaults to `auto` and accepts `low`, `medium`, `high`, `xhigh`, `max`. Enabled targets must have available enabled channels supporting the fixed effort. A source cannot equal its primary target; it may appear explicitly as a backup. Duplicate model/version/effort combinations within a rule are rejected. Disabled stale entries can be retained or removed. Changing rules while that user has an active generation returns 409.
 
-Source entitlement and requested capabilities are validated first. An enabled rule chooses the actual target exactly once; mappings do not chain or recurse. The administrator's rule authorizes execution of the target without a second plan-model or target-version quota check. Account/plan aggregate quotas still apply; version quota is charged to the selected source only. Target unavailability fails before message/history mutation and request reservation, with no fallback to the source. All target attempts remain confined to the specified target version. Work continuation also retains its actual-model/protocol checkpoint compatibility checks.
+Source entitlement and requested capabilities are validated first. A rule supplies one ordered list: primary followed by explicit backups; mappings do not chain or recurse. A usable backup can start if an earlier target is unavailable. If all targets fail preflight, no message/history mutation or quota reservation occurs. Target failure, timeout, empty output or explicit upstream incomplete status can advance to the next target. Already emitted text stays in the same assistant message and becomes continuation context; normal completion is not heuristically reclassified from its prose. Each target independently applies the workspace's maximum channel attempts and its own deadline. There is no implicit fallback to the source or unlisted models.
+
+The administrator's rule authorizes target execution without a second plan-model or target-version quota check. Account/plan aggregate quotas still apply; one accepted request reserves the selected source version only once across the entire list. User stop/disconnect and local output/storage safety limits stop fallback. Native Work can hand off saved, compatible tool checkpoints and files; completed tools are not automatically replayed. Committed operations without a reliable checkpoint, or a CLI run that already performed actions, block automatic handoff. Ordinary same-target Work continuation preserves its model/protocol checks. Upper-layer text continuation cannot recover arbitrary process memory or private upstream state.
 
 Ordinary models/chat/message APIs and SSE retain the selected source identity and do not expose the mapping. The app does not change system prompts to impersonate the selected model. Administrator routing logs additionally expose `userId`, `sourceRouteKey`, `sourceVariantName`, `executionRouteKey`, `executionVariantName`, `requestedEffort`, `executionEffort`, `userRoutingApplied`; these fields are snapshots recorded on the generation request. Provider/channel backups do not include per-user mappings; full database backup does.
+
+## External API credentials
+
+The independent external-client API uses root `/v1/*` endpoints rather than the browser's `/api/*` session interface. Administrators manage credentials through GET/POST `/api/admin/api-keys` and PATCH/DELETE `/api/admin/api-keys/:id`; these management routes use normal administrator session authentication and CSRF. Creation returns `{key,apiKey}` once, listing returns `{keys}`, updates return `{key}`. A credential record is `{id,name,enabled,modelIds,keyHint,createdAt,lastUsedAt}`. `modelIds` references explicitly allowed upstream channel-record IDs, not public aliases. The database stores the credential hash, not recoverable plaintext.
+
+External GET `/v1/models` lists authorized enabled original upstream model IDs, deduplicated in `{object:'list',data:[{id,object:'model',created:0,owned_by:'apirouter'}]}`; listing does not guarantee real-time upstream health. POST `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` accept their respective native request protocols and only use authorized matching-protocol direct-API channels. An identical upstream ID on an unselected channel is not authorized implicitly. These endpoints do not translate protocols or run the website's Work/Claude Code engines, user-specific routing or browser membership quotas, and do not create website chat records. They accept the site's independently issued API Key through Bearer or `x-api-key` authentication; conflicting dual headers are rejected, and saved provider credentials are applied only server-side. JSON/SSE responses pass through without protocol conversion, with provider-secret redaction; an interrupted committed stream is not retried into another provider's response.
+
+External requests have a 32 MiB JSON limit, 64 MiB response limit, fixed one-hour total deadline, default 180-second upstream inactivity timeout, per-key limit of 10 concurrent generations and per-IP limit of 300 requests/minute. Keys have no automatic expiry; disabling/revoking or changing their allowlist aborts their active external requests as well as preventing later unauthorized calls. Disabling an upstream model/provider is rechecked before retries and after awaited stream reads. An owner account that is disabled or no longer an administrator invalidates its keys. See [EXPORTED-API.md](EXPORTED-API.md) for setup, one-time credential download and examples.
 
 ## Mathematical Markdown presentation
 

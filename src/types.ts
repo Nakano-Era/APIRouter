@@ -3,7 +3,7 @@ export interface Session { user: User | null; needsSetup: boolean; csrfToken?: s
 export interface LoginSession { id: string; deviceName: string; deviceType: 'desktop' | 'mobile' | 'tablet' | 'unknown'; loginIp: string | null; geoLocation: string; createdAt: string; lastSeenAt: string; expiresAt: string | null; current: boolean }
 export type ChatMode = 'chat' | 'work';
 export interface Model { variantName?: string; routeKey?: string; id: string; modelId: string; name: string; vision: boolean; modes: ChatMode[]; reasoningEfforts: string[]; contextWindow?: number | null; maxOutputTokens?: number | null }
-export interface AdminModel extends Model { failureProtectionEnabled?: boolean | null; failureThreshold?: number | null; cooldownSeconds?: number | null; providerId: string; enabled: boolean; providerName?: string; status: 'untested' | 'ok' | 'error'; lastCheckedAt?: string | null; error?: string | null; available?: boolean; routeKey?: string; channelCount?: number; failureCount?: number; cooldownUntil?: string | null }
+export interface AdminModel extends Model { retries?: number | null; failureProtectionEnabled?: boolean | null; failureThreshold?: number | null; cooldownSeconds?: number | null; providerId: string; enabled: boolean; providerName?: string; status: 'untested' | 'ok' | 'error'; lastCheckedAt?: string | null; error?: string | null; available?: boolean; routeKey?: string; channelCount?: number; failureCount?: number; cooldownUntil?: string | null }
 export interface Chat { id: string; title: string; modelId: string; createdAt: string; updatedAt: string; pinned: boolean; archived: boolean; mode: ChatMode; effort: string; skillIds: string[]; webSearch: boolean }
 export interface Attachment { id: string; name: string; mime: string; size: number; kind: 'image' | 'text'; url: string }
 export interface Message { id: string; role: 'user' | 'assistant'; content: string; reasoning?: string; modelId?: string; createdAt: string; status: 'complete' | 'streaming' | 'error' | 'stopped'; attachments: Attachment[]; error?: string | null; canContinue?: boolean }
@@ -19,4 +19,5 @@ export interface RoutingAttempt { id: string; requestId: string; providerName: s
 
 export interface ModelGroup { name: string; variants: { name: string; modelIds: string[] }[] }
 export interface ModelLimit { routeKey: string; variantName: string | null; dailyLimit: number | null; monthlyLimit: number | null; usedToday?: number; usedMonth?: number }
-export interface UserModelRoutingRule { sourceRouteKey: string; sourceVariantName: string; targetRouteKey: string; targetVariantName: string; enabled: boolean; effort: string }
+export interface UserModelRoutingTarget { targetRouteKey: string; targetVariantName: string; effort: string }
+export interface UserModelRoutingRule extends UserModelRoutingTarget { sourceRouteKey: string; sourceVariantName: string; enabled: boolean; fallbacks?: UserModelRoutingTarget[] }

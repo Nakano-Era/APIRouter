@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && python3 -m venv --system-site-packages /opt/pythonenv \
     && /opt/pythonenv/bin/pip install --no-cache-dir python-pptx==1.0.2 XlsxWriter==3.2.9 typing-extensions==4.15.0
 WORKDIR /opt/apirouter
-COPY --chown=node:node runner/worker.mjs runner/protocol.mjs runner/native-agent.mjs runner/native-tools.mjs ./
+COPY --chown=node:node runner/worker.mjs runner/protocol.mjs runner/native-agent.mjs runner/native-tools.mjs runner/native-web.mjs runner/work-handoff.mjs ./
 RUN mkdir -p /workspace && chown node:node /workspace
 ENV NODE_ENV=production PATH=/opt/pythonenv/bin:$PATH
 USER node

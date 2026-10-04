@@ -112,6 +112,17 @@ test('invites are single-use and ordinary members cannot access admin configurat
   assert.equal((await request('/api/admin/users', { session: member })).status, 403);
   assert.equal((await request('/api/settings', { session: member })).data.settings.systemPrompt, undefined);
 });
+
+test('per-model retry override is admin-only, nullable, bounded and survives sync', async () => {
+  const path = `/api/admin/models/${modelId}`;
+  for (const retries of [-1, 11, 1.5, '2']) assert.equal((await request(path, { session: admin, method: 'PATCH', body: { retries } })).status, 400);
+  assert.equal((await request(path, { session: member, method: 'PATCH', body: { retries: 0 } })).status, 403);
+  assert.equal((await request(path, { session: admin, csrf: false, method: 'PATCH', body: { retries: 0 } })).status, 403);
+  assert.equal((await request(path, { session: admin, method: 'PATCH', body: { retries: 0 } })).data.model.retries, 0);
+  const synced = await request(`/api/admin/providers/${providerId}/sync`, { session: admin, method: 'POST' });
+  assert.equal(synced.data.models.find(model => model.id === modelId).retries, 0);
+  assert.equal((await request(path, { session: admin, method: 'PATCH', body: { retries: null } })).data.model.retries, null);
+});
 test('upstream diagnostics are available only in the administrator probe response', async t => {
   const created = await request('/api/admin/models', { session: admin, method: 'POST', body: { providerId, modelId: diagnosticModelId } });
   assert.equal(created.status, 201);

@@ -192,6 +192,46 @@ test('work service forwards reasoning separately from final answer text', async 
   assert.deepEqual(events.filter(event => event.type === 'delta'), [{ type: 'delta', text: '最终回答。' }]);
 });
 
+test('work default quotas allow more than 30 files and 30 MB and restore every saved file', async t => {
+  const data = Buffer.alloc(1024 * 1024, 65).toString('base64');
+  const files = Array.from({ length: 32 }, (_, index) => ({ path: `source-${index}.txt`, data }));
+  let restored;
+  const { service, store } = fixture(t, { fetcher: async (_url, request) => {
+    const payload = JSON.parse(request.body);
+    if (payload.files.length) { restored = payload.files; return eventsResponse([{ type: 'done' }]); }
+    return eventsResponse([...files.map(file => ({ type: 'file', file })), { type: 'done' }]);
+  } });
+  assert.equal((await collect(service.stream(options()))).length, 32);
+  assert.equal(store.get('SELECT SUM(size) AS bytes FROM work_artifacts').bytes, 32 * 1024 * 1024);
+  await collect(service.stream(options()));
+  assert.equal(restored.length, 32);
+  assert.deepEqual(new Set(restored.map(file => file.path)), new Set(files.map(file => `output/${file.path}`)));
+  const directory = temp(t);
+  for (const file of files) writeFileSync(join(directory, file.path), Buffer.from(file.data, 'base64'));
+  assert.equal((await collectArtifacts(directory)).length, 32);
+});
+
+test('configurable work quotas account for actual bytes and file replacement; zero removes them', async t => {
+  let file = { path: 'first.bin', data: Buffer.alloc(1024 * 1024).toString('base64') };
+  const { service, store } = fixture(t, { fetcher: async () => eventsResponse([{ type: 'file', file }, { type: 'done' }]) });
+  store.setSetting('workSettings', { artifactMaxFiles: 1, artifactTotalMb: 1, userStorageMb: 1 });
+  await collect(service.stream(options()));
+  // One MiB is padded in base64: the old approximate byte count rejected it.
+  await collect(service.stream(options()));
+  assert.equal(store.get('SELECT COUNT(*) AS count FROM work_artifacts').count, 1);
+  file = { path: 'second.bin', data: 'eA==' };
+  await assert.rejects(collect(service.stream(options())), error => error.code === 'WORK_STORAGE_FULL');
+  store.setSetting('workSettings', { artifactMaxFiles: 1, artifactTotalMb: 0, userStorageMb: 0 });
+  await assert.rejects(collect(service.stream(options())), error => error.code === 'WORK_ARTIFACT_COUNT_LIMIT');
+  store.setSetting('workSettings', { artifactMaxFiles: 0, artifactTotalMb: 1, userStorageMb: 0 });
+  await assert.rejects(collect(service.stream(options())), error => error.code === 'WORK_ARTIFACT_TOTAL_LIMIT');
+  store.setSetting('workSettings', { artifactMaxFiles: 0, artifactTotalMb: 0, userStorageMb: 0 });
+  await collect(service.stream(options()));
+  assert.equal(store.get('SELECT COUNT(*) AS count FROM work_artifacts').count, 2);
+  assert.throws(() => validateLimits({ artifactTotalMb: -1 }));
+  assert.throws(() => validateJob(job({ files: [{ path: 'too-big', data: Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64') }] })));
+});
+
 for (const scenario of [
   { name: 'actual HTTP 503 switches before tools or text', status: 503, source: 'upstream-http', expectedCalls: ['primary', 'backup'], fails: false, channelFailures: 1 },
   { name: 'actual HTTP 400 does not retry another paid channel', status: 400, source: 'upstream-http', expectedCalls: ['primary'], fails: true, channelFailures: 0 },
@@ -272,7 +312,8 @@ test('work file and ZIP downloads are scoped to the conversation and contain onl
   }
   assert.deepEqual(Object.fromEntries(entries), { '源码/README.md': '真实源码说明', '源码/index.js': 'export const answer = 42;' });
   store.run('UPDATE work_artifacts SET size=? WHERE id=?', 31 * 1024 * 1024, artifacts[0].id);
-  assert.equal((await get('/api/work/chats/chat/artifacts/download')).status, 413);
+  const largeArchive = await get('/api/work/chats/chat/artifacts/download');
+  assert.equal(largeArchive.status, 200); await largeArchive.arrayBuffer();
 });
 
 test('artifact collection reports bounds instead of silently presenting an incomplete source tree', async t => {
@@ -281,11 +322,11 @@ test('artifact collection reports bounds instead of silently presenting an incom
   const files = await collectArtifacts(directory, { bytes: 10, onSkip: reason => skipped.push(reason) });
   assert.equal(files.length, 1); assert.deepEqual(skipped, ['size']);
   const events = [];
-  await runWorker({ ...job(), gateway: `http://gateway:3210/proxy/${jobId}`, jobToken: token }, { cwd: directory, emit: event => events.push(event), nativeRunner: async (_job, runtime) => {
+  await runWorker({ ...job({ limits: { ...DEFAULT_LIMITS, artifactMaxFiles: 30 } }), gateway: `http://gateway:3210/proxy/${jobId}`, jobToken: token }, { cwd: directory, emit: event => events.push(event), nativeRunner: async (_job, runtime) => {
     for (let index = 0; index < 31; index++) writeFileSync(join(runtime.cwd, 'output', `file-${index}.txt`), 'source');
   } });
   assert.equal(events.filter(event => event.type === 'file').length, 30);
-  assert.match(events.find(event => event.type === 'activity').label, /30 个文件.*ZIP/);
+  assert.match(events.find(event => event.type === 'activity').label, /30 个文件上限.*设为 0/);
 });
 
 test('work broker never exposes master runner token or API key to worker stdin and cleans Docker objects', async t => {

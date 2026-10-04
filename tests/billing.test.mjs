@@ -292,3 +292,81 @@ test('Checkout rejects unsafe deployment origins', async t => {
   const f = await fixture(t, { publicOrigin: 'http://remote.example.com' }), p = await f.plan(); await f.enable();
   assert.equal((await f.checkout(p.id)).status, 400); assert.equal(f.calls.length, 0);
 });
+
+test('admin membership assignment enforces auth, CSRF, validation and preserves usage', async t => {
+  const f = await fixture(t), p = await f.plan({ active: false, name: '内部体验版' });
+  const path = '/api/admin/users/user/membership', body = { planId: p.id, duration: 'period', note: '内部赠送' };
+  assert.equal((await f.request(path, { user: '' })).status, 401);
+  assert.equal((await f.request(path)).status, 403);
+  assert.equal((await f.request(path, { method: 'PUT', user: 'admin', body, headers: { 'X-CSRF-Token': '' } })).status, 403);
+  assert.equal((await f.request('/api/admin/users/missing/membership', { user: 'admin' })).status, 404);
+  assert.equal((await f.request(path, { method: 'PUT', user: 'admin' })).status, 400);
+  for (const invalid of [{ planId: 'missing' }, { planId: p.id, duration: 'bad' }, { planId: p.id, duration: 'until', activeUntil: '2020-01-01T00:00:00Z' }, { planId: p.id, duration: 'until', activeUntil: '2029-01-01' }]) {
+    assert.ok([400, 404].includes((await f.request(path, { method: 'PUT', user: 'admin', body: invalid })).status));
+  }
+  f.store.run('INSERT INTO requests(id,user_id,status,created_at) VALUES(?,?,?,?)', 'usage-preserved', 'user', 'complete', '2026-01-31T12:00:00Z');
+  const changed = await f.request(path, { method: 'PUT', user: 'admin', body });
+  assert.equal(changed.status, 200); assert.equal(changed.body.effective.planId, p.id);
+  assert.equal(changed.body.effective.activeUntil, '2026-02-28T12:34:56.000Z');
+  assert.equal(changed.body.effective.source, 'admin'); assert.equal(changed.body.history[0].reason, '内部赠送');
+  assert.equal(changed.body.plans[0].active, false); assert.equal(changed.body.underlyingMembership, null);
+  const publicData = (await f.request('/api/billing')).body;
+  assert.equal(publicData.membership.source, 'admin'); assert.equal(publicData.hasAdminOverride, true);
+  assert.equal(publicData.membership.reason, undefined); assert.equal(publicData.membership.adminId, undefined);
+  assert.equal(publicData.effectiveDailyLimit, 50); assert.equal(publicData.canRequestManual, false);
+  assert.equal(f.store.get('SELECT COUNT(*) AS n FROM requests WHERE user_id=?', 'user').n, 1);
+  f.store.run('UPDATE users SET daily_limit=7 WHERE id=?', 'user');
+  assert.equal(f.billing.effectiveEntitlement('user').dailyLimit, 7);
+  assert.equal((await f.request('/api/admin/users/other/membership', { user: 'admin' })).body.override, null);
+});
+
+test('admin free override replaces paid access, expires or restores without deleting subscriptions', async t => {
+  const f = await fixture(t), p = await f.plan(), request = await f.apply(p.id); await f.review(request.id);
+  const path = '/api/admin/users/user/membership';
+  f.store.setSetting('dailyLimit', 9);
+  await f.request('/api/admin/billing/settings', { method: 'PATCH', user: 'admin', body: { freeAllowedRoutes: ['free-only'] } });
+  let response = await f.request(path, { method: 'PUT', user: 'admin', body: { planId: 'free', duration: 'until', activeUntil: '2026-02-01T12:00:00Z' } });
+  assert.equal(response.status, 200); assert.equal(response.body.effective.planId, 'free'); assert.equal(response.body.effective.dailyLimit, 9);
+  assert.deepEqual(response.body.effective.allowedRoutes, ['free-only']); assert.equal(response.body.underlyingMembership.planId, p.id);
+  assert.equal((await f.request('/api/billing')).body.membership.planId, null);
+  f.setTime('2026-02-01T12:00:00Z');
+  response = await f.request(path, { user: 'admin' });
+  assert.equal(response.body.override.status, 'expired'); assert.equal(response.body.effective.planId, p.id);
+  await f.request(path, { method: 'PUT', user: 'admin', body: { planId: 'free', duration: 'permanent' } });
+  f.setTime('2029-01-01'); assert.equal(f.billing.effectiveEntitlement('user').source, 'admin');
+  assert.equal(f.billing.effectiveEntitlement('user').activeUntil, null);
+  response = await f.request(path, { method: 'DELETE', user: 'admin', body: { note: '恢复默认' } });
+  assert.equal(response.body.override, null); assert.equal(response.body.effective.source, 'free');
+  assert.equal(response.body.history.length, 3); assert.equal(response.body.history[0].action, 'restore');
+  assert.equal(f.store.get('SELECT plan_id FROM billing_memberships WHERE user_id=?', 'user').plan_id, p.id);
+});
+
+test('admin override survives in-flight Stripe confirmation and restores latest paid subscription', async t => {
+  const f = await fixture(t), paid = await f.plan(), override = await f.plan({ name: '赠送版', dailyLimit: 123, allowedRoutes: ['gift'] }); await f.enable();
+  const path = '/api/admin/users/user/membership';
+  await f.checkout(paid.id); const { session, subscription } = f.complete();
+  const gate = f.pauseCall('subscription'), confirmation = f.webhook('checkout.session.completed', session);
+  await gate.entered;
+  try { assert.equal((await f.request(path, { method: 'PUT', user: 'admin', body: { planId: override.id, duration: 'permanent' } })).status, 200); } finally { gate.release(); }
+  assert.equal((await confirmation).status, 200); assert.equal(f.billing.effectiveEntitlement('user').planId, override.id);
+  assert.equal((await f.request('/api/billing')).body.canManageSubscription, true);
+  assert.equal((await f.checkout(paid.id)).status, 409);
+  assert.equal((await f.request('/api/billing/requests', { method: 'POST', body: { planId: paid.id } })).status, 409);
+  subscription.items.data[0].current_period_end += 28 * 86400;
+  assert.equal((await f.webhook('invoice.paid', { subscription: subscription.id })).status, 200);
+  assert.equal(f.billing.effectiveEntitlement('user').dailyLimit, 123);
+  assert.equal((await f.request('/api/billing/portal', { method: 'POST', body: {} })).status, 200);
+  const result = await f.request(path, { method: 'DELETE', user: 'admin' });
+  assert.equal(result.status, 200); assert.equal(result.body.effective.source, 'stripe'); assert.equal(result.body.effective.planId, paid.id);
+  assert.equal(result.body.effective.activeUntil, '2026-03-28T12:34:56.000Z');
+});
+
+test('pending manual approvals cannot silently replace admin assignment and restore enables approval', async t => {
+  const f = await fixture(t), p = await f.plan(), pending = await f.apply(p.id);
+  const path = '/api/admin/users/user/membership';
+  await f.request(path, { method: 'PUT', user: 'admin', body: { planId: 'free', duration: 'permanent' } });
+  assert.equal((await f.review(pending.id)).status, 409);
+  assert.equal(f.store.get('SELECT status FROM billing_requests WHERE id=?', pending.id).status, 'pending');
+  await f.request(path, { method: 'DELETE', user: 'admin' });
+  assert.equal((await f.review(pending.id)).status, 200);
+});

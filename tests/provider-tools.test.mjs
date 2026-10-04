@@ -100,7 +100,7 @@ test('AnyRouter OpenAI environment imports select Responses rather than Claude C
 test('provider backup round trip retains version mappings and independent failure policies', t => {
   const { store, tools } = fixture(t);
   tools.importProviders([{ ...sample(), failureProtectionEnabled: false, failureThreshold: 1000, cooldownSeconds: 2592000,
-    models: [{ ...sample().models[0], variantName: '高智商版', catalogAssigned: true, failureProtectionEnabled: true, failureThreshold: 5, cooldownSeconds: 600 }] }]);
+    models: [{ ...sample().models[0], variantName: '高智商版', catalogAssigned: true, failureProtectionEnabled: true, failureThreshold: 5, cooldownSeconds: 600, retries: 2 }] }]);
   const saved = tools.exportDocument().providers[0];
   assert.equal(saved.failureProtectionEnabled, false);
   assert.equal(saved.models[0].variantName, '高智商版');
@@ -114,6 +114,8 @@ test('provider backup round trip retains version mappings and independent failur
   assert.equal(model.failure_protection_enabled, 1);
   assert.equal(model.failure_threshold_override, 5);
   assert.equal(model.cooldown_seconds_override, 600);
+  assert.equal(saved.models[0].retries, 2); assert.equal(model.retries_override, 2);
+  assert.throws(() => normalizeProvider({ ...sample(), models: [{ modelId: 'test', retries: -1 }] }), /重试/);
   assert.throws(() => normalizeProvider({ ...sample(), failureThreshold: 1001 }), /失败阈值/);
   assert.throws(() => normalizeProvider({ ...sample(), models: [{ modelId: 'test', variantName: 'a'.repeat(101) }] }), /版本名称/);
 });

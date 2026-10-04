@@ -4,7 +4,7 @@ import { Agent, fetch } from 'undici';
 import { classifyAddress } from '../server/net.mjs';
 import { fault } from './protocol.mjs';
 
-export async function safePublicRequest(raw, { method = 'GET', headers = {}, body, signal, timeoutMs = 30_000 } = {}) {
+export async function safePublicRequest(raw, { method = 'GET', headers = {}, body, signal, timeoutMs = 30_000, allowRedirect = false } = {}) {
   let url;
   try { url = new URL(raw); } catch { throw fault('请输入有效的公网 HTTPS 地址。'); }
   const host = url.hostname.replace(/^\[|\]$/g, '');
@@ -19,7 +19,7 @@ export async function safePublicRequest(raw, { method = 'GET', headers = {}, bod
   let response;
   try {
     response = await fetch(url, { method, headers, body, signal: effective, redirect: 'manual', dispatcher });
-    if (response.status >= 300 && response.status < 400) throw fault('地址发生重定向，请填写最终 HTTPS 地址。', 502);
+    if (!allowRedirect && response.status >= 300 && response.status < 400) throw fault('地址发生重定向，请填写最终 HTTPS 地址。', 502);
     return { response, signal: effective, cleanup: async () => { try { await response.body?.cancel(); } catch {} await dispatcher.destroy(); } };
   } catch (error) { await dispatcher.destroy(); throw error; }
 }

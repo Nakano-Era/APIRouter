@@ -1,0 +1,15 @@
+.exported-api-copy { display:flex; gap:8px; align-items:center; }
+.exported-api-copy input { min-width:0; flex:1; font-family:var(--font-mono, monospace); font-size:12px; }
+.exported-api-endpoints, .exported-api-tags { display:flex; flex-wrap:wrap; gap:6px 12px; font-size:12px; }
+.exported-api-endpoints code, .exported-api-tags code { overflow-wrap:anywhere; }
+.exported-api-selection { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.exported-api-selection h4 { margin:0; }
+.exported-api-models { max-height:280px; overflow:auto; border:1px solid var(--border); border-radius:10px; padding:4px 10px; }
+.exported-api-model { display:flex !important; flex-direction:row !important; align-items:flex-start; gap:10px; padding:10px 2px; cursor:pointer; }
+.exported-api-model + .exported-api-model { border-top:1px solid var(--border); }
+.exported-api-model > input { width:16px; height:16px; flex:none; margin-top:2px; }
+.exported-api-model > span { min-width:0; display:grid; gap:5px; }
+.exported-api-model code { overflow-wrap:anywhere; }
+.exported-api-model small { color:var(--muted); font-weight:400; }
+.exported-api-secret { border-color:var(--green); }
+.exported-api .button-group { flex-wrap:wrap; }

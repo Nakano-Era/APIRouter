@@ -72,6 +72,7 @@ export function createStore(dataDir) {
   addColumns('providers', { responses_profile: "TEXT NOT NULL DEFAULT 'auto'" });
   addColumns('providers', { failure_protection_enabled: 'INTEGER NOT NULL DEFAULT 1' });
   addColumns('models', { variant_name: "TEXT NOT NULL DEFAULT ''", catalog_assigned: 'INTEGER NOT NULL DEFAULT 0', failure_protection_enabled: 'INTEGER', failure_threshold_override: 'INTEGER', cooldown_seconds_override: 'INTEGER' });
+  addColumns('models', { retries_override: 'INTEGER' });
   addColumns('requests', { route_key: 'TEXT', variant_name: "TEXT NOT NULL DEFAULT ''" });
   addColumns('requests', { execution_route_key: 'TEXT', execution_variant_name: 'TEXT', requested_effort: 'TEXT', execution_effort: 'TEXT', user_routing_applied: 'INTEGER NOT NULL DEFAULT 0' });
   db.exec('CREATE INDEX IF NOT EXISTS idx_requests_model_quota ON requests(user_id,route_key,variant_name,created_at); CREATE INDEX IF NOT EXISTS idx_models_variant ON models(route_key,variant_name);');
@@ -85,7 +86,7 @@ export function createStore(dataDir) {
   db.exec("UPDATE models SET route_key=model_id WHERE route_key=''; CREATE INDEX IF NOT EXISTS idx_models_route ON models(route_key);");
   db.exec(`CREATE TABLE IF NOT EXISTS route_attempts (id TEXT PRIMARY KEY, request_id TEXT, provider_id TEXT, model_id TEXT, outcome TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_attempts_request ON route_attempts(request_id,created_at);`);
-  addColumns('route_attempts', { encrypted_detail: 'TEXT' });
+  addColumns('route_attempts', { encrypted_detail: 'TEXT', execution_route_key: 'TEXT', execution_variant_name: 'TEXT', execution_effort: 'TEXT' });
   db.prepare("UPDATE messages SET status='error', error='服务重启导致回复中断，已保存的内容可以继续生成。' WHERE status='streaming'").run();
   db.prepare("UPDATE requests SET status='interrupted' WHERE status='running'").run();
   db.prepare("UPDATE route_attempts SET outcome='stopped', error='服务重启导致尝试中断。' WHERE outcome='running'").run();

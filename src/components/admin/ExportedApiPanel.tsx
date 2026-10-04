@@ -1,0 +1,57 @@
+import { useEffect, useState, type FormEvent } from 'react';
+import { Check, Copy, Download, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { api, errorText, patch, post, remove } from '../../api';
+import type { AdminModel, Provider } from '../../types';
+import { orderedProviders } from './upstream-model-options';
+import './exported-api.css';
+
+interface ExportedKey { id: string; name: string; enabled: boolean; modelIds: string[]; keyHint: string; createdAt: string; lastUsedAt: string | null }
+const endpoints = { 'openai-chat': '/v1/chat/completions', 'openai-responses': '/v1/responses', anthropic: '/v1/messages' };
+const protocolLabels = { 'openai-chat': 'Chat Completions', 'openai-responses': 'Responses', anthropic: 'Anthropic Messages' };
+
+export default function ExportedApiPanel({ models, providers }: { models: AdminModel[]; providers: Provider[] }) {
+  const [keys, setKeys] = useState<ExportedKey[]>([]), [loading, setLoading] = useState(true), [busy, setBusy] = useState(false);
+  const [error, setError] = useState(''), [notice, setNotice] = useState('');
+  const [editing, setEditing] = useState<ExportedKey | 'new' | null>(null), [name, setName] = useState(''), [selected, setSelected] = useState<string[]>([]);
+  const [search, setSearch] = useState(''), [channel, setChannel] = useState(''), [revoking, setRevoking] = useState<string | null>(null);
+  const [created, setCreated] = useState<{ key: ExportedKey; apiKey: string } | null>(null);
+  const baseUrl = `${window.location.origin}/v1`;
+  const apiProviders = orderedProviders(providers).filter(provider => provider.runtime !== 'claude-code');
+  const options = models.map(model => ({ model, provider: apiProviders.find(provider => provider.id === model.providerId) })).filter(item => !!item.provider)
+    .sort((a, b) => Number(!!b.provider?.enabled && b.model.enabled && b.model.available !== false) - Number(!!a.provider?.enabled && a.model.enabled && a.model.available !== false) || a.model.modelId.localeCompare(b.model.modelId));
+  const visible = options.filter(({ model, provider }) => (!channel || model.providerId === channel) && `${model.modelId} ${provider?.name}`.toLowerCase().includes(search.trim().toLowerCase()));
+  const currentModels = (key: ExportedKey) => models.filter(model => key.modelIds.includes(model.id));
+  const originalIds = (key: ExportedKey) => [...new Set(currentModels(key).map(model => model.modelId))];
+  async function load() { const result = await api<{ keys: ExportedKey[] }>('/admin/api-keys'); setKeys(result.keys); }
+  useEffect(() => { let active = true; void api<{ keys: ExportedKey[] }>('/admin/api-keys').then(result => { if (active) setKeys(result.keys); }).catch(cause => { if (active) setError(errorText(cause)); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, []);
+  async function action(work: () => Promise<void>) { if (busy) return; setBusy(true); setError(''); setNotice(''); try { await work(); } catch (cause) { setError(errorText(cause)); } finally { setBusy(false); } }
+  function edit(value: ExportedKey | 'new') { setEditing(value); setName(value === 'new' ? '' : value.name); setSelected(value === 'new' ? [] : value.modelIds); setSearch(''); setChannel(''); setError(''); setNotice(''); }
+  async function save(event: FormEvent) {
+    event.preventDefault(); if (!editing) return;
+    await action(async () => {
+      const body = { name: name.trim(), modelIds: selected };
+      if (editing === 'new') { const result = await post<{ key: ExportedKey; apiKey: string }>('/admin/api-keys', body); setCreated(result); setKeys(items => [result.key, ...items]); }
+      else { const result = await patch<{ key: ExportedKey }>(`/admin/api-keys/${editing.id}`, body); setKeys(items => items.map(item => item.id === result.key.id ? result.key : item)); if (created?.key.id === result.key.id) setCreated({ ...created, key: result.key }); }
+      setEditing(null); setNotice('API 权限已保存。调用时填写上游原始模型 ID。');
+    });
+  }
+  async function copy(text: string) { try { await navigator.clipboard.writeText(text); setNotice('已复制。'); } catch { setError('浏览器未允许复制，请从下面的文本框手动复制。'); } }
+  function download() {
+    if (!created) return;
+    const document = { name: created.key.name, url: baseUrl, apiKey: created.apiKey, models: originalIds(created.key), endpoints: [...new Set(currentModels(created.key).map(model => providers.find(provider => provider.id === model.providerId)?.protocol).filter((protocol): protocol is Provider['protocol'] => !!protocol).map(protocol => endpoints[protocol]))] };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(document, null, 2)], { type: 'application/json' }));
+    const anchor = window.document.createElement('a'); anchor.href = url; anchor.download = `apirouter-api-${created.key.id}.json`; window.document.body.append(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); setNotice('调用配置已下载，文件内包含这把 API 密钥。');
+  }
+  return <section className="admin-section exported-api"><div className="section-title"><div><h3>对外 API</h3><p>生成本站调用密钥，为每把密钥指定可用模型和渠道。</p></div><button type="button" className="button primary small" disabled={busy || !!editing} onClick={() => edit('new')}><Plus size={15}/>创建 API</button></div>
+    {error && <div className="alert error" role="alert">{error}</div>}{notice && <div className="alert success" role="status"><Check size={16}/>{notice}</div>}
+    <div className="settings-card stack"><label>API 基础地址<div className="exported-api-copy"><input readOnly value={baseUrl}/><button type="button" className="button small" aria-label="复制 API 地址" onClick={() => void copy(baseUrl)}><Copy size={14}/></button></div></label><p className="field-help">模型名保持上游原始 ID；同名模型仅在勾选的渠道中调用。客户端需使用该渠道对应的接口协议。</p><div className="exported-api-endpoints"><code>GET /v1/models</code><code>POST /v1/chat/completions</code><code>POST /v1/responses</code><code>POST /v1/messages</code></div></div>
+    {created && <div className="settings-card stack exported-api-secret"><div className="card-heading"><strong>API 已生成 · {created.key.name}</strong><button type="button" className="icon-button" aria-label="关闭新 API 密钥" onClick={() => setCreated(null)}><X size={16}/></button></div><p className="field-help">完整密钥只在创建后这一次显示。请复制或下载配置，关闭后无法再次读取。</p><label>新 API Key<div className="exported-api-copy"><input readOnly autoComplete="off" value={created.apiKey}/><button type="button" className="button small" aria-label="复制新 API 密钥" onClick={() => void copy(created.apiKey)}><Copy size={14}/></button></div></label><div className="button-group"><button type="button" className="button primary small" onClick={download}><Download size={14}/>下载 API 配置</button><button type="button" className="button small" onClick={() => setCreated(null)}>已保存，关闭</button></div></div>}
+    {editing && <form className="settings-card stack" onSubmit={save}><div className="card-heading"><strong>{editing === 'new' ? '创建 API 密钥' : '修改 API 权限'}</strong><button type="button" className="icon-button" disabled={busy} aria-label="关闭 API 编辑" onClick={() => setEditing(null)}><X size={16}/></button></div><label>API 名称<input value={name} onChange={event => setName(event.target.value)} required maxLength={80} disabled={busy} placeholder="例如 我的外部客户端"/></label><div className="form-grid"><label>搜索上游模型或渠道<input value={search} onChange={event => setSearch(event.target.value)} placeholder="输入原始模型 ID 或渠道名"/></label><label>筛选 API 渠道<select value={channel} onChange={event => setChannel(event.target.value)}><option value="">全部 API 渠道</option>{apiProviders.map(provider => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label></div><div className="exported-api-selection"><strong>允许使用的模型</strong><span className="muted">已选 {selected.length} 项</span></div>
+      <div className="exported-api-models">{visible.map(({ model, provider }) => { const available = !!provider?.enabled && model.enabled && model.available !== false; return <label className="exported-api-model" key={model.id}><input type="checkbox" disabled={busy} checked={selected.includes(model.id)} onChange={event => setSelected(ids => event.target.checked ? [...ids, model.id] : ids.filter(id => id !== model.id))}/><span><code>{model.modelId}</code><small>{provider?.name} · {provider && protocolLabels[provider.protocol]}{!available ? ' · 当前不可用' : ''}</small></span></label>; })}{!visible.length && <p className="muted">没有匹配的 API 模型。请先添加连接并同步模型。</p>}</div>
+      {selected.some(id => !options.some(item => item.model.id === id)) && <div className="field-help">部分已选模型已被删除或改为 Claude Code。<button type="button" className="button small" disabled={busy} onClick={() => setSelected(ids => ids.filter(id => options.some(item => item.model.id === id)))}>移除失效选项</button></div>}
+      <p className="field-help">未选中的模型无法调用；停用的模型和渠道立即停止接收新请求。此 API 使用原生模型接口，不执行网页 Work 沙箱或用户专属路由。</p><div className="form-actions"><button type="button" className="button" disabled={busy} onClick={() => setEditing(null)}>取消</button><button className="button primary" disabled={busy || !selected.length}>{busy ? <LoaderCircle size={15} className="spin"/> : <Check size={15}/>}保存 API</button></div></form>}
+    <div className="exported-api-selection"><h4>已创建的 API</h4><button type="button" className="icon-button" aria-label="刷新 API 列表" disabled={busy || loading} onClick={() => void action(load)}><RefreshCw size={15}/></button></div>
+    {loading ? <p className="muted">正在加载…</p> : !keys.length && <div className="settings-empty"><KeyRound size={26}/><p>创建第一把密钥后，即可从其他客户端调用本站 API。</p></div>}
+    {keys.map(key => <div className="settings-card stack" key={key.id}><div className="card-heading"><strong>{key.name}</strong><span className={`status-pill ${key.enabled ? 'success' : ''}`}>{key.enabled ? '已启用' : '已停用'}</span></div><code className="muted">{key.keyHint}</code><div className="exported-api-tags">{originalIds(key).map(modelId => <code key={modelId}>{modelId}</code>)}{!originalIds(key).length && <span className="muted">已授权的模型已被删除</span>}</div><small className="muted">创建于 {new Date(key.createdAt).toLocaleString('zh-CN')} · {key.lastUsedAt ? `最近调用 ${new Date(key.lastUsedAt).toLocaleString('zh-CN')}` : '尚未调用'}</small><div className="button-group"><button type="button" className="button small" disabled={busy || !!editing} onClick={() => edit(key)}><Pencil size={14}/>修改模型权限</button><button type="button" className="button small" disabled={busy} onClick={() => void action(async () => { const result = await patch<{ key: ExportedKey }>(`/admin/api-keys/${key.id}`, { enabled: !key.enabled }); setKeys(items => items.map(item => item.id === key.id ? result.key : item)); setNotice(result.key.enabled ? 'API 已启用。' : 'API 已停用。'); })}>{key.enabled ? '停用' : '启用'}</button><button type="button" className="button small danger-text" disabled={busy} onClick={() => setRevoking(key.id)}><Trash2 size={14}/>撤销</button></div>{revoking === key.id && <div className="inline-confirm"><p>撤销后此密钥无法恢复，需要重新创建。</p><div className="button-group"><button type="button" className="button small" onClick={() => setRevoking(null)} disabled={busy}>取消</button><button type="button" className="button danger small" disabled={busy} onClick={() => void action(async () => { await remove(`/admin/api-keys/${key.id}`); setKeys(items => items.filter(item => item.id !== key.id)); if (created?.key.id === key.id) setCreated(null); setRevoking(null); setNotice('API 已撤销。'); })}>确认撤销</button></div></div>}</div>)}
+  </section>;
+}
