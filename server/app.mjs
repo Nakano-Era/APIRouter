@@ -18,6 +18,7 @@ import { createModelCatalog, modelRouteId, variantName } from './model-catalog.m
 import { createUserModelAccess } from './user-model-access.mjs';
 import { createChatExport } from './chat-export.mjs';
 import { createUserModelRouting } from './user-model-routing.mjs';
+import { createSessionManager } from './sessions.mjs';
 
 const protocols = new Set(['openai-chat', 'openai-responses', 'anthropic']);
 const effortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -49,6 +50,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   const syncing = new Set();
   const testing = new Map();
   const secureCookies = process.env.COOKIE_SECURE === 'true';
+  const sessions = createSessionManager({ store, secureCookies });
   const setupToken = store.get('SELECT id FROM users LIMIT 1') ? null : (suppliedSetupToken || process.env.SETUP_TOKEN || randomBytes(24).toString('base64url'));
   const publicOrigin = process.env.PUBLIC_ORIGIN ? new URL(process.env.PUBLIC_ORIGIN).origin : null;
   const billing = createBilling({ store, publicOrigin, stripeFactory });
@@ -84,13 +86,14 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     const token = req.headers.cookie?.split(';').map(v => v.trim()).find(v => v.startsWith('apirouter_session='))?.slice(18);
     if (token && /^[a-zA-Z0-9_-]{43}$/.test(token)) {
       const session = store.get('SELECT sessions.*, users.disabled FROM sessions JOIN users ON users.id=sessions.user_id WHERE token=? AND expires_at>?', digest(token), now());
-      if (session && !session.disabled) { req.session = session; req.user = store.get('SELECT * FROM users WHERE id=?', session.user_id); }
+      if (session && !session.disabled) { req.session = sessions.touch(session); req.user = store.get('SELECT * FROM users WHERE id=?', session.user_id); }
     }
     next();
   });
   const auth = (req, _res, next) => req.user ? next() : next(fail(401, '请先登录。'));
   const csrf = (req, _res, next) => ['GET', 'HEAD', 'OPTIONS'].includes(req.method) || safeEqual(req.get('x-csrf-token'), req.session?.csrf) ? next() : next(fail(403, '登录状态已更新，请刷新页面后重试。', 'CSRF_INVALID'));
   const admin = (req, _res, next) => req.user?.role === 'admin' ? next() : next(fail(403, '此操作仅限管理员。'));
+  sessions.registerRoutes(app, { auth, csrf });
   billing.registerRoutes(app, { auth, admin, csrf });
   work.registerRoutes(app, { auth, admin, csrf });
   createProviderTools({ store, providerJSON, ensureProviderIdle }).registerRoutes(app, { auth, admin, csrf });
@@ -100,13 +103,8 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   createChatExport({ store }).registerRoutes(app, { auth, admin, csrf });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false, message: { error: '登录尝试过多，请 15 分钟后重试。' } });
   function userJSON(row) { return { id: row.id, name: row.name, email: row.email, role: row.role, disabled: !!row.disabled, dailyLimit: row.daily_limit, createdAt: row.created_at }; }
-  function createSession(res, user) {
-    store.run('DELETE FROM sessions WHERE expires_at<=?', now());
-    const token = randomBytes(32).toString('base64url');
-    const csrfToken = randomBytes(24).toString('base64url');
-    const expiresAt = new Date(Date.now() + 7 * 86400_000).toISOString();
-    store.run('INSERT INTO sessions(token,user_id,csrf,expires_at) VALUES (?,?,?,?)', digest(token), user.id, csrfToken, expiresAt);
-    res.cookie('apirouter_session', token, { httpOnly: true, secure: secureCookies, sameSite: 'strict', path: '/', maxAge: 7 * 86400_000 });
+  function createSession(req, res, user) {
+    const csrfToken = sessions.create(req, res, user.id);
     return { user: userJSON(user), csrfToken, needsSetup: false };
   }
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
@@ -121,15 +119,16 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       if (store.get('SELECT id FROM users LIMIT 1')) throw fail(409, '管理员已创建，请登录。');
       store.run('INSERT INTO users(id,name,email,password,role,created_at) VALUES (?,?,?,?,?,?)', userId, name, email, password, 'admin', now());
     });
-    res.status(201).json(createSession(res, store.get('SELECT * FROM users WHERE id=?', userId)));
+    res.status(201).json(createSession(req, res, store.get('SELECT * FROM users WHERE id=?', userId)));
   });
   app.post('/api/auth/login', authLimiter, async (req, res) => {
     const email = validEmail(req.body.email);
     const password = typeof req.body.password === 'string' && req.body.password.length <= 256 ? req.body.password : '';
     const user = store.get('SELECT * FROM users WHERE email=?', email);
     const valid = await verifyPassword(password, user?.password || `${'00'.repeat(16)}:${'00'.repeat(64)}`);
-    if (!user || !valid || user.disabled) throw fail(401, '邮箱或密码错误，或账号已停用。');
-    res.json(createSession(res, user));
+    const currentUser = user && store.get('SELECT * FROM users WHERE id=?', user.id);
+    if (!user || !valid || !currentUser || currentUser.disabled || currentUser.password !== user.password) throw fail(401, '邮箱或密码错误，或账号已停用。');
+    res.json(createSession(req, res, currentUser));
   });
   app.get('/api/auth/invite', authLimiter, (req, res) => {
     const token = cleanText(req.query.token, 200);
@@ -151,11 +150,11 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       store.run('INSERT INTO users(id,name,email,password,role,created_at) VALUES (?,?,?,?,?,?)', userId, name, email, password, 'user', now());
       store.run('UPDATE invites SET used_at=? WHERE id=?', now(), invite.id);
     });
-    res.status(201).json(createSession(res, store.get('SELECT * FROM users WHERE id=?', userId)));
+    res.status(201).json(createSession(req, res, store.get('SELECT * FROM users WHERE id=?', userId)));
   });
   app.use('/api', auth, csrf);
   app.use(longPromptPath, express.json({ limit: '32mb' }));
-  app.post('/api/auth/logout', (req, res) => { store.run('DELETE FROM sessions WHERE token=?', req.session.token); res.clearCookie('apirouter_session', { path: '/', httpOnly: true, sameSite: 'strict', secure: secureCookies }); res.json({ ok: true }); });
+  app.post('/api/auth/logout', (req, res) => { store.run('DELETE FROM sessions WHERE token=?', req.session.token); sessions.clearCookie(res); res.json({ ok: true }); });
   app.post('/api/auth/password', authLimiter, async (req, res) => {
     const current = typeof req.body.currentPassword === 'string' && req.body.currentPassword.length <= 256 ? req.body.currentPassword : '';
     if (!(await verifyPassword(current, req.user.password))) throw fail(400, '当前密码错误。');

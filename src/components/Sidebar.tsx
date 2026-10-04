@@ -89,7 +89,7 @@ export default function Sidebar({ chats, selectedId, user, siteName, mobileOpen,
           {user.role === 'admin' && <button onClick={settings}><Shield size={17}/>管理工作空间</button>}
           <button onClick={() => { setArchiveView(!archiveView); setAccountOpen(false); }}><Archive size={17}/>{archiveView ? '返回全部聊天' : '已归档的聊天'}</button>
           {user.role !== 'admin' && <button onClick={settings}><Settings size={17}/>设置</button>}
-          <button onClick={onLogout}><LogOut size={17}/>退出登录</button>
+          <button onClick={onLogout} title="仅退出当前浏览器，其他设备保持登录"><LogOut size={17}/>退出登录</button>
         </div>}
         <button className="account-button" onClick={() => setAccountOpen(!accountOpen)} aria-expanded={accountOpen} aria-label="账号与设置">
           <span className="avatar">{user.name.slice(0,1).toUpperCase()}</span><span className="account-name"><strong>{user.name}</strong><small className="account-plan">{planName}</small></span><ChevronUp size={16}/>

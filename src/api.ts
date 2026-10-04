@@ -2,6 +2,7 @@ import type { Session, StreamEvent } from './types';
 
 let csrfToken = '';
 export function setSessionToken(session: Session) { csrfToken = session.csrfToken || ''; }
+const publicAuthPaths = new Set(['/auth/session', '/auth/setup', '/auth/login', '/auth/invite', '/auth/invite/accept']);
 export class ApiError extends Error { constructor(message: string, public status: number) { super(message); } }
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
@@ -10,7 +11,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   const response = await fetch(`/api${path}`, { ...options, headers, credentials: 'same-origin' });
   let data;
   try { data = await response.json(); } catch { throw new ApiError('服务器未返回有效数据，请稍后重试。', response.status); }
-  if (!response.ok) { if (response.status === 401 && csrfToken && !path.startsWith('/auth/')) window.dispatchEvent(new Event('session-expired')); throw new ApiError(data.error || '请求失败，请稍后重试。', response.status); }
+  if (!response.ok) { if (response.status === 401 && csrfToken && !publicAuthPaths.has(path.split('?')[0])) window.dispatchEvent(new Event('session-expired')); throw new ApiError(data.error || '请求失败，请稍后重试。', response.status); }
   return data as T;
 }
 export function post<T>(path: string, body?: unknown) { return api<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }); }

@@ -29,10 +29,17 @@ This document describes the HTTP API implemented by `server/app.mjs`, `server/pr
 | POST `/api/auth/login` | `{email,password}` | `Session` |
 | POST `/api/auth/logout` | — | `{ok:true}` |
 | POST `/api/auth/password` | `{currentPassword,newPassword}` | `{ok:true}` |
+| GET `/api/auth/sessions` | — | `{sessions:LoginSession[]}` |
+| DELETE `/api/auth/sessions/:id` | Opaque device-session ID | `{ok:true,current:boolean}` |
+| POST `/api/auth/sessions/logout-others` | — | `{ok:true,revokedCount:number}` |
 | GET `/api/auth/invite?token=...` | Invitation token | `{email,expiresAt}` |
 | POST `/api/auth/invite/accept` | `{token,name,email,password}` | `Session`, 201 |
 
 The setup token is shown in the server startup output and is never exposed by a GET endpoint. Passwords must be 12–256 characters; user names have a 60-character limit. Invitation URLs may carry `?invite=...` for the frontend.
+
+`LoginSession` is `{id,deviceName,createdAt,lastSeenAt,expiresAt,current:boolean}`. Device-management endpoints require authentication; mutations require CSRF. The list includes only the caller's unexpired sessions, with the current session first. IDs are random public identifiers, not authentication tokens or token hashes; raw user agents, IP addresses, CSRF secrets and cookie values are never returned in this list. Device names are coarse browser/OS labels and do not identify physical hardware. Recent activity updates at most once per minute.
+
+An account may hold multiple independent seven-day sessions. Signing in with an existing same-account cookie replaces only that browser session; other devices remain signed in. `/auth/logout` deletes only the current session and clears its cookie. Deleting a current session also clears its cookie; a missing or other-user ID returns 404. `logout-others` retains the caller's session and counts only unexpired sessions removed. Password changes revoke other sessions; account disable revokes all of that account's sessions. Revocation blocks subsequent authenticated requests and does not cancel account-wide background tasks. Existing session cookies remain valid after the automatic metadata migration; older unidentified sessions are labeled `原有设备`.
 
 ## Public models and channel privacy
 
@@ -329,7 +336,9 @@ Day/month boundaries use UTC+8 natural calendar periods; account/plan aggregate 
 
 ## Administrator chat archive
 
-GET `/api/admin/chats/export?format=json|markdown` requires an administrator and returns an attachment ZIP with no-store caching. Default format is JSON. It contains a manifest, user records and every user's chats including archived chats, with messages, separate reasoning, active journal chunks and file metadata. It omits attachment/artifact binary data, service credentials, password hashes and payment configuration; user-written message content is retained. Files are organized by user/chat ID. A dedicated read-only database snapshot keeps an export consistent while writes continue; at most two exports run concurrently (429 when busy). This is a reading/archive export, not a complete application restore backup.
+GET `/api/admin/chats/export?format=json|markdown&userId=<user-id>` requires an administrator and returns an attachment ZIP with no-store caching. Default format is JSON. Omit `userId` to export all users; supply a single nonempty user ID to include only that user's profile, chats and messages (including archived chats and disabled accounts). A nonexistent user returns 404; empty, repeated or overlong user IDs return 400. A user without chats still has their profile exported. Ordinary users cannot export even their own records through this admin endpoint.
+
+The archive retains its existing per-user/chat file layout and schema version. `manifest.json` adds `scope: "all" | "user"` and `userId: string | null`; all user/chat/message counts are scoped to the selected export. Attachment filenames contain `all` or `user-<id>`, format and creation time. Messages include separate reasoning, active journal chunks and owned file metadata. Attachment/artifact metadata is restricted to the chat owner's records, including for stale cross-user references. It omits attachment/artifact binary data, service credentials, password hashes and payment configuration; user-written message content is retained. A dedicated read-only database snapshot keeps an export consistent while writes continue; at most two exports run concurrently (429 when busy). This is a reading/archive export, not a complete application restore backup.
 
 ## Per-user execution routing
 

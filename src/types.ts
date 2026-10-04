@@ -1,5 +1,6 @@
 export interface User { id: string; name: string; email: string; role: 'admin' | 'user'; createdAt: string; disabled?: boolean; dailyLimit?: number }
 export interface Session { user: User | null; needsSetup: boolean; csrfToken?: string }
+export interface LoginSession { id: string; deviceName: string; createdAt: string; lastSeenAt: string; expiresAt: string; current: boolean }
 export type ChatMode = 'chat' | 'work';
 export interface Model { variantName?: string; routeKey?: string; id: string; modelId: string; name: string; vision: boolean; modes: ChatMode[]; reasoningEfforts: string[]; contextWindow?: number | null; maxOutputTokens?: number | null }
 export interface AdminModel extends Model { failureProtectionEnabled?: boolean | null; failureThreshold?: number | null; cooldownSeconds?: number | null; providerId: string; enabled: boolean; providerName?: string; status: 'untested' | 'ok' | 'error'; lastCheckedAt?: string | null; error?: string | null; available?: boolean; routeKey?: string; channelCount?: number; failureCount?: number; cooldownUntil?: string | null }

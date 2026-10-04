@@ -52,6 +52,14 @@ export function createStore(dataDir) {
     const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
     for (const [name, definition] of Object.entries(columns)) if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
   };
+  addColumns('sessions', { public_id: 'TEXT', created_at: 'TEXT', last_seen_at: 'TEXT', device_label: 'TEXT' });
+  // Existing cookies remain valid after migration. Public IDs are independent of
+  // both the authentication token hash and CSRF secret.
+  for (const session of db.prepare('SELECT token,expires_at FROM sessions WHERE public_id IS NULL OR created_at IS NULL OR last_seen_at IS NULL').all()) {
+    const createdAt = Number.isFinite(Date.parse(session.expires_at)) ? new Date(Date.parse(session.expires_at) - 7 * 86400_000).toISOString() : now();
+    db.prepare('UPDATE sessions SET public_id=COALESCE(public_id,?),created_at=COALESCE(created_at,?),last_seen_at=COALESCE(last_seen_at,?),device_label=COALESCE(device_label,?) WHERE token=?').run(id(), createdAt, createdAt, '原有设备', session.token);
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_public_id ON sessions(public_id); CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id,expires_at);');
   addColumns('providers', { priority: 'INTEGER NOT NULL DEFAULT 0', failure_threshold: 'INTEGER NOT NULL DEFAULT 3', cooldown_seconds: 'INTEGER NOT NULL DEFAULT 60', auth_mode: "TEXT NOT NULL DEFAULT 'auto'", runtime: "TEXT NOT NULL DEFAULT 'api'" });
   addColumns('models', { route_key: "TEXT NOT NULL DEFAULT ''", failure_count: 'INTEGER NOT NULL DEFAULT 0', cooldown_until: 'TEXT', failure_epoch: 'INTEGER NOT NULL DEFAULT 0', reasoning_efforts: "TEXT NOT NULL DEFAULT '[]'", context_window: 'INTEGER', max_output_tokens: 'INTEGER' });
   addColumns('providers', { responses_profile: "TEXT NOT NULL DEFAULT 'auto'" });
