@@ -56,7 +56,7 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
   }
   const pending = new Set();
   const activeChats = new Set();
-  let statusCache, closed = false;
+  let statusCache, closed = false, skillMutations = 0;
   const settings = () => validateLimits(store.get('SELECT value FROM settings WHERE key=?', 'workSettings') ? JSON.parse(store.get('SELECT value FROM settings WHERE key=?', 'workSettings').value) : {});
   const searchSettings = () => ({ enabled: true, baseUrl: 'http://work-search:8080', ...JSON.parse(store.get('SELECT value FROM settings WHERE key=?', 'workSearch')?.value || '{}') });
   const isConfigured = () => !!endpoint && !closed;
@@ -261,19 +261,25 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
     app.get('/api/work/capabilities', auth, async (_req, res) => res.json(await capabilities()));
     app.get('/api/work/skills', auth, (req, res) => res.json({ skills: skillRows().map(row => skillJSON(row, req.user.role === 'admin')) }));
     app.post('/api/work/skills', auth, csrf, admin, async (req, res) => {
+      skillMutations++;
+      try {
       if (skillRows().length >= 32) throw fault('最多添加 32 项技能。');
       const skill = await skillInput(req.body);
       if (store.get('SELECT id FROM work_skills WHERE name=?', skill.name)) throw fault('已存在同名技能。', 409);
       const skillId = id(), time = now();
       store.run('INSERT INTO work_skills(id,name,description,content,created_at,updated_at) VALUES (?,?,?,?,?,?)', skillId, skill.name, skill.description, skill.content, time, time);
       res.status(201).json({ skill: skillJSON(store.get('SELECT * FROM work_skills WHERE id=?', skillId), true) });
+      } finally { skillMutations--; }
     });
     app.patch('/api/work/skills/:id', auth, csrf, admin, async (req, res) => {
+      skillMutations++;
+      try {
       const prior = store.get('SELECT * FROM work_skills WHERE id=?', req.params.id); if (!prior) throw fault('技能不存在。', 404);
       const skill = await skillInput(req.body, prior);
       if (store.get('SELECT id FROM work_skills WHERE name=? AND id<>?', skill.name, prior.id)) throw fault('已存在同名技能。', 409);
       store.run('UPDATE work_skills SET name=?,description=?,content=?,updated_at=? WHERE id=?', skill.name, skill.description, skill.content, now(), prior.id);
       res.json({ skill: skillJSON(store.get('SELECT * FROM work_skills WHERE id=?', prior.id), true) });
+      } finally { skillMutations--; }
     });
     app.delete('/api/work/skills/:id', auth, csrf, admin, (req, res) => { if (!store.run('DELETE FROM work_skills WHERE id=?', req.params.id).changes) throw fault('技能不存在。', 404); res.json({ ok: true }); });
     app.get('/api/work/skills/:id/download', auth, (req, res) => {
@@ -319,5 +325,5 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
       res.json({ configured: isConfigured(), ...(await capabilities()), settings: updated, limits: LIMIT_BOUNDS });
     });
   }
-  return { stream, registerRoutes, isConfigured, capabilities, continuationCandidates, close() { closed = true; for (const controller of pending) controller.abort(); } };
+  return { stream, registerRoutes, isConfigured, capabilities, continuationCandidates, ensureIdle() { if (pending.size || skillMutations) throw fault('Work 任务或技能下载正在进行，请等待完成后导入配置。', 409); }, invalidateConfiguration() { statusCache = null; }, close() { closed = true; for (const controller of pending) controller.abort(); } };
 }

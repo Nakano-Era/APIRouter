@@ -17,16 +17,27 @@ export function createModelRename({ store, routeId }) {
     if (!exists('user_model_routing') || !store.all('PRAGMA table_info(user_model_routing)').some(column => column.name === 'fallbacks_json')) return [];
     return store.all('SELECT rowid AS routing_rowid,fallbacks_json FROM user_model_routing').map(row => ({ ...row, fallbacks: JSON.parse(row.fallbacks_json || '[]') }));
   }
+  function invitationConfigs() {
+    const result = [];
+    if (exists('invite_groups')) for (const row of store.all('SELECT id,rules_json FROM invite_groups')) result.push({ table: 'invite_groups', column: 'rules_json', id: row.id, value: JSON.parse(row.rules_json), snapshot: false });
+    if (store.all('PRAGMA table_info(invites)').some(column => column.name === 'group_snapshot')) for (const row of store.all('SELECT id,group_snapshot FROM invites WHERE used_at IS NULL AND group_snapshot IS NOT NULL')) result.push({ table: 'invites', column: 'group_snapshot', id: row.id, value: JSON.parse(row.group_snapshot), snapshot: true });
+    return result;
+  }
+  const invitationRules = item => item.snapshot ? item.value.rules || [] : item.value;
+  const invitationSteps = item => invitationRules(item).flatMap(rule => [{ route: rule.sourceRouteKey, variant: rule.sourceVariantName }, { route: rule.targetRouteKey, variant: rule.targetVariantName }, ...(rule.fallbacks || []).map(step => ({ route: step.targetRouteKey, variant: step.targetVariantName }))]);
   function assertUnused(name) {
     const conflict = () => { throw Object.assign(new Error('此模型名称已被使用，请选择其他名称。'), { status: 409 }); };
     for (const [table, column] of references) if (exists(table) && store.get(`SELECT 1 FROM ${table} WHERE ${column}=? LIMIT 1`, name)) conflict();
     for (const row of routingFallbacks()) if (row.fallbacks.some(step => step.targetRouteKey === name)) conflict();
+    for (const item of invitationConfigs()) if (invitationSteps(item).some(step => step.route === name) || item.snapshot && item.value.plan?.allowedRoutes?.includes(name)) conflict();
     if (exists('billing_config')) for (const row of store.all('SELECT free_routes FROM billing_config')) if (JSON.parse(row.free_routes).includes(name)) conflict();
     for (const [table, , column] of snapshots) if (exists(table)) for (const row of store.all(`SELECT ${column} FROM ${table}`)) if (JSON.parse(row[column]).allowedRoutes?.includes(name)) conflict();
   }
   function apply(original, name) {
     const variants = new Set(['']);
     const routingBackups = routingFallbacks();
+    const invitations = invitationConfigs();
+    for (const item of invitations) for (const step of invitationSteps(item)) if (step.route === original) variants.add(step.variant || '');
     for (const row of routingBackups) for (const step of row.fallbacks) if (step.targetRouteKey === original) variants.add(step.targetVariantName || '');
     for (const [table, key, variant] of [
       ['models', 'route_key', 'variant_name'], ['model_versions', 'route_key', 'name'],
@@ -53,6 +64,15 @@ export function createModelRename({ store, routeId }) {
       store.run('DELETE FROM model_route_aliases WHERE id=?', newId);
     }
     const replace = values => [...new Set(values.map(value => value === original ? name : value))];
+    for (const item of invitations) {
+      const rules = invitationRules(item).map(rule => ({ ...rule,
+        sourceRouteKey: rule.sourceRouteKey === original ? name : rule.sourceRouteKey,
+        targetRouteKey: rule.targetRouteKey === original ? name : rule.targetRouteKey,
+        fallbacks: (rule.fallbacks || []).map(step => ({ ...step, targetRouteKey: step.targetRouteKey === original ? name : step.targetRouteKey }))
+      }));
+      const value = item.snapshot ? { ...item.value, rules, ...(item.value.plan ? { plan: { ...item.value.plan, allowedRoutes: replace(item.value.plan.allowedRoutes) } } : {}) } : rules;
+      store.run(`UPDATE ${item.table} SET ${item.column}=? WHERE id=?`, JSON.stringify(value), item.id);
+    }
     if (exists('billing_config')) for (const row of store.all('SELECT id,free_routes FROM billing_config')) {
       const values = JSON.parse(row.free_routes);
       if (values.includes(original)) store.run('UPDATE billing_config SET free_routes=? WHERE id=?', JSON.stringify(replace(values)), row.id);

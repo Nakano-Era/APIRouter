@@ -46,14 +46,13 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
   }
   function recordFailure(candidate, error) {
     if ((candidate.failure_protection_enabled ?? candidate.provider_failure_protection_enabled) === 0) {
-      store.run("UPDATE models SET failure_count=failure_count+1,cooldown_until=NULL,status='error',error=?,last_checked_at=? WHERE id=? AND failure_epoch=?", sanitizeUpstreamError(error), timestamp(), candidate.id, candidate.failure_epoch);
-      return;
+      return store.run("UPDATE models SET failure_count=failure_count+1,cooldown_until=NULL,status='error',error=?,last_checked_at=? WHERE id=? AND failure_epoch=?", sanitizeUpstreamError(error), timestamp(), candidate.id, candidate.failure_epoch);
     }
     // A recovery probe must reopen the circuit even if the admin raised its
     // threshold during the preceding cooldown.
     const threshold = candidate.cooldown_until ? 1 : boundedInteger(candidate.failure_threshold_override ?? candidate.failure_threshold, 1, 1000, 3);
     const seconds = boundedInteger(candidate.cooldown_seconds_override ?? candidate.cooldown_seconds, 1, 2_592_000, 60);
-    store.run(`UPDATE models SET failure_count=failure_count+1,status='error',error=?,last_checked_at=?,
+    return store.run(`UPDATE models SET failure_count=failure_count+1,status='error',error=?,last_checked_at=?,
       cooldown_until=CASE WHEN failure_count+1>=? THEN ? ELSE cooldown_until END,
       failure_epoch=failure_epoch+CASE WHEN failure_count+1>=? THEN 1 ELSE 0 END
       WHERE id=? AND failure_epoch=?`, sanitizeUpstreamError(error), timestamp(), threshold,
@@ -88,7 +87,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     if (!candidates.length) throw new UpstreamError(needsVision ? '该模型路由没有支持图片的可用通道。' : '该模型路由没有可用通道，请联系管理员。', needsVision ? 'VISION_UNSUPPORTED' : 'ROUTE_UNAVAILABLE', 400);
     const attemptLimit = boundedInteger(maxAttempts, 1, 100, 6);
     const defaultRetryLimit = boundedInteger(retriesPerChannel, 0, 3, 1);
-    let attempts = 0;
+    let attempts = 0, inheritedAttempts = 0;
     let lastError;
     let emittedText = false;
     let knownInput = 0, knownOutput = 0;
@@ -99,18 +98,21 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     }
     for (const initial of candidates) {
       signal?.throwIfAborted();
-      if (attempts >= attemptLimit) break;
       let current = readCandidate(initial.id, routeKey, variantName, needsVision);
       if (!current || cooldown(current) === 'open' || probes.has(current.id)) continue;
+      const explicitRetries = current.retries_override != null;
+      if (!explicitRetries && inheritedAttempts >= attemptLimit) continue;
       const halfOpen = cooldown(current) === 'half-open';
-      const retryLimit = current.retries_override == null ? defaultRetryLimit : boundedInteger(current.retries_override, 0, 10, defaultRetryLimit);
+      const retryLimit = explicitRetries ? boundedInteger(current.retries_override, 0, 100, defaultRetryLimit) : defaultRetryLimit;
+      let ownFailureEpoch = null;
       if (halfOpen) probes.add(current.id);
       try {
-        for (let retry = 0; retry <= (halfOpen ? 0 : retryLimit); retry++) {
+        for (let retry = 0; retry <= (halfOpen && !explicitRetries ? 0 : retryLimit); retry++) {
           signal?.throwIfAborted();
-          if (attempts >= attemptLimit) break;
+          if (!explicitRetries && inheritedAttempts >= attemptLimit) break;
           current = readCandidate(initial.id, routeKey, variantName, needsVision);
-          if (!current || cooldown(current) === 'open' || (!halfOpen && probes.has(current.id))) break;
+          const ownCooldown = explicitRetries && ownFailureEpoch !== null && current?.failure_epoch === ownFailureEpoch;
+          if (!current || (cooldown(current) === 'open' && !ownCooldown) || (!halfOpen && probes.has(current.id))) break;
           // Decryption and local configuration errors are not channel outages.
           const provider = {
             id: current.provider_id, name: current.provider_name, baseUrl: current.base_url,
@@ -126,6 +128,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
           yield selected;
           signal?.throwIfAborted();
           attempts++;
+          if (!explicitRetries) inheritedAttempts++;
           const auditId = auditStart(requestId, current, effort);
           let auditFinished = false;
           let attemptText = false;
@@ -160,12 +163,15 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
             auditFinished = true;
             if (pendingUsage) yield accumulatedUsage(pendingUsage);
             if (policy.cancelled) throw signal?.aborted ? signal.reason : error;
-            if (policy.channel) recordFailure(current, error);
+            if (policy.channel) {
+              const recorded = recordFailure(current, error);
+              ownFailureEpoch = recorded?.changes ? store.get('SELECT failure_epoch FROM models WHERE id=?', current.id)?.failure_epoch ?? null : null;
+            }
             if (emittedText || committed || !policy.switch) throw error;
             lastError = error;
-            if (!policy.retry || retry >= retryLimit || halfOpen || attempts >= attemptLimit) break;
+            if (!policy.retry || retry >= retryLimit || (!explicitRetries && (halfOpen || inheritedAttempts >= attemptLimit))) break;
             const updated = readCandidate(initial.id, routeKey, variantName, needsVision);
-            if (!updated || cooldown(updated) !== 'closed') break;
+            if (!updated || (cooldown(updated) !== 'closed' && !(explicitRetries && updated.failure_epoch === ownFailureEpoch))) break;
             await sleep(Math.min(2000, 250 * (2 ** retry)), undefined, { signal });
           } finally {
             // A consumer cancelling iteration closes the attempt without damaging health.

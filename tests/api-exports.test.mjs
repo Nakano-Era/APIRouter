@@ -104,6 +104,18 @@ test('fallback stays within authorized raw-ID rows and honors per-model retries,
   assert.equal((await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } })).status, 200); assert.equal(f.calls.length, 1); assert.match(f.calls[0].provider.baseUrl, /backup/);
 });
 
+test('exported API honors explicit retry budget above site defaults and its own newly opened cooldown', async t => {
+  const f = await fixture(t, { upstream: async () => { throw new UpstreamError('bad', 'UPSTREAM_HTTP_ERROR', 502, 500); } });
+  f.store.setSetting('routingMaxAttempts', 1);
+  f.store.run("UPDATE models SET retries_override=4,failure_protection_enabled=1,failure_threshold_override=2 WHERE id='chat'");
+  const { apiKey } = await f.key(['chat']);
+  const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } });
+  assert.ok(response.status >= 400); assert.equal(f.calls.length, 5);
+  assert.equal(f.store.get("SELECT failure_count FROM models WHERE id='chat'").failure_count, 5);
+  await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } });
+  assert.equal(f.calls.length, 5);
+});
+
 test('invalid native payload HTTP 400 is sanitized and never retried or sent to a different model', async t => {
   const f = await fixture(t, { upstream: async provider => { const error = new UpstreamError(`secret ${provider.apiKey}`, 'UPSTREAM_HTTP_ERROR', 502, 400); error.rawDiagnostic = { body: provider.apiKey }; throw error; } }); f.add('backup');
   const { apiKey } = await f.key(['chat', 'backup']); const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } }); assert.equal(response.status, 400); const text = await response.text(); assert.ok(!text.includes('upstream-secret')); assert.ok(!text.includes('rawDiagnostic')); assert.equal(f.calls.length, 1);

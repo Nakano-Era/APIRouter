@@ -89,7 +89,7 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
     const enabled = (row.failure_protection_enabled ?? row.provider_protection) !== 0;
     const threshold = row.cooldown_until ? 1 : bounded(row.failure_threshold_override ?? row.failure_threshold, 1, 1000, 3);
     const seconds = bounded(row.cooldown_seconds_override ?? row.cooldown_seconds, 1, 2592000, 60);
-    store.run(`UPDATE models SET failure_count=failure_count+1,status='error',error='导出 API 上游请求失败。',last_checked_at=?,
+    return store.run(`UPDATE models SET failure_count=failure_count+1,status='error',error='导出 API 上游请求失败。',last_checked_at=?,
       cooldown_until=CASE WHEN ?=0 THEN NULL WHEN failure_count+1>=? THEN ? ELSE cooldown_until END,
       failure_epoch=failure_epoch+CASE WHEN ?=1 AND failure_count+1>=? THEN 1 ELSE 0 END WHERE id=? AND failure_epoch=?`,
     now(), enabled ? 1 : 0, threshold, new Date(Date.now() + seconds * 1000).toISOString(), enabled ? 1 : 0, threshold, row.id, row.failure_epoch);
@@ -116,26 +116,29 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
     const disconnected = () => { if (!res.writableEnded) controller.abort(new DOMException('Client disconnected', 'AbortError')); };
     req.on('aborted', disconnected); res.on('close', disconnected);
     const timer = setTimeout(() => controller.abort(fail(504, 'API 请求超过最长处理时间。', 'request_timeout')), totalTimeoutMs); timer.unref?.();
-    let written = false, attempts = 0, lastError, bytes = 0;
+    let written = false, inheritedAttempts = 0, lastError, bytes = 0;
     const settings = store.settings(), attemptLimit = bounded(settings.routingMaxAttempts, 1, 100, 6);
     try {
       for (const initial of candidates) {
         let row = models(req.apiExportKeyId, body.model, protocol).find(item => item.id === initial.id);
         if (!row || cooling(row) || probes.has(row.id)) continue;
+        const explicitRetries = row.retries_override != null;
+        if (!explicitRetries && inheritedAttempts >= attemptLimit) continue;
+        let ownFailureEpoch = null;
         const halfOpen = !!row.cooldown_until && (row.failure_protection_enabled ?? row.provider_protection) !== 0;
         if (halfOpen) probes.add(row.id);
         try {
-          const retries = halfOpen ? 0 : bounded(row.retries_override, 0, 10, bounded(settings.retriesPerChannel, 0, 3, 1));
-          for (let retry = 0; retry <= retries && attempts < attemptLimit; retry++) {
+          const retries = halfOpen && !explicitRetries ? 0 : bounded(row.retries_override, 0, 100, bounded(settings.retriesPerChannel, 0, 3, 1));
+          for (let retry = 0; retry <= retries && (explicitRetries || inheritedAttempts < attemptLimit); retry++) {
             signal.throwIfAborted();
             row = models(req.apiExportKeyId, body.model, protocol).find(item => item.id === initial.id);
-            if (!row || cooling(row)) break;
+            if (!row || (cooling(row) && !(explicitRetries && ownFailureEpoch !== null && row.failure_epoch === ownFailureEpoch))) break;
             const provider = { baseUrl: row.base_url, protocol: row.protocol, authMode: row.auth_mode, apiKey: store.decrypt(row.encrypted_key) };
             let opened, reader;
             const auditId = id();
             store.run('INSERT INTO route_attempts(id,request_id,provider_id,model_id,outcome,created_at,execution_route_key,execution_variant_name,execution_effort) VALUES(?,?,?,?,?,?,?,?,?)',
               auditId, `api-export-${requestId}`, row.provider_id, row.id, 'running', now(), row.route_key, row.variant_name || '', typeof body.reasoning?.effort === 'string' ? body.reasoning.effort.slice(0, 100) : null);
-            attempts++;
+            if (!explicitRetries) inheritedAttempts++;
             try {
               opened = await upstream(provider, req.path.slice(1), { signal, body, idleTimeout: true, nativePassthrough: true, requestHeaders: req.headers });
               const response = opened.response, contentType = response.headers.get('content-type') || '';
@@ -175,7 +178,7 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
               auditEnd(auditId, signal.aborted ? 'stopped' : 'error', signal.aborted ? null : error, provider.apiKey);
               if (signal.aborted) throw signal.reason;
               const action = disposition(error);
-              if (action.switch) recordFailure(row);
+              if (action.switch) { const recorded = recordFailure(row); ownFailureEpoch = recorded?.changes ? store.get('SELECT failure_epoch FROM models WHERE id=?', row.id)?.failure_epoch ?? null : null; }
               // Even the first native SSE byte commits this response; mixing
               // another provider's IDs/tool calls would corrupt client state.
               if (written || bytes > 0 || !action.switch) throw error;
@@ -183,7 +186,6 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
             } finally { try { await reader?.cancel(); } catch { /* upstream closed */ } reader?.releaseLock(); await opened?.cleanup?.(); }
           }
         } finally { probes.delete(initial.id); }
-        if (attempts >= attemptLimit) break;
       }
       throw lastError || fail(503, '授权模型的渠道正在冷却或暂时不可用。', 'model_unavailable');
     } catch (error) {
@@ -230,5 +232,5 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
     });
   }
   const abortAll = () => { for (const job of active.values()) job.controller.abort(new DOMException('Server stopping', 'AbortError')); };
-  return { mountPublic, registerRoutes, abortAll, close: abortAll };
+  return { mountPublic, registerRoutes, abortAll, ensureIdle() { if (active.size) throw fail(409, '对外 API 正在处理请求，请等待完成后导入配置。'); }, close: abortAll };
 }

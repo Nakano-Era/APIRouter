@@ -22,6 +22,8 @@ import { createSessionManager } from './sessions.mjs';
 import { executionTargets, continuationMessages, mayFallback } from './generation-fallback.mjs';
 import { createAnnouncements } from './announcements.mjs';
 import { createApiExports } from './api-exports.mjs';
+import { createConfigTransfer } from './config-transfer.mjs';
+import { createInviteGroups } from './invite-groups.mjs';
 
 const protocols = new Set(['openai-chat', 'openai-responses', 'anthropic']);
 const effortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -66,6 +68,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   const userRouting = createUserModelRouting({ store, ensureUserIdle: userId => {
     if ([...active.values()].some(job => job.userId === userId)) throw fail(409, '此用户还有进行中的任务，请等待完成或停止后修改路由。');
   } });
+  const inviteGroups = createInviteGroups({ store, userRouting });
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 5, fields: 0, parts: 5 } });
   app.disable('x-powered-by');
   if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
@@ -86,8 +89,9 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   // Authenticate before buffering long prompts. Other endpoints retain their
   // smaller JSON limit, including public sign-in and setup requests.
   const longPromptPath = /^\/api\/chats\/[^/]+\/(?:messages|edit)\/?$/;
+  const configTransferPath = /^\/api\/admin\/config\/(?:export|preview|import)\/?$/;
   const standardJSON = express.json({ limit: '1mb' });
-  app.use((req, res, next) => req.method === 'POST' && longPromptPath.test(req.path) ? next() : standardJSON(req, res, next));
+  app.use((req, res, next) => req.method === 'POST' && (longPromptPath.test(req.path) || configTransferPath.test(req.path)) ? next() : standardJSON(req, res, next));
   app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next(); });
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false, message: { error: '请求过于频繁，请稍后再试。' } }));
   app.use('/api', (req, res, next) => {
@@ -106,11 +110,19 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   billing.registerRoutes(app, { auth, admin, csrf });
   createAnnouncements({ store }).registerRoutes(app, { auth, admin, csrf });
   work.registerRoutes(app, { auth, admin, csrf });
-  createProviderTools({ store, providerJSON, ensureProviderIdle }).registerRoutes(app, { auth, admin, csrf });
+  const providerTools = createProviderTools({ store, providerJSON, ensureProviderIdle });
+  providerTools.registerRoutes(app, { auth, admin, csrf });
   catalog.registerRoutes(app, { auth, admin, csrf });
   modelAccess.registerRoutes(app, { auth, admin, csrf });
   userRouting.registerRoutes(app, { auth, admin, csrf });
+  inviteGroups.registerRoutes(app, { auth, admin, csrf });
   createChatExport({ store }).registerRoutes(app, { auth, admin, csrf });
+  const configTransfer = createConfigTransfer({ store, ensureIdle() {
+    if (active.size || syncing.size || testing.size) throw fail(409, '仍有聊天、同步或模型测试正在进行，请等待完成后导入配置。');
+    apiExports.ensureIdle(); providerTools.ensureIdle(); billing.ensureConfigurationIdle(); work.ensureIdle?.();
+    work.invalidateConfiguration?.();
+  } });
+  configTransfer.registerRoutes(app, { auth, admin, csrf });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false, message: { error: '登录尝试过多，请 15 分钟后重试。' } });
   function userJSON(row) { return { id: row.id, name: row.name, email: row.email, role: row.role, disabled: !!row.disabled, dailyLimit: row.daily_limit, createdAt: row.created_at }; }
   function createSession(req, res, user) {
@@ -144,12 +156,14 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     const token = cleanText(req.query.token, 200);
     const invite = store.get('SELECT * FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?', digest(token), now());
     if (!invite) throw fail(404, '邀请已失效、已使用或不存在。');
+    inviteGroups.validateInvitation(invite);
     res.json({ email: invite.email, expiresAt: invite.expires_at });
   });
   app.post('/api/auth/invite/accept', authLimiter, async (req, res) => {
     const token = requiredText(req.body.token, '邀请链接', 200), name = requiredText(req.body.name, '姓名', 60);
     const invite = store.get('SELECT * FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?', digest(token), now());
     if (!invite) throw fail(400, '邀请已失效、已使用或不存在。');
+    inviteGroups.validateInvitation(invite);
     const email = validEmail(req.body.email || invite.email);
     if (invite.email && invite.email !== email) throw fail(400, '此邀请仅供指定邮箱使用。');
     if (store.get('SELECT id FROM users WHERE email=?', email)) throw fail(409, '该邮箱已存在，请登录。');
@@ -158,6 +172,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       const current = store.get('SELECT * FROM invites WHERE id=? AND used_at IS NULL AND expires_at>?', invite.id, now());
       if (!current) throw fail(409, '邀请已失效或已使用。');
       store.run('INSERT INTO users(id,name,email,password,role,created_at) VALUES (?,?,?,?,?,?)', userId, name, email, password, 'user', now());
+      inviteGroups.applyInvitation(current, userId);
       store.run('UPDATE invites SET used_at=? WHERE id=?', now(), invite.id);
     });
     res.status(201).json(createSession(req, res, store.get('SELECT * FROM users WHERE id=?', userId)));
@@ -500,7 +515,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       enabled: body.failureProtectionEnabled === undefined ? row.failure_protection_enabled ?? null : body.failureProtectionEnabled === null ? null : bool(body.failureProtectionEnabled, '失败冷却'),
       threshold: body.failureThreshold === undefined ? row.failure_threshold_override ?? null : body.failureThreshold === null ? null : number(body.failureThreshold, 1, 1000, '连续失败阈值'),
       seconds: body.cooldownSeconds === undefined ? row.cooldown_seconds_override ?? null : body.cooldownSeconds === null ? null : number(body.cooldownSeconds, 1, 2592000, '冷却秒数'),
-      retries: body.retries === undefined ? row.retries_override ?? null : body.retries === null ? null : number(body.retries, 0, 10, '模型失败重试次数'),
+      retries: body.retries === undefined ? row.retries_override ?? null : body.retries === null ? null : number(body.retries, 0, 100, '模型失败重试次数'),
     };
   }
   app.post('/api/admin/models', (req, res) => {
@@ -553,8 +568,14 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   });
   app.get('/api/admin/users', (_req, res) => res.json({ users: store.all('SELECT * FROM users ORDER BY created_at').map(userJSON) }));
   app.patch('/api/admin/users/:id', (req, res) => { const user = store.get('SELECT * FROM users WHERE id=?', req.params.id); if (!user) throw fail(404, '用户不存在。'); if (user.role === 'admin' && req.body.disabled === true) throw fail(400, '不能停用管理员账号。'); const disabled = req.body.disabled === undefined ? user.disabled : bool(req.body.disabled, '停用'); const dailyLimit = req.body.dailyLimit === undefined ? user.daily_limit : req.body.dailyLimit === null ? null : number(req.body.dailyLimit, 0, 100_000, '每日请求额度'); store.run('UPDATE users SET disabled=?,daily_limit=? WHERE id=?', disabled, dailyLimit, user.id); if (disabled) { store.run('DELETE FROM sessions WHERE user_id=?', user.id); for (const job of active.values()) if (job.userId === user.id) job.controller.abort(); } res.json({ user: userJSON(store.get('SELECT * FROM users WHERE id=?', user.id)) }); });
-  app.get('/api/admin/invites', (_req, res) => res.json({ invites: store.all('SELECT * FROM invites ORDER BY created_at DESC').map(row => ({ id: row.id, email: row.email, expiresAt: row.expires_at, usedAt: row.used_at, createdAt: row.created_at })) }));
-  app.post('/api/admin/invites', (req, res) => { const email = req.body.email ? validEmail(req.body.email) : null, days = req.body.days === undefined ? 7 : number(req.body.days, 1, 30, '有效天数'); const token = randomBytes(32).toString('base64url'), inviteId = id(), expiresAt = new Date(Date.now() + days * 86400_000).toISOString(); store.run('INSERT INTO invites(id,token_hash,email,expires_at,created_at) VALUES (?,?,?,?,?)', inviteId, digest(token), email, expiresAt, now()); res.status(201).json({ invite: { id: inviteId, token, expiresAt } }); });
+  app.get('/api/admin/invites', (_req, res) => res.json({ invites: store.all('SELECT * FROM invites ORDER BY created_at DESC').map(row => ({ id: row.id, email: row.email, expiresAt: row.expires_at, usedAt: row.used_at, createdAt: row.created_at, ...inviteGroups.describeInvitation(row) })) }));
+  app.post('/api/admin/invites', (req, res) => {
+    const email = req.body.email ? validEmail(req.body.email) : null, days = req.body.days === undefined ? 7 : number(req.body.days, 1, 30, '有效天数');
+    const snapshot = inviteGroups.snapshotForInvite(req.body.groupId ?? null, req.user.id);
+    const token = randomBytes(32).toString('base64url'), inviteId = id(), expiresAt = new Date(Date.now() + days * 86400_000).toISOString();
+    store.run('INSERT INTO invites(id,token_hash,email,expires_at,created_at,group_id,group_snapshot) VALUES (?,?,?,?,?,?,?)', inviteId, digest(token), email, expiresAt, now(), snapshot.groupId, snapshot.groupSnapshot);
+    res.status(201).json({ invite: { id: inviteId, token, expiresAt } });
+  });
   app.delete('/api/admin/invites/:id', (req, res) => { store.run('DELETE FROM invites WHERE id=?', req.params.id); res.json({ ok: true }); });
   app.get('/api/admin/stats', (_req, res) => res.json({ users: store.get('SELECT COUNT(*) AS n FROM users').n, chats: store.get('SELECT COUNT(*) AS n FROM chats').n, messages: store.get('SELECT COUNT(*) AS n FROM messages').n, requestsToday: store.get('SELECT COUNT(*) AS n FROM requests WHERE created_at>=?', `${now().slice(0, 10)}T00:00:00.000Z`).n }));
   app.patch('/api/admin/settings', (req, res) => {
@@ -582,5 +603,5 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   cleanAbandonedUploads();
   const cleanupTimer = setInterval(cleanAbandonedUploads, 3600_000);
   cleanupTimer.unref();
-  return { app, store, setupToken, abortAll: () => { for (const job of active.values()) job.controller.abort(); apiExports.abortAll(); }, close: () => { clearInterval(cleanupTimer); apiExports.close(); work.close(); store.close(); } };
+  return { app, store, setupToken, abortAll: () => { for (const job of active.values()) job.controller.abort(); apiExports.abortAll(); }, close: () => { clearInterval(cleanupTimer); configTransfer.close(); apiExports.close(); work.close(); store.close(); } };
 }

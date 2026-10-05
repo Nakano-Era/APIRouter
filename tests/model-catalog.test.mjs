@@ -94,4 +94,36 @@ test('model catalog HTTP routes require administrator access and CSRF for mutati
   assert.equal((await fetch(url, { method: 'PUT', headers: { 'x-user': 'admin', 'content-type': 'application/json' }, body })).status, 403);
   assert.equal((await fetch(url, { method: 'PUT', headers: { 'x-user': 'admin', 'content-type': 'application/json', 'x-csrf-token': 'fixture-token' }, body })).status, 200);
   assert.deepEqual(await (await fetch(url, { headers: { 'x-user': 'admin' } })).json(), { groups: [group] });
+  const deletion = `${url}/${encodeURIComponent(group.name)}`;
+  assert.equal((await fetch(deletion, { method: 'DELETE' })).status, 401);
+  assert.equal((await fetch(deletion, { method: 'DELETE', headers: { 'x-user': 'user' } })).status, 403);
+  assert.equal((await fetch(deletion, { method: 'DELETE', headers: { 'x-user': 'admin' } })).status, 403);
+  assert.equal((await fetch(deletion, { method: 'DELETE', headers: { 'x-user': 'admin', 'x-csrf-token': 'fixture-token' } })).status, 200);
+  assert.deepEqual(catalog.listGroups(), []);
+});
+
+test('deleting a displayed model removes all versions and default selection but retains disabled upstream records', t => {
+  const { store, catalog, group } = fixture(t); catalog.saveGroup(group);
+  store.setSetting('defaultModelId', modelRouteId(group.name, group.variants[0].name));
+  catalog.deleteGroup(group.name);
+  assert.deepEqual(catalog.listGroups(), []);
+  assert.equal(store.get('SELECT COUNT(*) n FROM model_versions').n, 0);
+  assert.equal(store.settings().defaultModelId, null);
+  const rows = store.all('SELECT * FROM models'); assert.equal(rows.length, 3);
+  assert.ok(rows.every(row => row.enabled === 0 && row.catalog_assigned === 0 && row.route_key === row.model_id && row.variant_name === ''));
+  assert.throws(() => catalog.deleteGroup(group.name), error => error.status === 404);
+});
+
+test('catalog version retries update bound channels, preserve omitted settings and accept inheritance explicitly', t => {
+  const { store, catalog, group } = fixture(t);
+  catalog.saveGroup({ ...group, variants: group.variants.map((variant, index) => ({ ...variant, retries: index === 0 ? 100 : 0 })) });
+  assert.equal(store.get('SELECT retries_override FROM models WHERE id=?', 'anyrouter-gpt').retries_override, 100);
+  catalog.saveGroup(group);
+  assert.equal(store.get('SELECT retries_override FROM models WHERE id=?', 'anyrouter-gpt').retries_override, 100);
+  catalog.saveGroup({ ...group, variants: group.variants.map(variant => ({ ...variant, retries: null })) });
+  assert.ok(store.all('SELECT retries_override FROM models').every(row => row.retries_override === null));
+  assert.throws(() => catalog.saveGroup({ ...group, variants: [{ ...group.variants[0], retries: 101 }] }), error => error.status === 400);
+  const locked = createModelCatalog({ store, ensureProviderIdle() { throw Object.assign(new Error('busy'), { status: 409 }); } });
+  assert.throws(() => locked.deleteGroup(group.name), error => error.status === 409);
+  assert.deepEqual(catalog.listGroups(), [group]);
 });

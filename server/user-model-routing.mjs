@@ -40,8 +40,7 @@ export function createUserModelRouting({ store, ensureUserIdle }) {
     requireUser(userId);
     return { rules: store.all('SELECT * FROM user_model_routing WHERE user_id=? ORDER BY source_route_key,source_variant_name', userId).map(ruleJSON) };
   }
-  function replaceRules(userId, values) {
-    requireUser(userId);
+  function validateRules(values, { checkAvailability = true } = {}) {
     if (!Array.isArray(values) || values.length > 100) throw fault(400, '用户模型路由应为最多 100 项的列表。');
     const seen = new Set();
     const rules = values.map(value => {
@@ -72,7 +71,7 @@ export function createUserModelRouting({ store, ensureUserIdle }) {
       });
       // Disabled records can still be removed or retained if a channel was
       // subsequently deleted. Enabling always revalidates both route names.
-      if (enabled) {
+      if (enabled && checkAvailability) {
         if (!known(sourceRouteKey, sourceVariantName)) throw fault(400, '所选模型的版本不存在，请刷新模型目录。');
         for (const step of [{ targetRouteKey, targetVariantName, effort }, ...backups]) {
           if (!known(step.targetRouteKey, step.targetVariantName)) throw fault(400, '执行模型或备用模型的版本不存在，请刷新模型目录。');
@@ -83,12 +82,19 @@ export function createUserModelRouting({ store, ensureUserIdle }) {
       }
       return { sourceRouteKey, sourceVariantName, targetRouteKey, targetVariantName, enabled, effort, fallbacks: backups };
     });
-    ensureUserIdle(userId);
-    store.transaction(() => {
+    return rules;
+  }
+  function applyValidatedRules(userId, rules) {
+    requireUser(userId);
       store.run('DELETE FROM user_model_routing WHERE user_id=?', userId);
       for (const rule of rules) store.run('INSERT INTO user_model_routing(user_id,source_route_key,source_variant_name,target_route_key,target_variant_name,enabled,effort,updated_at,fallbacks_json) VALUES (?,?,?,?,?,?,?,?,?)',
         userId, rule.sourceRouteKey, rule.sourceVariantName, rule.targetRouteKey, rule.targetVariantName, rule.enabled ? 1 : 0, rule.effort, now(), JSON.stringify(rule.fallbacks));
-    });
+  }
+  function replaceRules(userId, values) {
+    requireUser(userId);
+    const rules = validateRules(values);
+    ensureUserIdle(userId);
+    store.transaction(() => applyValidatedRules(userId, rules));
     return listRules(userId);
   }
   // Resolve exactly once. The caller walks the primary and explicit backups;
@@ -101,5 +107,5 @@ export function createUserModelRouting({ store, ensureUserIdle }) {
     app.get('/api/admin/users/:id/model-routing', auth, admin, (req, res) => res.json(listRules(req.params.id)));
     app.put('/api/admin/users/:id/model-routing', auth, admin, csrf, (req, res) => res.json(replaceRules(req.params.id, req.body?.rules)));
   }
-  return { listRules, replaceRules, resolve, registerRoutes };
+  return { listRules, replaceRules, validateRules, applyValidatedRules, resolve, registerRoutes };
 }

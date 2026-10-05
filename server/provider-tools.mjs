@@ -37,7 +37,7 @@ function modelDefinition(value) {
     variantName: variantName(value.variantName ?? value.variant_name ?? ''),
     catalogAssigned: bool(value.catalogAssigned ?? value.enabled ?? false, '目录分配状态'),
     failureProtectionEnabled: value.failureProtectionEnabled == null ? null : bool(value.failureProtectionEnabled, '模型失败保护'),
-    retries: value.retries == null ? null : integer(value.retries, 0, 10, '模型重试次数'),
+    retries: value.retries == null ? null : integer(value.retries, 0, 100, '模型重试次数'),
     failureThreshold: value.failureThreshold == null ? null : integer(value.failureThreshold, 1, 1000, '模型失败阈值'),
     cooldownSeconds: value.cooldownSeconds == null ? null : integer(value.cooldownSeconds, 1, 2592000, '模型冷却时间'),
     contextWindow: value.contextWindow == null ? null : integer(value.contextWindow, 1024, 10_000_000, '模型上下文容量'),
@@ -231,5 +231,5 @@ export function createProviderTools({ store, providerJSON, ensureProviderIdle = 
     });
     app.use('/api/admin/providers', auth, admin, csrf, router);
   }
-  return { registerRoutes, importProviders, exportDocument, balanceState };
+  return { registerRoutes, importProviders, exportDocument, balanceState, ensureIdle() { if (balanceBusy.size) throw fail(409, '渠道余额查询正在进行，请等待完成后导入配置。'); } };
 }

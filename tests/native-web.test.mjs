@@ -67,7 +67,7 @@ test('model-invoked webpage fetch uses the same controlled gateway and returns i
   assert.equal(urls.filter(url => url.endsWith('/web/read')).length, 1);
 });
 
-test('web gateway enforces task credentials, enabled flags, body fields and a shared per-job call ceiling', async t => {
+test('web gateway enforces task credentials, enabled flags, body fields without a twenty-call ceiling', async t => {
   const calls = [], broker = createBroker({ token: 's'.repeat(43), self: 'test-broker', docker: async () => '', webAccess: { search: async (body, options) => { calls.push({ body, options }); return { results: [] }; }, read: async body => { calls.push(body); return { text: 'read' }; } } });
   broker.server.listen(0, '127.0.0.1'); await once(broker.server, 'listening'); t.after(() => broker.close());
   const id = 'a'.repeat(32), jobToken = 'b'.repeat(43);
@@ -81,9 +81,8 @@ test('web gateway enforces task credentials, enabled flags, body fields and a sh
     const old = task.config; task.config = config; assert.equal((await request()).status, 403); task.config = old;
   }
   assert.equal((await request({ query: 'x'.repeat(18000) })).status, 413);
-  task.webCalls = 0;
   assert.equal((await request()).status, 200); assert.equal(calls[0].options.baseUrl, 'http://work-search:8080'); assert.equal(calls[0].options.signal, task.controller.signal);
-  for (let index = 1; index < 20; index++) assert.equal((await request({ url: 'https://example.com' }, jobToken, 'read')).status, 200);
-  assert.equal((await request()).status, 429); assert.equal(calls.length, 20);
+  for (let index = 1; index < 25; index++) assert.equal((await request({ url: 'https://example.com' }, jobToken, 'read')).status, 200);
+  assert.equal((await request()).status, 200); assert.equal(calls.length, 26);
   broker.jobs.delete(id); assert.equal((await request()).status, 401);
 });

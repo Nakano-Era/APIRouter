@@ -43,6 +43,7 @@ export function createModelCatalog({ store, ensureProviderIdle, ensureRenameIdle
     const names = new Set(), ids = new Set();
     const variants = body.variants.map(item => {
       const name = variantName(item?.name);
+      if (item.retries !== undefined && item.retries !== null && (!Number.isInteger(item.retries) || item.retries < 0 || item.retries > 100)) throw bad('模型额外重试次数需要为 0–100，或留空继承。');
       if (names.has(name)) throw bad('同一模型的版本名称不能重复。');
       names.add(name);
       if (!Array.isArray(item.modelIds) || item.modelIds.length > 500) throw bad('每个版本最多绑定 500 个渠道模型。');
@@ -53,7 +54,7 @@ export function createModelCatalog({ store, ensureProviderIdle, ensureRenameIdle
         if (!model) throw bad('选择的渠道模型已不存在，请刷新后重试。', 404);
         return model;
       });
-      return { name, models };
+      return { name, models, retries: item.retries };
     });
     const prior = store.all('SELECT * FROM models WHERE route_key=? AND (enabled=1 OR catalog_assigned=1)', originalName);
     if (renaming) {
@@ -71,14 +72,32 @@ export function createModelCatalog({ store, ensureProviderIdle, ensureRenameIdle
         for (const model of version.models) {
           const enabled = renaming && model.route_key === originalName && model.variant_name === version.name && model.catalog_assigned ? model.enabled : 1;
           store.run('UPDATE models SET route_key=?,variant_name=?,catalog_assigned=1,enabled=? WHERE id=?', name, version.name, enabled, model.id);
+          if (version.retries !== undefined) store.run('UPDATE models SET retries_override=? WHERE id=?', version.retries, model.id);
         }
       });
     });
     return { groups: listGroups() };
   }
+  function deleteGroup(name) {
+    const group = listGroups().find(item => item.name === name);
+    if (!group) throw bad('模型已不存在，请刷新列表。', 404);
+    ensureRenameIdle(name);
+    const rows = store.all('SELECT id,provider_id FROM models WHERE route_key=?', name);
+    for (const providerId of new Set(rows.map(row => row.provider_id))) ensureProviderIdle(providerId);
+    store.transaction(() => {
+      const defaultId = store.settings().defaultModelId;
+      const ids = new Set([...rows.map(row => row.id), modelRouteId(name), ...group.variants.map(version => modelRouteId(name, version.name)), ...store.all('SELECT id FROM model_route_aliases WHERE route_key=?', name).map(row => row.id)]);
+      if (ids.has(defaultId)) store.setSetting('defaultModelId', null);
+      store.run("UPDATE models SET enabled=0,catalog_assigned=0,route_key=model_id,variant_name='' WHERE route_key=?", name);
+      store.run('DELETE FROM model_route_aliases WHERE route_key=?', name);
+      store.run('DELETE FROM model_catalog WHERE name=?', name);
+    });
+    return { ok: true, groups: listGroups() };
+  }
   function registerRoutes(app, { auth, admin, csrf }) {
     app.get('/api/admin/model-groups', auth, admin, (_req, res) => res.json({ groups: listGroups() }));
     app.put('/api/admin/model-groups', auth, admin, csrf, (req, res) => res.json(saveGroup(req.body)));
+    app.delete('/api/admin/model-groups/:name', auth, admin, csrf, (req, res) => res.json(deleteGroup(req.params.name)));
   }
-  return { listGroups, saveGroup, registerRoutes, resolveRouteId: rename.resolve, routeAliases: rename.aliases };
+  return { listGroups, saveGroup, deleteGroup, registerRoutes, resolveRouteId: rename.resolve, routeAliases: rename.aliases };
 }

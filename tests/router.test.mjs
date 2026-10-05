@@ -88,15 +88,14 @@ test('equal priority uses stable model ID ordering', async t => {
   assert.deepEqual(selected(await collect(router.run(input()))), ['a']);
 });
 
-test('each upstream model overrides retry defaults, respects zero and total attempt budget', async t => {
+test('explicit model retries have independent budgets and preserve zero despite lower site defaults', async t => {
   const store = fixture(t, [{ id: 'a', priority: 20, protection: 0 }, { id: 'b', priority: 10, protection: 0 }, { id: 'c', protection: 0 }]);
   store.run('UPDATE models SET retries_override=0 WHERE id=?', 'a');
   store.run('UPDATE models SET retries_override=2 WHERE id=?', 'b');
   const router = createRouter({ store, stream: async function* ({ provider }) { if (provider.id !== 'c') throw failure(); yield { type: 'delta', text: 'success' }; } });
   assert.deepEqual(selected(await collect(router.run(input({ retriesPerChannel: 1, maxAttempts: 8 })))), ['a', 'b', 'b', 'b', 'c']);
-  const events = [];
-  await assert.rejects(collect(router.run(input({ retriesPerChannel: 1, maxAttempts: 2 })), events));
-  assert.deepEqual(selected(events), ['a', 'b']);
+  const events = await collect(router.run(input({ retriesPerChannel: 1, maxAttempts: 2 })));
+  assert.deepEqual(selected(events), ['a', 'b', 'b', 'b', 'c']);
 });
 
 test('transient failures retry same channel then reset its consecutive failure counter', async t => {
@@ -112,6 +111,26 @@ test('transient failures retry same channel then reset its consecutive failure c
   assert.deepEqual(callbacks, [1, 2]);
   assert.equal(model(store, 'a').failure_count, 0);
   assert.equal(model(store, 'a').cooldown_until, null);
+});
+
+test('explicit retries complete their budget despite a lower site cap and this request opening cooldown', async t => {
+  const store = fixture(t, [{ id: 'a', threshold: 2 }]);
+  store.run('UPDATE models SET retries_override=4 WHERE id=?', 'a');
+  let count = 0;
+  const router = createRouter({ store, stream: async function* () { count++; throw failure(500); } });
+  await assert.rejects(collect(router.run(input({ maxAttempts: 2 }))), /共 5 次/);
+  assert.equal(count, 5); assert.equal(model(store, 'a').failure_count, 5); assert.ok(model(store, 'a').cooldown_until);
+  await assert.rejects(collect(router.run(input({ maxAttempts: 2 }))), { code: 'ROUTE_COOLDOWN' });
+  assert.equal(count, 5);
+});
+
+test('successful explicit retry clears a cooldown opened by its earlier attempts', async t => {
+  const store = fixture(t, [{ id: 'a', threshold: 1 }]);
+  store.run('UPDATE models SET retries_override=2 WHERE id=?', 'a');
+  let count = 0;
+  const router = createRouter({ store, stream: async function* () { if (++count < 3) throw failure(500); yield { type: 'delta', text: 'Recovered' }; } });
+  assert.deepEqual(selected(await collect(router.run(input({ maxAttempts: 1 })))), ['a', 'a', 'a']);
+  assert.equal(model(store, 'a').failure_count, 0); assert.equal(model(store, 'a').cooldown_until, null);
 });
 
 test('threshold counts actual failures and opens a persistent per-model cooldown', async t => {

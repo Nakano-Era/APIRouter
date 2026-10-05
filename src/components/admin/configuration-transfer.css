@@ -1,0 +1,22 @@
+.config-transfer .settings-card { min-width: 0; }
+.config-transfer h4, .config-transfer p { margin: 0; }
+.config-transfer p { line-height: 1.65; }
+.config-transfer-fields { border: 0; padding: 0; margin: 0; display: grid; gap: 16px; min-width: 0; }
+.config-transfer input[type="file"] { width: 100%; max-width: 100%; font-size: 13px; }
+.config-transfer input[type="file"]::file-selector-button { padding: 6px 10px; margin-right: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--hover); color: inherit; cursor: pointer; }
+.config-transfer-table { overflow-x: auto; }
+.config-transfer-table table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.config-transfer-table caption { text-align: left; padding-bottom: 10px; color: var(--muted); }
+.config-transfer-table th, .config-transfer-table td { padding: 9px 8px; border-bottom: 1px solid var(--border); text-align: right; }
+.config-transfer-table th:first-child { text-align: left; font-weight: 500; }
+.config-transfer-table thead th { color: var(--muted); white-space: nowrap; }
+.config-transfer-ack { display: flex !important; flex-direction: row !important; align-items: flex-start; gap: 10px !important; line-height: 1.6; }
+.config-transfer-ack input { width: 16px !important; flex: 0 0 16px; margin: 3px 0 0; }
+.config-transfer-warnings { padding: 14px; background: var(--hover); border-radius: 12px; font-size: 13px; line-height: 1.7; }
+.config-transfer-warnings ul, .config-transfer-conflicts { margin: 8px 0 0; padding-left: 20px; overflow-wrap: anywhere; }
+.config-transfer-warnings li + li, .config-transfer-conflicts li + li { margin-top: 7px; }
+.config-transfer-conflicts { max-height: 240px; overflow-y: auto; font-size: 13px; }
+.config-transfer-conflicts span { display: block; color: var(--muted); margin-top: 3px; }
+.config-transfer details summary { cursor: pointer; font-size: 13px; }
+.config-transfer .card-heading { flex-wrap: wrap; gap: 8px; }
+@media (max-width: 560px) { .config-transfer-table th, .config-transfer-table td { padding: 8px 4px; } .config-transfer .form-actions { flex-wrap: wrap; } }

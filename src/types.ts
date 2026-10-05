@@ -9,7 +9,7 @@ export interface Attachment { id: string; name: string; mime: string; size: numb
 export interface Message { id: string; role: 'user' | 'assistant'; content: string; reasoning?: string; modelId?: string; createdAt: string; status: 'complete' | 'streaming' | 'error' | 'stopped'; attachments: Attachment[]; error?: string | null; canContinue?: boolean }
 export interface Provider { failureProtectionEnabled?: boolean; responsesProfile?: 'auto' | 'standard' | 'codex'; runtime?: 'api' | 'claude-code'; id: string; name: string; baseUrl: string; protocol: 'openai-chat' | 'openai-responses' | 'anthropic'; enabled: boolean; hasKey: boolean; keyHint: string; lastSyncedAt: string | null; lastSyncError: string | null; createdAt: string; priority?: number; failureThreshold?: number; cooldownSeconds?: number; authMode?: 'auto' | 'bearer' | 'x-api-key' }
 export interface Settings { siteName: string; systemPrompt?: string; defaultModelId: string | null; dailyLimit: number; maxOutputTokens: number; routingMaxAttempts?: number; retriesPerChannel?: number }
-export interface Invite { id: string; email?: string; expiresAt: string; usedAt: string | null; createdAt: string }
+export interface Invite { id: string; email?: string; expiresAt: string; usedAt: string | null; createdAt: string; groupId?: string | null; groupName?: string | null }
 export interface WorkSkill { id: string; name: string; description?: string }
 export interface WorkCapabilities { available: boolean; reason?: string; skills: WorkSkill[]; webSearchSupported?: boolean }
 export interface WorkArtifact { path?: string; chatId?: string; id: string; name: string; size: number; downloadUrl: string; mime?: string; createdAt?: string }

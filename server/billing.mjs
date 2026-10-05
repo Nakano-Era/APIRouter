@@ -387,5 +387,6 @@ export function createBilling({ store, publicOrigin, stripeFactory = key => new 
   function ensureModelRenameIdle() {
     if (checkoutBusy.size || manualRequestBusy.size || queues.size) throw fail(409, '支付操作正在处理中，请稍后再修改模型名称。');
   }
-  return { mountWebhook, registerRoutes, effectiveEntitlement, ensureModelRenameIdle };
+  function ensureConfigurationIdle() { if (checkoutBusy.size || manualRequestBusy.size || queues.size) throw fail(409, '支付操作正在处理中，请等待完成后导入配置。'); }
+  return { mountWebhook, registerRoutes, effectiveEntitlement, ensureModelRenameIdle, ensureConfigurationIdle };
 }

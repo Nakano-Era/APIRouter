@@ -77,8 +77,6 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     const webEndpoint = url.pathname === `/proxy/${id}/web/search` ? 'search' : url.pathname === `/proxy/${id}/web/read` ? 'read' : null;
     if (webEndpoint) {
       if (req.method !== 'POST' || url.search || job.config.mode !== 'work' || !job.config.webSearch || job.config.search?.enabled !== true) return json(res, 403, { error: '当前任务未获准使用联网服务。' });
-      job.webCalls = (job.webCalls || 0) + 1;
-      if (job.webCalls > 20) return json(res, 429, { error: '本次任务的联网请求已达到 20 次限制。' });
       const body = await bodyJSON(req, 16 * 1024);
       if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !(webEndpoint === 'search' ? ['query', 'limit'] : ['url']).includes(key))) return json(res, 400, { error: '联网请求参数无效。' });
       const result = webEndpoint === 'search' ? await webAccess.search(body, { baseUrl: job.config.search.baseUrl, signal: job.controller.signal }) : await webAccess.read(body, { signal: job.controller.signal });

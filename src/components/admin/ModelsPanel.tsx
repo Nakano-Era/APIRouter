@@ -12,7 +12,7 @@ function EffortFields({ values = [] }: { values?: string[] }) {
   return <fieldset className="model-effort-fields"><legend>支持的思考强度</legend><p className="field-help">自动始终可用。只勾选此模型和接口实际接受的参数，未勾选的选项不会向用户显示。</p><div className="model-effort-options">{['low', 'medium', 'high', 'xhigh', 'max'].map(value => <label className="checkbox-label compact" key={value}><input type="checkbox" name="reasoningEfforts" value={value} defaultChecked={values.includes(value)}/>{effortLabels[value]} <small>{value}</small></label>)}</div></fieldset>;
 }
 function RetryFields({ model }: { model?: AdminModel }) {
-  return <label>响应失败后的额外重试次数<input name="retries" type="number" min={0} max={10} step={1} defaultValue={model?.retries ?? ''} placeholder="留空继承站点设置"/><span className="field-help">0 表示不在此渠道重试；例如 2 表示首次失败后最多再试 2 次。适用于连接失败、超时等可重试错误，仍受单个方案总尝试上限和失败冷却控制。已输出的内容由备用方案接续。</span></label>;
+  return <label>响应失败后的额外重试次数<input name="retries" type="number" min={0} max={100} step={1} defaultValue={model?.retries ?? ''} placeholder="留空继承站点设置"/><span className="field-help">0 表示不在此渠道重试；例如 2 表示首次失败后最多再试 2 次。适用于 HTTP 5xx、连接失败和超时。独立设置优先于站点默认预算，本轮触发冷却不会截断设定的重试。已在冷却的渠道不启动；已输出内容由备用方案接续。</span></label>;
 }
 function CapacityFields({ model }: { model?: AdminModel }) {
   return <div className="form-grid"><label>上下文容量（tokens）<input name="contextWindow" type="number" min={1024} max={10000000} step={1} defaultValue={model?.contextWindow ?? ''} placeholder="未声明，留空"/><span className="field-help">以服务商的实际模型容量为准；留空不会猜测模型限制。</span></label><label>最大输出（tokens）<input name="maxOutputTokens" type="number" min={128} max={1000000} step={1} defaultValue={model?.maxOutputTokens ?? ''} placeholder="未设置，使用站点默认值"/><span className="field-help">单次调用的输出上限，不能超过模型实际支持的限制。</span></label></div>;
