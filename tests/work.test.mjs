@@ -234,8 +234,8 @@ test('configurable work quotas account for actual bytes and file replacement; ze
 
 for (const scenario of [
   { name: 'actual HTTP 503 switches before tools or text', status: 503, source: 'upstream-http', expectedCalls: ['primary', 'backup'], fails: false, channelFailures: 1 },
-  { name: 'actual HTTP 400 does not retry another paid channel', status: 400, source: 'upstream-http', expectedCalls: ['primary'], fails: true, channelFailures: 0 },
-  { name: 'local CLI error with a status number is not a channel outage', status: 503, source: 'claude-code', expectedCalls: ['primary'], fails: true, channelFailures: 0 },
+  { name: 'actual HTTP 400 can fall back after the configured zero retries', status: 400, source: 'upstream-http', expectedCalls: ['primary', 'backup'], fails: false, channelFailures: 1 },
+  { name: 'CLI execution failure before operations can fall back after the configured zero retries', status: 503, source: 'claude-code', expectedCalls: ['primary', 'backup'], fails: false, channelFailures: 1 },
   { name: 'actual HTTP 503 after a tool starts never switches', status: 503, source: 'upstream-http', committed: true, expectedCalls: ['primary'], fails: true, channelFailures: 1 },
 ]) test(`work service/router integration: ${scenario.name}`, async t => {
   const calls = [];
@@ -251,7 +251,7 @@ for (const scenario of [
   }
   const router = createRouter({ store, stream: args => service.stream(args) });
   const run = router.run({ routeKey: 'shared', messages: [{ role: 'user', content: '回答' }], mode: 'work', effort: 'high', retriesPerChannel: 0, context: { userId: 'owner', chatId: 'chat' }, requestId: 'routing-work-test' });
-  if (scenario.fails) await assert.rejects(collect(run), error => { assert.equal(error.code, scenario.source === 'upstream-http' ? 'UPSTREAM_HTTP_ERROR' : 'CLAUDE_EXECUTION_FAILED'); return true; });
+  if (scenario.fails) await assert.rejects(collect(run), { code: 'WORK_FALLBACK_UNSAFE' });
   else assert.ok((await collect(run)).some(event => event.text === '备用渠道实际回答'));
   assert.deepEqual(calls, scenario.expectedCalls);
   assert.equal(store.get('SELECT failure_count FROM models WHERE id=?', 'primary').failure_count, scenario.channelFailures);

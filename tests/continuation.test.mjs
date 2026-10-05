@@ -28,7 +28,7 @@ async function fixture(t, implementation) {
   const setup = await request('/api/auth/setup', 'POST', { setupToken: 'resume-setup', email: 'resume@example.com', name: 'Resume', password: 'resume-password-long-2026' });
   session = { cookie: setup.response.headers.get('set-cookie').split(';')[0], csrfToken: setup.data.csrfToken };
   const provider = (await request('/api/admin/providers', 'POST', { name: 'Hidden', baseUrl: 'https://example.com', apiKey: 'test-secret', protocol: 'anthropic', runtime: 'claude-code' })).data.provider;
-  const model = (await request('/api/admin/models', 'POST', { providerId: provider.id, modelId: 'test-long-context', contextWindow: 1_000_000, maxOutputTokens: 8000 })).data.model;
+  const model = (await request('/api/admin/models', 'POST', { providerId: provider.id, modelId: 'test-long-context', contextWindow: 1_000_000, maxOutputTokens: 8000, retries: 0 })).data.model;
   const chat = (await request('/api/chats', 'POST', { modelId: model.id })).data.chat;
   return { instance, request, chat, model, calls, close, dataDir };
 }
@@ -53,6 +53,46 @@ test('timeout continuation appends to the same saved message and typed continue 
     assert.equal(messages[1].content, prefix + '")\n```\n完成。'); assert.equal(messages[1].status, 'complete');
     assert.equal(f.instance.store.get('SELECT COUNT(*) AS n FROM message_chunks').n, 0);
     assert.equal((await f.request(`/api/chats/${f.chat.id}/continue`, 'POST', { messageId: 'wrong' })).status, 409);
+  } finally { await f.close(); }
+});
+
+test('automatic configured retries continue a saved answer through mixed HTTP and stream failures without duplicate content or quota charges', async t => {
+  const prefix = '已经写出的源码开头必须完整保留，而且后续重试不能从头重新输出。\n```js\n';
+  const f = await fixture(t, async function* (args, attempt) {
+    if (attempt === 1) { yield { type: 'reasoning', text: '开始处理' }; yield { type: 'delta', text: prefix }; throw new UpstreamError('HTTP 500，已保留进度', 'UPSTREAM_HTTP_ERROR', 502, 500); }
+    assert.equal(args.context.continuation, true);
+    assert.equal(args.context.resumeText, prefix);
+    assert.equal(args.messages.filter(message => message.role === 'assistant').length, 1);
+    assert.equal(args.messages.find(message => message.role === 'assistant').content, prefix);
+    if (attempt === 2) throw new UpstreamError('HTTP 400，已保留进度', 'UPSTREAM_HTTP_ERROR', 502, 400);
+    if (attempt === 3) throw new UpstreamError('断流', 'UPSTREAM_TRUNCATED_STREAM');
+    yield { type: 'delta', text: '<think>恢复处理</think>' + prefix + 'console.log(1);\n```' };
+  });
+  try {
+    assert.equal((await f.request(`/api/admin/models/${f.model.id}`, 'PATCH', { retries: 3, failureThreshold: 1 })).status, 200);
+    const response = await f.request(`/api/chats/${f.chat.id}/messages`, 'POST', { content: '请写源码' });
+    assert.match(response.text, /event: done/); assert.doesNotMatch(response.text, /event: error/);
+    const message = (await f.request(`/api/chats/${f.chat.id}`)).data.messages.at(-1);
+    assert.equal(message.content, prefix + 'console.log(1);\n```');
+    assert.equal(message.reasoning, '开始处理\n\n恢复处理');
+    assert.equal(f.calls.length, 4); assert.equal(message.status, 'complete');
+    assert.equal(f.instance.store.get('SELECT COUNT(*) AS n FROM requests').n, 1);
+    assert.equal(f.instance.store.get('SELECT COUNT(*) AS n FROM route_attempts').n, 4);
+    assert.equal(f.instance.store.get('SELECT COUNT(*) AS n FROM message_chunks').n, 0);
+  } finally { await f.close(); }
+});
+
+test('a nominally complete upstream reply with reasoning only still uses remaining retries', async t => {
+  const f = await fixture(t, async function* (_args, attempt) {
+    yield { type: 'delta', text: attempt === 1 ? '<think>还在处理，没有最终正文</think>' : '最终正文' };
+  });
+  try {
+    await f.request(`/api/admin/models/${f.model.id}`, 'PATCH', { retries: 1 });
+    const response = await f.request(`/api/chats/${f.chat.id}/messages`, 'POST', { content: '回答' });
+    assert.match(response.text, /event: done/); assert.equal(f.calls.length, 2);
+    const message = (await f.request(`/api/chats/${f.chat.id}`)).data.messages.at(-1);
+    assert.equal(message.content, '最终正文'); assert.equal(message.reasoning, '还在处理，没有最终正文');
+    assert.deepEqual(f.instance.store.all('SELECT outcome FROM route_attempts ORDER BY rowid').map(row => row.outcome), ['error', 'complete']);
   } finally { await f.close(); }
 });
 

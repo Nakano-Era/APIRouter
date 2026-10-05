@@ -194,28 +194,28 @@ test('ordered targets continue partial output in one assistant and one quota req
   const chat = await f.chat();
   const response = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '连续回答' } });
   const text = await response.text(); assert.equal(response.status, 200); assert.equal((text.match(/event: done/g) || []).length, 1); assert.ok(!text.includes('event: error'));
-  assert.ok(!text.includes(target.routeKey) && !text.includes(third.routeKey)); assert.equal(f.calls.length, 2);
+  assert.ok(!text.includes(target.routeKey) && !text.includes(third.routeKey)); assert.equal(f.calls.length, 3);
   const history = await (await f.request(`/api/chats/${chat.id}`)).json();
   assert.equal(history.messages.length, 2); assert.equal(history.messages[1].content, prefix + '现在接续完成。'); assert.equal(history.messages[1].status, 'complete'); assert.equal(history.messages[1].modelId, sourceId);
   const request = f.instance.store.get('SELECT * FROM requests');
   assert.equal(f.instance.store.get('SELECT COUNT(*) AS count FROM requests').count, 1); assert.equal(request.route_key, source.routeKey); assert.equal(request.variant_name, source.variantName);
-  assert.equal(request.execution_route_key, third.routeKey); assert.equal(request.input_tokens, 30); assert.equal(request.output_tokens, 13);
+  assert.equal(request.execution_route_key, third.routeKey); assert.equal(request.input_tokens, 40); assert.equal(request.output_tokens, 18);
   const logs = (await (await f.request('/api/admin/routing-logs', { user: 'admin' })).json()).attempts.reverse();
-  assert.deepEqual(logs.map(row => [row.executionRouteKey, row.executionVariantName, row.executionEffort, row.outcome]), [[target.routeKey, '', 'low', 'error'], [third.routeKey, '', 'low', 'complete']]);
+  assert.deepEqual(logs.map(row => [row.executionRouteKey, row.executionVariantName, row.executionEffort, row.outcome]), [[target.routeKey, '', 'low', 'error'], [target.routeKey, '', 'low', 'error'], [third.routeKey, '', 'low', 'complete']]);
   assert.ok(logs.every(row => row.requestId === request.id && row.sourceRouteKey === source.routeKey));
   assert.equal((await f.request(`/api/chats/${chat.id}/continue`, { method: 'POST', body: {} })).status, 429);
 });
 
 test('all failed targets preserve cumulative partial text and remain continuable without falsely completing', async t => {
   const f = await fixture(t, { implementation: async function* (_args, number) {
-    yield { type: 'delta', text: number === 1 ? '先保存第一部分。' : '第二部分也已保存。' };
+    yield { type: 'delta', text: `第${number}部分也已保存。` };
     throw new UpstreamError('输出达到上限', 'OUTPUT_LIMIT_REACHED');
   } });
   assert.equal((await f.save([rule({ fallbacks: [{ targetRouteKey: third.routeKey, targetVariantName: '', effort: 'auto' }] })])).status, 200);
   const chat = await f.chat(), response = await f.request(`/api/chats/${chat.id}/messages`, { method: 'POST', body: { content: '继续保存' } });
-  const stream = await response.text(); assert.match(stream, /event: error/); assert.ok(!stream.includes('event: done')); assert.equal(f.calls.length, 2);
+  const stream = await response.text(); assert.match(stream, /event: error/); assert.ok(!stream.includes('event: done')); assert.equal(f.calls.length, 4);
   const history = await (await f.request(`/api/chats/${chat.id}`)).json();
-  assert.equal(history.messages[1].content, '先保存第一部分。第二部分也已保存。'); assert.equal(history.messages[1].status, 'error'); assert.equal(history.messages[1].canContinue, true);
+  assert.equal(history.messages[1].content, '第1部分也已保存。第2部分也已保存。第3部分也已保存。第4部分也已保存。'); assert.equal(history.messages[1].status, 'error'); assert.equal(history.messages[1].canContinue, true);
   assert.equal(f.instance.store.get('SELECT COUNT(*) AS count FROM requests').count, 1);
 });
 

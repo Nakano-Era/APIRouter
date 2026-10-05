@@ -52,7 +52,56 @@ function secretFilter(secret) {
   };
 }
 
-export function createApiExports({ store, upstream = openUpstream, maxResponseBytes = 64 * 1024 * 1024, requestLimit = '32mb', totalTimeoutMs = 3600_000 } = {}) {
+function inspectNativePayload(payload, raw) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new UpstreamError('上游没有返回有效的响应对象。', 'INVALID_UPSTREAM_RESPONSE');
+  const type = payload.type;
+  const failed = payload.error || payload.response?.error || type === 'error' || ['response.failed', 'response.incomplete', 'response.cancelled'].includes(type) || ['failed', 'incomplete', 'cancelled'].includes(payload.status) || ['failed', 'incomplete', 'cancelled'].includes(payload.response?.status);
+  const incomplete = payload.choices?.some?.(choice => choice.finish_reason === 'length') || payload.stop_reason === 'max_tokens' || payload.delta?.stop_reason === 'max_tokens';
+  if (failed || incomplete) {
+    const error = new UpstreamError(incomplete ? '上游输出未完成。' : '上游返回了失败响应。', incomplete ? 'INCOMPLETE_UPSTREAM_OUTPUT' : 'UPSTREAM_RESPONSE_ERROR');
+    error.rawDiagnostic = { responseFormat: 'native', body: raw.slice(0, 1024 * 1024), truncated: raw.length > 1024 * 1024 };
+    throw error;
+  }
+}
+
+// Validate frames without rewriting provider IDs, arguments or usage events.
+// A TCP EOF is not a successful SSE response: each protocol has a terminal event.
+function nativeStreamInspector(protocol) {
+  const decoder = new TextDecoder();
+  let pending = '', completed = false, payloadCount = 0;
+  function frame(raw) {
+    const lines = raw.split(/\r?\n/), data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+    if (!data) return;
+    if (data.trim() === '[DONE]') {
+      if (protocol === 'openai-chat') {
+        if (!payloadCount) throw new UpstreamError('上游没有返回内容。', 'EMPTY_UPSTREAM_OUTPUT');
+        completed = true;
+      }
+      return;
+    }
+    let payload;
+    try { payload = JSON.parse(data); } catch { throw new UpstreamError('上游流式响应包含无效 JSON。', 'INVALID_UPSTREAM_RESPONSE'); }
+    const event = lines.find(line => line.startsWith('event:'))?.slice(6).trim(), type = payload.type || event;
+    inspectNativePayload(event && !payload.type ? { ...payload, type: event } : payload, data);
+    payloadCount++;
+    if (protocol === 'openai-responses' && type === 'response.completed' || protocol === 'anthropic' && type === 'message_stop') completed = true;
+  }
+  return {
+    push(chunk, final = false) {
+      pending += decoder.decode(chunk, { stream: !final });
+      let boundary;
+      while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+        frame(pending.slice(0, boundary.index));
+        pending = pending.slice(boundary.index + boundary[0].length);
+      }
+      if (final && pending.trim()) { frame(pending); pending = ''; }
+      if (final && !completed) throw new UpstreamError('上游流式响应在完成前断开。', 'INCOMPLETE_UPSTREAM_OUTPUT');
+      return completed;
+    },
+  };
+}
+
+export function createApiExports({ store, upstream = openUpstream, maxResponseBytes = 64 * 1024 * 1024, requestLimit = '32mb', totalTimeoutMs = 3600_000, keepAliveMs = 15_000 } = {}) {
   store.db.exec(`CREATE TABLE IF NOT EXISTS api_export_keys (
     id TEXT PRIMARY KEY,name TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,key_hint TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,model_ids TEXT NOT NULL,
@@ -95,9 +144,10 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
     now(), enabled ? 1 : 0, threshold, new Date(Date.now() + seconds * 1000).toISOString(), enabled ? 1 : 0, threshold, row.id, row.failure_epoch);
   }
   function disposition(error) {
-    if (!(error instanceof UpstreamError) || [400, 413, 422].includes(error.upstreamStatus)) return { switch: false, retry: false };
-    const transient = ['UPSTREAM_CONNECTION_ERROR', 'UPSTREAM_TIMEOUT', 'EMPTY_UPSTREAM_OUTPUT'].includes(error.code) || error.upstreamStatus >= 500;
-    return { switch: transient || ['UPSTREAM_HTTP_ERROR', 'UPSTREAM_REDIRECT', 'INVALID_UPSTREAM_RESPONSE'].includes(error.code), retry: transient };
+    // Local validation, access revocation and resource limits do not become
+    // upstream retries. Once dispatched, every upstream failure uses the budget.
+    const local = ['INVALID_BASE_URL', 'BLOCKED_UPSTREAM_ADDRESS', 'INVALID_PROTOCOL', 'MISSING_API_KEY', 'INVALID_AUTH_MODE', 'invalid_api_key', 'model_access_revoked', 'response_too_large'].includes(error?.code);
+    return { switch: !local, retry: !local };
   }
   function auditEnd(auditId, outcome, error, apiKey) {
     const message = error ? `导出 API 上游请求失败${error.upstreamStatus ? `（HTTP ${error.upstreamStatus}）` : ''}。` : null;
@@ -115,9 +165,20 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
     active.set(requestId, { keyId: req.apiExportKeyId, controller });
     const disconnected = () => { if (!res.writableEnded) controller.abort(new DOMException('Client disconnected', 'AbortError')); };
     req.on('aborted', disconnected); res.on('close', disconnected);
-    const timer = setTimeout(() => controller.abort(fail(504, 'API 请求超过最长处理时间。', 'request_timeout')), totalTimeoutMs); timer.unref?.();
-    let written = false, inheritedAttempts = 0, lastError, bytes = 0;
+    let written = false, inheritedAttempts = 0, lastError;
     const settings = store.settings(), attemptLimit = bounded(settings.routingMaxAttempts, 1, 100, 6);
+    // Native APIs may deliver executable tool calls. Hold retryable attempts
+    // until completion, rather than replaying partial native event sequences.
+    const atomicResponse = candidates.length > 1 || candidates.some(row => bounded(row.retries_override, 0, 100, bounded(settings.retriesPerChannel, 0, 3, 1)) > 0);
+    let heartbeat;
+    if (body.stream === true && atomicResponse) {
+      heartbeat = setInterval(() => {
+        if (res.destroyed || res.writableEnded || written || res.writableNeedDrain) return;
+        if (!res.headersSent) res.status(200).set({ 'Content-Type': 'text/event-stream', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' });
+        res.write(': apirouter waiting for upstream\n\n');
+      }, keepAliveMs);
+      heartbeat.unref?.();
+    }
     try {
       for (const initial of candidates) {
         let row = models(req.apiExportKeyId, body.model, protocol).find(item => item.id === initial.id);
@@ -134,37 +195,62 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
             row = models(req.apiExportKeyId, body.model, protocol).find(item => item.id === initial.id);
             if (!row || (cooling(row) && !(explicitRetries && ownFailureEpoch !== null && row.failure_epoch === ownFailureEpoch))) break;
             const provider = { baseUrl: row.base_url, protocol: row.protocol, authMode: row.auth_mode, apiKey: store.decrypt(row.encrypted_key) };
-            let opened, reader;
+            let opened, reader, bytes = 0;
+            const attemptController = new AbortController();
+            const attemptSignal = AbortSignal.any([signal, attemptController.signal]);
+            const attemptTimer = setTimeout(() => attemptController.abort(new UpstreamError('上游 API 响应超时。', 'UPSTREAM_TIMEOUT', 504)), totalTimeoutMs); attemptTimer.unref?.();
             const auditId = id();
             store.run('INSERT INTO route_attempts(id,request_id,provider_id,model_id,outcome,created_at,execution_route_key,execution_variant_name,execution_effort) VALUES(?,?,?,?,?,?,?,?,?)',
               auditId, `api-export-${requestId}`, row.provider_id, row.id, 'running', now(), row.route_key, row.variant_name || '', typeof body.reasoning?.effort === 'string' ? body.reasoning.effort.slice(0, 100) : null);
             if (!explicitRetries) inheritedAttempts++;
             try {
-              opened = await upstream(provider, req.path.slice(1), { signal, body, idleTimeout: true, nativePassthrough: true, requestHeaders: req.headers });
+              opened = await upstream(provider, req.path.slice(1), { signal: attemptSignal, body, idleTimeout: true, nativePassthrough: true, requestHeaders: req.headers });
               const response = opened.response, contentType = response.headers.get('content-type') || '';
               if (!/^(?:application\/(?:[\w.-]+\+)?json|text\/event-stream)(?:;|$)/i.test(contentType) || !response.body) throw new UpstreamError('上游返回了不受支持的响应。', 'INVALID_UPSTREAM_RESPONSE');
+              const streaming = /^text\/event-stream(?:;|$)/i.test(contentType);
+              if (res.headersSent && !streaming) throw new UpstreamError('上游未返回所请求的流式响应。', 'INVALID_UPSTREAM_RESPONSE');
               reader = response.body.getReader();
               const filter = secretFilter(provider.apiKey);
+              const inspector = streaming ? nativeStreamInspector(protocol) : null;
+              const buffered = [], holdOutput = atomicResponse || !streaming;
               async function write(chunk) {
                 if (!chunk.length) return;
                 if (!written) {
-                  res.status(response.status); res.set({ 'Content-Type': contentType, 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' });
+                  if (!res.headersSent) { res.status(response.status); res.set({ 'Content-Type': contentType, 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' }); }
                   written = true;
                 }
-                if (!res.write(chunk)) await once(res, 'drain', { signal: opened.signal || signal });
+                if (!res.write(chunk)) await once(res, 'drain', { signal: opened.signal || attemptSignal });
               }
               while (true) {
-                signal.throwIfAborted();
+                attemptSignal.throwIfAborted();
                 const { value, done } = await reader.read();
                 // A key/model/provider disabled during an in-flight stream must
                 // not keep delivering data. Recheck after the awaited read.
-                signal.throwIfAborted();
+                attemptSignal.throwIfAborted();
                 if (!models(req.apiExportKeyId, body.model, protocol).some(item => item.id === row.id)) throw fail(403, '模型授权或渠道状态已变更。', 'model_access_revoked');
-                if (done) { await write(filter(Buffer.alloc(0), true)); break; }
+                if (done) {
+                  inspector?.push(new Uint8Array(), true);
+                  if (!streaming) {
+                    const raw = Buffer.concat(buffered).toString('utf8');
+                    let payload;
+                    try { payload = JSON.parse(raw); } catch { throw new UpstreamError('上游没有返回有效的 JSON。', 'INVALID_UPSTREAM_RESPONSE'); }
+                    inspectNativePayload(payload, raw);
+                  }
+                  if (holdOutput) for (const chunk of buffered) await write(filter(chunk));
+                  await write(filter(Buffer.alloc(0), true)); break;
+                }
                 bytes += value.byteLength;
                 if (bytes > maxResponseBytes) throw fail(502, '上游响应超过大小限制。', 'response_too_large');
                 opened.touch?.();
-                await write(filter(Buffer.from(value)));
+                const complete = inspector?.push(value);
+                if (holdOutput) buffered.push(Buffer.from(value));
+                else await write(filter(Buffer.from(value)));
+                // Do not wait for TCP EOF after an explicit terminal event;
+                // all preceding frames, including usage, are already buffered.
+                if (complete) {
+                  if (holdOutput) for (const chunk of buffered) await write(filter(chunk));
+                  await write(filter(Buffer.alloc(0), true)); break;
+                }
               }
               if (!bytes) throw new UpstreamError('上游没有返回内容。', 'EMPTY_UPSTREAM_OUTPUT');
               store.run("UPDATE models SET failure_count=0,cooldown_until=NULL,status='ok',error=NULL,last_checked_at=?,failure_epoch=failure_epoch+1 WHERE id=? AND failure_epoch=?", now(), row.id, row.failure_epoch);
@@ -174,24 +260,37 @@ export function createApiExports({ store, upstream = openUpstream, maxResponseBy
               // fetch/read may surface a plain AbortError for its own idle
               // timer. Retain that controller's timeout reason for failover.
               if (opened?.signal?.aborted && !signal.aborted) error = opened.signal.reason || error;
+              if (attemptSignal.aborted && !signal.aborted) error = attemptSignal.reason || error;
               lastError = error;
               auditEnd(auditId, signal.aborted ? 'stopped' : 'error', signal.aborted ? null : error, provider.apiKey);
               if (signal.aborted) throw signal.reason;
               const action = disposition(error);
               if (action.switch) { const recorded = recordFailure(row); ownFailureEpoch = recorded?.changes ? store.get('SELECT failure_epoch FROM models WHERE id=?', row.id)?.failure_epoch ?? null : null; }
-              // Even the first native SSE byte commits this response; mixing
-              // another provider's IDs/tool calls would corrupt client state.
-              if (written || bytes > 0 || !action.switch) throw error;
+              // Keepalive comments commit HTTP headers, not native model data.
+              // Failed buffered attempts can therefore still be discarded.
+              if (written || !action.switch) throw error;
               if (!action.retry) break;
-            } finally { try { await reader?.cancel(); } catch { /* upstream closed */ } reader?.releaseLock(); await opened?.cleanup?.(); }
+            } finally { clearTimeout(attemptTimer); try { await reader?.cancel(); } catch { /* upstream closed */ } reader?.releaseLock(); await opened?.cleanup?.(); }
           }
         } finally { probes.delete(initial.id); }
       }
       throw lastError || fail(503, '授权模型的渠道正在冷却或暂时不可用。', 'model_unavailable');
     } catch (error) {
-      if (res.headersSent || res.destroyed) { if (!res.destroyed) res.destroy(); return; }
+      if (res.headersSent || res.destroyed) {
+        if (!res.destroyed) {
+          const reason = signal.aborted ? signal.reason : error;
+          if (!written) {
+            const stopped = signal.aborted || !disposition(reason).retry;
+            const message = stopped ? reason?.code === 'response_too_large' ? '上游响应超过大小限制，请求已停止。' : '请求已停止或授权状态已变更。' : `上游 API 请求失败${reason?.upstreamStatus ? `（HTTP ${reason.upstreamStatus}）` : ''}。已用完本次可用重试次数。`;
+            const code = stopped ? reason?.code || 'request_stopped' : 'upstream_error';
+            const payload = protocol === 'anthropic' ? { type: 'error', error: { type: 'api_error', message } } : protocol === 'openai-responses' ? { type: 'error', code, message } : errorJSON(message, code);
+            res.end(`${protocol === 'openai-chat' ? '' : 'event: error\n'}data: ${JSON.stringify(payload)}\n\n`);
+          } else res.destroy();
+        }
+        return;
+      }
       throw signal.aborted ? signal.reason : error;
-    } finally { clearTimeout(timer); req.off('aborted', disconnected); res.off('close', disconnected); active.delete(requestId); }
+    } finally { clearInterval(heartbeat); req.off('aborted', disconnected); res.off('close', disconnected); active.delete(requestId); }
   }
   function mountPublic(app) {
     const api = express.Router();

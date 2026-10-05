@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { streamReply, UpstreamError, sanitizeUpstreamError } from './upstream.mjs';
+import { continuationAppender } from './continuation.mjs';
+import { continuationMessages } from './generation-fallback.mjs';
 
 const selection = `SELECT m.*,p.name AS provider_name,p.base_url,p.protocol,p.encrypted_key,
   p.priority,p.failure_threshold,p.cooldown_seconds,p.failure_protection_enabled AS provider_failure_protection_enabled,p.auth_mode,p.runtime,p.responses_profile,p.enabled AS provider_enabled
@@ -8,29 +10,23 @@ const selection = `SELECT m.*,p.name AS provider_name,p.base_url,p.protocol,p.en
 const nonChannelErrors = new Set([
   'INVALID_BASE_URL', 'BLOCKED_UPSTREAM_ADDRESS', 'INVALID_PROTOCOL', 'INVALID_AUTH_MODE',
   'MISSING_API_KEY', 'INVALID_MESSAGES', 'INVALID_ATTACHMENT', 'VISION_UNSUPPORTED',
-  'INVALID_MODEL', 'UNSUPPORTED_TOOL_CALL', 'UNSUPPORTED_OUTPUT', 'OUTPUT_LIMIT_REACHED',
-  'UPSTREAM_CONTENT_FILTER', 'UPSTREAM_RESPONSE_TOO_LARGE', 'INVALID_EFFORT', 'WORK_UNAVAILABLE', 'WORK_PROTOCOL_UNSUPPORTED',
-]);
-const transientErrors = new Set(['UPSTREAM_CONNECTION_ERROR', 'UPSTREAM_TIMEOUT', 'UPSTREAM_TRUNCATED_STREAM']);
-const upstreamFailures = new Set([
-  ...transientErrors, 'UPSTREAM_HTTP_ERROR', 'UPSTREAM_REDIRECT', 'INVALID_UPSTREAM_RESPONSE',
-  'UPSTREAM_RESPONSE_ERROR', 'UPSTREAM_STREAM_ERROR', 'UPSTREAM_INCOMPLETE', 'EMPTY_UPSTREAM_OUTPUT',
+  'INVALID_MODEL', 'INVALID_EFFORT', 'WORK_UNAVAILABLE', 'WORK_NOT_CONFIGURED', 'WORK_PROTOCOL_UNSUPPORTED',
+  'WORK_FALLBACK_UNSAFE', 'WORK_CHECKPOINT_INCOMPATIBLE', 'WORK_CONTEXT_LIMIT', 'WORK_STORAGE_FULL',
+  'WORK_ARTIFACT_COUNT_LIMIT', 'WORK_ARTIFACT_TOTAL_LIMIT', 'WORK_RESTORE_TOO_LARGE', 'WORK_EVENT_TOO_LARGE',
+  'WORK_CHAT_NOT_FOUND', 'WORK_MESSAGE_NOT_FOUND', 'WORK_CHAT_BUSY', 'WEB_SEARCH_DISABLED', 'LOCAL_OUTPUT_LIMIT',
 ]);
 const boundedInteger = (value, min, max, fallback) => Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
 
 function disposition(error, signal) {
-  if (signal?.aborted || error?.name === 'AbortError' || error?.name === 'TimeoutError') return { cancelled: true, channel: false, retry: false, switch: false };
+  if (signal?.aborted) return { cancelled: true, channel: false, retry: false, switch: false };
   if (!(error instanceof UpstreamError) || nonChannelErrors.has(error.code)) return { channel: false, retry: false, switch: false };
-  const status = error.upstreamStatus;
-  // Invalid payloads should be corrected once, rather than sent to more paid APIs.
-  if ([400, 413, 422].includes(status)) return { channel: false, retry: false, switch: false };
-  if (!upstreamFailures.has(error.code)) return { channel: false, retry: false, switch: false };
-  const retry = transientErrors.has(error.code) || (status >= 500 && status <= 599);
-  return { channel: true, retry, switch: true };
+  // The configured budget applies to every upstream failure, irrespective of
+  // HTTP status, output already received, or whether a gateway retained progress.
+  return { channel: true, retry: true, switch: true };
 }
 
 /** Route one logical reply only among administrator-defined equivalent model aliases. */
-export function createRouter({ store, stream = streamReply, clock = Date.now }) {
+export function createRouter({ store, stream = streamReply, clock = Date.now, wait = sleep }) {
   const probes = new Set();
   const timestamp = () => new Date(clock()).toISOString();
   function readCandidate(modelId, routeKey, variantName, needsVision) {
@@ -77,7 +73,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     }
   }
 
-  async function* run({ routeKey, variantName = '', candidateIds, messages, maxOutputTokens, systemPrompt, signal, maxAttempts = 6, retriesPerChannel = 1, onAttempt, requestId, mode = 'chat', effort = 'auto', skillIds = [], webSearch = false, context }) {
+  async function* run({ routeKey, variantName = '', candidateIds, messages, maxOutputTokens, systemPrompt, signal, maxAttempts = 6, retriesPerChannel = 1, onAttempt, prepareAttempt, completeAttempt, attemptTimeoutMs, requestId, mode = 'chat', effort = 'auto', skillIds = [], webSearch = false, context }) {
     signal?.throwIfAborted();
     if (typeof routeKey !== 'string' || !routeKey.trim()) throw new UpstreamError('请选择有效的模型路由。', 'INVALID_ROUTE', 400);
     if (!Array.isArray(messages) || !messages.length) throw new UpstreamError('消息不能为空。', 'INVALID_MESSAGES', 400);
@@ -89,7 +85,7 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
     const defaultRetryLimit = boundedInteger(retriesPerChannel, 0, 3, 1);
     let attempts = 0, inheritedAttempts = 0;
     let lastError;
-    let emittedText = false;
+    let savedText = context?.resumeText || '', committedTools = !!context?.committedTools, previous;
     let knownInput = 0, knownOutput = 0;
     function accumulatedUsage(event) {
       const tokens = value => Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
@@ -131,33 +127,49 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
           if (!explicitRetries) inheritedAttempts++;
           const auditId = auditStart(requestId, current, effort);
           let auditFinished = false;
-          let attemptText = false;
-          let committed = false;
+          let attemptText = false, attemptMessages = messages, attemptContext = context;
+          let appender;
+          const attemptController = new AbortController();
+          const attemptSignal = signal ? AbortSignal.any([signal, attemptController.signal]) : attemptController.signal;
+          const timer = Number.isFinite(attemptTimeoutMs) && attemptTimeoutMs > 0
+            ? setTimeout(() => attemptController.abort(new UpstreamError('上游响应超时，已保留进度。', 'UPSTREAM_TIMEOUT', 504)), attemptTimeoutMs) : null;
+          const append = text => { if (!text) return null; attemptText = true; savedText += text; return { type: 'delta', text }; };
           let pendingUsage;
           try {
-            for await (const event of stream({ provider, model, messages, maxOutputTokens: current.max_output_tokens ? Math.min(maxOutputTokens, current.max_output_tokens) : maxOutputTokens, systemPrompt, signal, mode, effort, skillIds, webSearch, context })) {
-              signal?.throwIfAborted();
+            if (attempts > 1) {
+              const changedChannel = previous?.id !== current.id;
+              attemptContext = { ...context, continuation: true, fallback: !!context?.fallback || changedChannel, committedTools, fallbackFrom: previous, resumeText: savedText };
+              attemptMessages = savedText || committedTools ? continuationMessages(messages, savedText, false, true) : messages;
+              const prepared = await prepareAttempt?.({ previous, candidate: { ...selected, runtime: provider.runtime, protocol: provider.protocol }, context: attemptContext, messages: attemptMessages, error: lastError, attempt: attempts });
+              if (prepared) { attemptMessages = prepared.messages; attemptContext = prepared.context; savedText = attemptContext?.resumeText ?? savedText; }
+            }
+            previous = { id: current.id, runtime: provider.runtime, protocol: provider.protocol, modelId: model.modelId };
+            appender = continuationAppender(savedText);
+            for await (const event of stream({ provider, model, messages: attemptMessages, maxOutputTokens: current.max_output_tokens ? Math.min(maxOutputTokens, current.max_output_tokens) : maxOutputTokens, systemPrompt, signal: attemptSignal, mode, effort, skillIds, webSearch, context: attemptContext })) {
+              attemptSignal.throwIfAborted();
               if (event.type === 'delta' && typeof event.text === 'string' && event.text.length) {
-                attemptText = true; emittedText = true;
-                yield event;
+                const output = append(appender.push(event.text));
+                if (output) yield output;
               } else if (event.type === 'reasoning' && typeof event.text === 'string' && event.text.length) {
-                // A visible reasoning segment belongs to this attempt. Do not
-                // splice another channel's output onto it after an interruption.
-                committed = true;
                 yield event;
               } else if (event.type === 'usage') pendingUsage = event;
               else if (event.type === 'activity' || event.type === 'artifact') {
-                if (event.committed || event.type === 'artifact') committed = true;
+                if (event.committed || event.type === 'artifact') committedTools = true;
                 yield event;
               }
             }
-            signal?.throwIfAborted();
+            attemptSignal.throwIfAborted();
+            const output = append(appender.finish()); if (output) yield output;
             if (!attemptText) throw new UpstreamError('模型没有返回可显示的文本。', 'EMPTY_UPSTREAM_OUTPUT');
+            await completeAttempt?.();
             recordSuccess(current);
             auditEnd(auditId, 'complete'); auditFinished = true;
             if (pendingUsage) yield accumulatedUsage(pendingUsage);
             return;
           } catch (error) {
+            const output = append(appender?.finish()); if (output) yield output;
+            if (!signal?.aborted && attemptSignal.aborted) error = attemptSignal.reason;
+            if (!signal?.aborted && ['TimeoutError', 'AbortError'].includes(error?.name)) error = new UpstreamError('上游连接中断或响应超时，已保留进度。', error.name === 'TimeoutError' ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_CONNECTION_ERROR', 504);
             const policy = disposition(error, signal);
             auditEnd(auditId, policy.cancelled ? 'stopped' : 'error', policy.cancelled ? null : error);
             auditFinished = true;
@@ -167,13 +179,17 @@ export function createRouter({ store, stream = streamReply, clock = Date.now }) 
               const recorded = recordFailure(current, error);
               ownFailureEpoch = recorded?.changes ? store.get('SELECT failure_epoch FROM models WHERE id=?', current.id)?.failure_epoch ?? null : null;
             }
-            if (emittedText || committed || !policy.switch) throw error;
+            if (!policy.switch) throw error;
             lastError = error;
             if (!policy.retry || retry >= retryLimit || (!explicitRetries && (halfOpen || inheritedAttempts >= attemptLimit))) break;
             const updated = readCandidate(initial.id, routeKey, variantName, needsVision);
             if (!updated || (cooldown(updated) !== 'closed' && !(explicitRetries && updated.failure_epoch === ownFailureEpoch))) break;
-            await sleep(Math.min(2000, 250 * (2 ** retry)), undefined, { signal });
+            // Clear the per-attempt deadline before backoff; the next attempt
+            // gets a fresh deadline while the caller's cancellation still wins.
+            clearTimeout(timer);
+            await wait(Math.min(2000, 250 * (2 ** retry)), undefined, { signal });
           } finally {
+            clearTimeout(timer);
             // A consumer cancelling iteration closes the attempt without damaging health.
             if (!auditFinished) auditEnd(auditId, 'stopped');
           }

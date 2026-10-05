@@ -5,7 +5,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { createStore, now, id, digest, hashPassword, verifyPassword } from './store.mjs';
-import { validateBaseUrl, listModels, streamReply, sanitizeUpstreamError } from './upstream.mjs';
+import { validateBaseUrl, listModels, streamReply, sanitizeUpstreamError, UpstreamError } from './upstream.mjs';
 import { extractUpload } from './files.mjs';
 import { createRouter } from './router.mjs';
 import { createBilling } from './billing.mjs';
@@ -360,7 +360,6 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
     res.flushHeaders();
     const send = (event, data) => { if (!res.destroyed && !res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
     const heartbeat = setInterval(() => { if (!res.destroyed) res.write(': keepalive\n\n'); }, 15_000);
-    let timeout;
     send('meta', { ...(userMessage ? { userMessage: messageJSON(userMessage) } : {}), assistantMessage: messageJSON(store.get('SELECT * FROM messages WHERE id=?', assistantId)), chat: chatJSON(store.get('SELECT * FROM chats WHERE id=?', chat.id)) });
     let content = priorContent, reasoning = continuing ? tail.reasoning || '' : '';
     let contentBytes = Buffer.byteLength(content) + Buffer.byteLength(reasoning);
@@ -399,17 +398,28 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
         const { compatible, candidateIds, context } = prepared;
         if (index > 0) send('routing', { message: content ? '连接中断，正在接续已保存的回答…' : '正在重新连接，请稍候…' });
         const beforeContent = content;
+        let attemptStartContent = content;
         appender = continuationAppender(content); splitter = reasoningSplitter(); reasoningStarted = false;
-        const attemptController = new AbortController();
-        const signal = AbortSignal.any([controller.signal, attemptController.signal]);
         const usesRunner = execution.mode === 'work' || compatible.some(row => row.runtime === 'claude-code');
         const taskSeconds = usesRunner ? Math.min(1800, Math.max(30, Number(settings.workSettings?.timeoutSeconds) || 600)) + 60 : Math.min(21600, Math.max(60, Number(process.env.CHAT_TIMEOUT_SECONDS) || 3600));
-        timeout = setTimeout(() => attemptController.abort(fail(504, '当前方案响应超时，已保存已有内容。', 'UPSTREAM_TIMEOUT')), taskSeconds * 1000);
         store.run('UPDATE requests SET execution_route_key=?,execution_variant_name=?,execution_effort=? WHERE id=?', plan.target.routeKey, plan.target.variantName, plan.target.effort, requestId);
         let reportedInput = 0, reportedOutput = 0;
         attempted = true;
         try {
-          for await (const event of router.run({ routeKey: plan.target.routeKey, variantName: plan.target.variantName, candidateIds, messages: attemptInput, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...execution, effort: plan.target.effort, context: { ...context, resumeText: content } })) {
+          for await (const event of router.run({ routeKey: plan.target.routeKey, variantName: plan.target.variantName, candidateIds, messages: attemptInput, maxOutputTokens: settings.maxOutputTokens, systemPrompt: settings.systemPrompt, signal: controller.signal, attemptTimeoutMs: taskSeconds * 1000, maxAttempts: settings.routingMaxAttempts, retriesPerChannel: settings.retriesPerChannel, requestId, ...execution, effort: plan.target.effort, context: { ...context, resumeText: content },
+            prepareAttempt: ({ context: retryContext }) => {
+              // Commit buffered text before constructing continuation context,
+              // and give reasoning tags a fresh parser for each provider reply.
+              separate(splitter.finish()); append(appender.finish());
+              appender = continuationAppender(content); splitter = reasoningSplitter(); reasoningStarted = false;
+              attemptStartContent = content;
+              return { messages: continuationMessages(input, content, continuing, continuing || !!content || committedTools), context: { ...retryContext, committedTools: retryContext.committedTools || committedTools, resumeText: content } };
+            },
+            completeAttempt: () => {
+              separate(splitter.finish()); append(appender.finish());
+              if (!content.trim() || content === attemptStartContent) throw new UpstreamError('上游没有返回新的可显示文字，已保留原内容。', 'EMPTY_UPSTREAM_OUTPUT');
+            },
+          })) {
             if (event.type === 'routing') send('routing', { message: '正在重新连接，请稍候…' });
             if (event.type === 'activity') { if (event.committed) committedTools = true; send('activity', { label: event.label }); }
             if (event.type === 'artifact') { committedTools = true; send('artifact', { artifact: event.artifact }); }
@@ -433,7 +443,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
           try { separate(splitter.finish()); append(appender.finish()); } catch { /* Preserve committed text. */ }
           lastError = error;
           if (!mayFallback(error, controller.signal)) throw error;
-        } finally { clearTimeout(timeout); }
+        }
       }
       if (!completed) throw lastError || fail(503, '所有已配置的回复方案均未完成，已保存内容可以继续生成。', 'ROUTE_EXHAUSTED');
       finishMessage('complete');
@@ -447,7 +457,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       store.run('UPDATE requests SET status=? WHERE id=?', stopped ? 'stopped' : 'error', requestId);
       const message = messageJSON(store.get('SELECT * FROM messages WHERE id=?', assistantId));
       if (stopped) send('done', { message }); else send('error', { error: errorText, message });
-    } finally { clearInterval(heartbeat); clearTimeout(timeout); res.off('close', abort); active.delete(chat.id); store.run('UPDATE chats SET updated_at=? WHERE id=?', now(), chat.id); if (!res.writableEnded) res.end(); }
+    } finally { clearInterval(heartbeat); res.off('close', abort); active.delete(chat.id); store.run('UPDATE chats SET updated_at=? WHERE id=?', now(), chat.id); if (!res.writableEnded) res.end(); }
   }
   app.post('/api/chats/:id/messages', (req, res) => generate(req, res, 'message'));
   app.post('/api/chats/:id/regenerate', (req, res) => generate(req, res, 'regenerate'));

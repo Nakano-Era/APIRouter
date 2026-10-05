@@ -116,10 +116,88 @@ test('exported API honors explicit retry budget above site defaults and its own 
   assert.equal(f.calls.length, 5);
 });
 
-test('invalid native payload HTTP 400 is sanitized and never retried or sent to a different model', async t => {
-  const f = await fixture(t, { upstream: async provider => { const error = new UpstreamError(`secret ${provider.apiKey}`, 'UPSTREAM_HTTP_ERROR', 502, 400); error.rawDiagnostic = { body: provider.apiKey }; throw error; } }); f.add('backup');
-  const { apiKey } = await f.key(['chat', 'backup']); const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } }); assert.equal(response.status, 400); const text = await response.text(); assert.ok(!text.includes('upstream-secret')); assert.ok(!text.includes('rawDiagnostic')); assert.equal(f.calls.length, 1);
-  const audit = f.store.get('SELECT * FROM route_attempts'); assert.equal(audit.outcome, 'error'); assert.match(audit.request_id, /^api-export-/); assert.equal(audit.model_id, 'backup');
+test('every upstream HTTP status and transport error consumes the complete configured retry budget', async t => {
+  for (const kind of [400, 401, 403, 404, 413, 422, 429, 500, 502, 503, 504, 'network', 'idle-timeout', 'invalid-response']) await t.test(String(kind), async t => {
+    const f = await fixture(t, { upstream: async () => {
+      if (kind === 'network') throw new TypeError('socket disconnected');
+      if (kind === 'invalid-response') return { response: new Response('<html>challenge</html>', { headers: { 'content-type': 'text/html' } }) };
+      throw typeof kind === 'number' ? new UpstreamError('failure', 'UPSTREAM_HTTP_ERROR', 502, kind) : new UpstreamError('timeout', 'UPSTREAM_TIMEOUT', 504);
+    } });
+    f.store.setSetting('routingMaxAttempts', 1);
+    f.store.run("UPDATE models SET retries_override=3,failure_threshold_override=1 WHERE id='chat'");
+    const { apiKey } = await f.key();
+    const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } });
+    await response.text(); assert.ok(response.status >= 400); assert.equal(f.calls.length, 4);
+    assert.equal(f.store.get("SELECT failure_count FROM models WHERE id='chat'").failure_count, 4);
+    assert.equal(f.store.get('SELECT COUNT(*) n FROM route_attempts WHERE outcome=?', 'error').n, 4);
+  });
+});
+
+test('inherited retry settings also apply to upstream HTTP 4xx errors', async t => {
+  const f = await fixture(t, { upstream: async () => { throw new UpstreamError('rate limit', 'UPSTREAM_HTTP_ERROR', 502, 429); } });
+  f.store.setSetting('retriesPerChannel', 2); f.store.setSetting('routingMaxAttempts', 3);
+  f.store.run("UPDATE models SET retries_override=NULL,failure_protection_enabled=0 WHERE id='chat'");
+  const { apiKey } = await f.key(), response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } });
+  assert.equal(response.status, 429); assert.equal(f.calls.length, 3);
+});
+
+test('native API retries malformed JSON, embedded errors and incomplete responses before committing output', async t => {
+  for (const raw of ['{"broken":', '{"error":{"message":"backend failed"}}', '{"status":"incomplete","output":[]}', '{"choices":[{"finish_reason":"length"}]}']) await t.test(raw, async t => {
+    const f = await fixture(t, { upstream: async (_provider, _endpoint, input, attempt) => ({ signal: input.signal, response: attempt === 3 ? Response.json({ answer: 'complete' }) : new Response(raw, { headers: { 'content-type': 'application/json' } }) }) });
+    f.store.run("UPDATE models SET retries_override=2 WHERE id='chat'");
+    const { apiKey } = await f.key(), response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } });
+    assert.equal(response.status, 200); assert.deepEqual(await response.json(), { answer: 'complete' }); assert.equal(f.calls.length, 3);
+  });
+});
+
+test('all native SSE protocols retry error frames and clean EOF without terminal events', async t => {
+  const cases = [
+    { id: 'chat', path: 'chat/completions', model: 'native-model', start: 'data: {"id":"failed","choices":[{"delta":{"content":"discard"}}]}\n\n', error: 'data: {"error":{"message":"failed"}}\n\n', terminal: 'data: {"id":"ok","choices":[{"delta":{"content":"kept"},"finish_reason":"stop"}]}\n\ndata: {"choices":[],"usage":{"total_tokens":8}}\n\ndata: [DONE]\n\n' },
+    { id: 'responses', path: 'responses', model: 'response-model', start: 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"failed","delta":"discard"}\n\n', error: 'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"message":"failed"}}}\n\n', terminal: 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"kept","delta":"kept"}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"total_tokens":8}}}\n\n' },
+    { id: 'anthropic', path: 'messages', model: 'claude-model', start: 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"discard"}}\n\n', error: 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"failed"}}\n\n', terminal: 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"kept"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n' },
+  ];
+  for (const item of cases) for (const failure of ['error', 'eof', 'invalid-json']) await t.test(`${item.id} ${failure}`, async t => {
+    const failed = item.start + (failure === 'error' ? item.error : failure === 'invalid-json' ? 'data: {invalid}\n\n' : '');
+    const f = await fixture(t, { upstream: async (_provider, _endpoint, input, attempt) => ({ signal: input.signal, response: new Response(attempt === 3 ? item.terminal : failed, { headers: { 'content-type': 'text/event-stream' } }) }) });
+    f.store.run('UPDATE models SET retries_override=2 WHERE id=?', item.id);
+    const { apiKey } = await f.key([item.id]), response = await f.request('/v1/' + item.path, { key: apiKey, method: 'POST', body: { model: item.model, stream: true } });
+    assert.equal(response.status, 200); assert.equal(await response.text(), item.terminal); assert.equal(f.calls.length, 3);
+  });
+});
+
+test('buffered native SSE keeps connections alive while retries remain hidden', async t => {
+  const f = await fixture(t, { keepAliveMs: 5, upstream: async (_provider, _endpoint, input, attempt) => {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (attempt < 3) throw new UpstreamError('backend failed', 'UPSTREAM_HTTP_ERROR', 502, 500);
+    return { signal: input.signal, response: new Response('data: {"choices":[{"delta":{"content":"kept"}}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) };
+  } });
+  f.store.run("UPDATE models SET retries_override=2 WHERE id='chat'");
+  const { apiKey } = await f.key(), response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model', stream: true } });
+  const body = await response.text(); assert.equal(response.status, 200); assert.match(body, /^: apirouter waiting for upstream\n\n/); assert.match(body, /\[DONE\]/); assert.ok(!body.includes('backend failed')); assert.equal(f.calls.length, 3);
+});
+
+test('buffered native SSE emits a protocol error when all retries fail after keepalives', async t => {
+  const f = await fixture(t, { keepAliveMs: 5, upstream: async () => { await new Promise(resolve => setTimeout(resolve, 15)); throw new UpstreamError('private provider failure', 'UPSTREAM_HTTP_ERROR', 502, 500); } });
+  f.store.run("UPDATE models SET retries_override=2 WHERE id='responses'");
+  const { apiKey } = await f.key(['responses']), response = await f.request('/v1/responses', { key: apiKey, method: 'POST', body: { model: 'response-model', stream: true } });
+  const body = await response.text(); assert.equal(response.status, 200); assert.match(body, /event: error\ndata: \{"type":"error","code":"upstream_error"/); assert.match(body, /HTTP 500/); assert.ok(!body.includes('private provider')); assert.equal(f.calls.length, 3);
+});
+
+test('buffered native response size and local address restrictions do not consume repeated attempts', async t => {
+  for (const cause of ['size', 'address']) await t.test(cause, async t => {
+    const f = await fixture(t, { maxResponseBytes: 40, upstream: async () => { if (cause === 'address') throw new UpstreamError('blocked', 'BLOCKED_UPSTREAM_ADDRESS', 400); return { response: Response.json({ answer: 'x'.repeat(100) }) }; } });
+    f.store.run("UPDATE models SET retries_override=3 WHERE id='chat'");
+    const { apiKey } = await f.key(), response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } });
+    assert.ok(response.status >= 400); assert.equal(f.calls.length, 1); assert.equal(f.store.get("SELECT failure_count FROM models WHERE id='chat'").failure_count, 0);
+  });
+});
+
+test('upstream HTTP 400 uses configured retries and authorized fallback while keeping errors sanitized', async t => {
+  const f = await fixture(t, { upstream: async provider => { const error = new UpstreamError(`secret ${provider.apiKey}`, 'UPSTREAM_HTTP_ERROR', 502, 400); error.rawDiagnostic = { body: provider.apiKey }; throw error; } }); f.add('backup', { priority: -1 });
+  f.store.run("UPDATE models SET retries_override=1 WHERE id='chat'");
+  const { apiKey } = await f.key(['chat', 'backup']); const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } }); assert.equal(response.status, 400); const text = await response.text(); assert.ok(!text.includes('upstream-secret')); assert.ok(!text.includes('rawDiagnostic')); assert.equal(f.calls.length, 3);
+  assert.deepEqual(f.calls.map(call => call.provider.baseUrl), ['https://chat.example.com/v1', 'https://chat.example.com/v1', 'https://backup.example.com/v1']);
+  const audit = f.store.get('SELECT * FROM route_attempts ORDER BY rowid DESC'); assert.equal(audit.outcome, 'error'); assert.match(audit.request_id, /^api-export-/); assert.equal(audit.model_id, 'backup');
   assert.ok(audit.encrypted_detail); assert.ok(!audit.error.includes('secret')); const detail = JSON.parse(f.store.decrypt(audit.encrypted_detail)); assert.ok(!detail.body.includes('upstream-secret')); assert.match(detail.body, /REDACTED/);
   assert.equal(f.store.get('SELECT COUNT(*) n FROM requests').n, 0);
 });
@@ -134,12 +212,15 @@ test('upstream idle abort before output retries authorized backup and keeps a di
   const attempts = f.store.all('SELECT * FROM route_attempts ORDER BY rowid'); assert.equal(attempts.length, 2); assert.equal(attempts[0].request_id, attempts[1].request_id); assert.deepEqual(attempts.map(row => row.outcome), ['error', 'complete']); assert.deepEqual(attempts.map(row => row.model_id), ['chat', 'backup']);
 });
 
-test('a stream interrupted after output never restarts on another channel', async t => {
-  const f = await fixture(t, { upstream: async (_provider, _endpoint, input) => {
-    let count = 0; return { signal: input.signal, response: new Response(new ReadableStream({ async pull(controller) { if (count++ === 0) controller.enqueue(Buffer.from('data: ' + JSON.stringify({ delta: 'first output '.repeat(30) }) + '\n\n')); else { await new Promise(resolve => setTimeout(resolve, 30)); controller.error(new UpstreamError('Interrupted', 'UPSTREAM_CONNECTION_ERROR')); } } }), { headers: { 'content-type': 'text/event-stream' } }) };
-  } }); f.add('backup'); const { apiKey } = await f.key(['chat', 'backup']);
+test('interrupted native stream discards failed text and tool calls before retrying the configured model', async t => {
+  const successful = 'data: {"id":"success","choices":[{"delta":{"content":"complete answer","tool_calls":[{"id":"tool-success","function":{"name":"write_file","arguments":"{}"}}]},"finish_reason":null}]}\n\ndata: {"id":"success","choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: {"id":"success","choices":[],"usage":{"total_tokens":27}}\n\ndata: [DONE]\n\n';
+  const f = await fixture(t, { upstream: async (_provider, _endpoint, input, attempt) => {
+    if (attempt === 2) return { signal: input.signal, response: new Response(successful, { headers: { 'content-type': 'text/event-stream' } }) };
+    let count = 0; return { signal: input.signal, response: new Response(new ReadableStream({ async pull(controller) { if (count++ === 0) controller.enqueue(Buffer.from('data: {"id":"failed","choices":[{"delta":{"content":"discarded prefix","tool_calls":[{"id":"tool-failed"}]}}]}\n\n')); else { await new Promise(resolve => setTimeout(resolve, 10)); controller.error(new TypeError('socket terminated')); } } }), { headers: { 'content-type': 'text/event-stream' } }) };
+  } }); f.store.run("UPDATE models SET retries_override=2 WHERE id='chat'"); const { apiKey } = await f.key();
   const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model', stream: true } }); assert.equal(response.status, 200);
-  await assert.rejects(response.text()); assert.equal(f.calls.length, 1);
+  assert.equal(await response.text(), successful); assert.equal(f.calls.length, 2);
+  assert.deepEqual(f.store.all('SELECT outcome FROM route_attempts ORDER BY rowid').map(row => row.outcome), ['error', 'complete']);
 });
 
 test('reflected upstream credentials are redacted across chunk boundaries without exposing export keys', async t => {
@@ -163,20 +244,41 @@ test('revoking a key cancels an in-flight upstream stream', async t => {
   assert.equal((await f.request('/api/admin/api-keys/' + key.id, { method: 'DELETE' })).status, 200); await assert.rejects(response.text()); assert.equal(aborted, true);
 });
 
-test('terminal SSE frames reach clients before upstream EOF and client disconnect cancels the upstream', async t => {
-  let abortResolve; const aborted = new Promise(resolve => { abortResolve = resolve; });
-  const f = await fixture(t, { upstream: async (_provider, _endpoint, input) => ({ signal: input.signal, response: new Response(new ReadableStream({ start(controller) { controller.enqueue(Buffer.from('data: [DONE]\n\n')); input.signal.addEventListener('abort', () => { abortResolve(); controller.error(input.signal.reason); }, { once: true }); } }), { headers: { 'content-type': 'text/event-stream' } }) }) });
+test('terminal SSE frames reach clients and release upstream before TCP EOF', async t => {
+  let cancelled = false;
+  const completed = 'data: {"choices":[{"delta":{"content":"finished"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
+  const f = await fixture(t, { upstream: async (_provider, _endpoint, input) => ({ signal: input.signal, response: new Response(new ReadableStream({ start(controller) { controller.enqueue(Buffer.from(completed)); }, cancel() { cancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } }) }) });
   const { apiKey } = await f.key(), client = new AbortController();
   const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model', stream: true }, signal: client.signal });
-  const reader = response.body.getReader(); assert.equal(Buffer.from((await reader.read()).value).toString(), 'data: [DONE]\n\n'); client.abort();
-  await aborted; await reader.cancel().catch(() => {});
+  assert.equal(await response.text(), completed); assert.equal(cancelled, true); client.abort();
 });
 
-test('total timeout returns 504 before any output and never fails over after cancellation', async t => {
+test('empty native SSE completion is an upstream failure subject to configured retries', async t => {
+  const f = await fixture(t, { upstream: async (_provider, _endpoint, input) => ({ signal: input.signal, response: new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) }) });
+  f.store.run("UPDATE models SET retries_override=2 WHERE id='chat'");
+  const { apiKey } = await f.key(), response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model', stream: true } });
+  assert.equal(response.status, 502); assert.equal(f.calls.length, 3);
+});
+
+test('per-attempt timeout consumes configured retries and then tries the next channel', async t => {
   const f = await fixture(t, { totalTimeoutMs: 20, upstream: async (_provider, _endpoint, input) => {
     await new Promise((_resolve, reject) => input.signal.addEventListener('abort', () => reject(input.signal.reason), { once: true }));
   } }); f.add('backup'); const { apiKey } = await f.key(['chat', 'backup']);
-  const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } }); assert.equal(response.status, 504); assert.equal((await response.json()).error.code, 'request_timeout'); assert.equal(f.calls.length, 1);
+  f.store.run("UPDATE models SET retries_override=2 WHERE id='chat'");
+  const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } }); assert.equal(response.status, 504); assert.equal((await response.json()).error.code, 'upstream_error'); assert.equal(f.calls.length, 4);
+  assert.equal(f.store.get("SELECT COUNT(*) AS n FROM route_attempts WHERE outcome='error'").n, 4);
+});
+
+test('a retry receives a fresh deadline after a timeout and returns only its successful response', async t => {
+  const f = await fixture(t, { totalTimeoutMs: 30, upstream: async (_provider, _endpoint, input, attempt) => {
+    if (attempt === 1) await new Promise((_resolve, reject) => input.signal.addEventListener('abort', () => reject(input.signal.reason), { once: true }));
+    assert.equal(input.signal.aborted, false);
+    return { response: Response.json({ answer: 'Recovered' }), signal: input.signal };
+  } });
+  f.store.run("UPDATE models SET retries_override=1,failure_threshold_override=1 WHERE id='chat'");
+  const { apiKey } = await f.key();
+  const response = await f.request('/v1/chat/completions', { key: apiKey, method: 'POST', body: { model: 'native-model' } });
+  assert.equal(response.status, 200); assert.deepEqual(await response.json(), { answer: 'Recovered' }); assert.equal(f.calls.length, 2);
 });
 
 test('native network mode skips Codex adapter, forwards only protocol headers and uses upstream credentials', async t => {

@@ -65,7 +65,11 @@ async function* sseRows(response, signal) {
 }
 
 function responseFailure(row) {
-  return fault('上游未完成响应，已保留任务进度。', 'UPSTREAM_STREAM_ERROR', { rawDiagnostic: { source: 'native-agent', body: JSON.stringify(row).slice(0, 128 * 1024) } });
+  const status = row.status_code ?? row.error?.status_code ?? row.error?.status ?? row.response?.error?.status_code;
+  return fault('上游未完成响应，已保留任务进度。', 'UPSTREAM_STREAM_ERROR', {
+    ...(Number.isInteger(status) && status >= 400 && status <= 599 ? { upstreamStatus: status } : {}),
+    rawDiagnostic: { source: 'native-agent', body: JSON.stringify(row).slice(0, 128 * 1024) },
+  });
 }
 
 // A response is successful only after the protocol's explicit terminal event.
@@ -347,11 +351,22 @@ export async function runNativeAgent(job, { cwd, emit = () => {}, fetcher = fetc
       const endpoint = job.protocol === 'anthropic' ? 'messages' : job.protocol === 'openai-responses' ? 'responses' : 'chat/completions';
       const body = nativeRequest(job, state.history, { delegated });
       state.partial = { text: '', visibleStart: state.visibleText.length };
-      const response = await fetcher(`${job.gateway}/v1/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${job.jobToken}`, ...(job.protocol === 'anthropic' ? { 'x-api-key': job.jobToken, 'anthropic-version': '2023-06-01' } : {}) }, body: JSON.stringify(body), signal, redirect: 'error' });
+      let response;
+      try {
+        response = await fetcher(`${job.gateway}/v1/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${job.jobToken}`, ...(job.protocol === 'anthropic' ? { 'x-api-key': job.jobToken, 'anthropic-version': '2023-06-01' } : {}) }, body: JSON.stringify(body), signal, redirect: 'error' });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        throw fault('上游连接失败，已保留任务进度。', error.name === 'TimeoutError' ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_CONNECTION_ERROR', { rawDiagnostic: { source: 'native-agent', protocol: job.protocol, modelId: job.model, body: String(error.message || error).slice(0, 128 * 1024) } });
+      }
       if (!response.ok) {
-        let diagnostic = ''; const decoder = new TextDecoder();
-        for await (const chunk of response.body ?? []) { diagnostic += decoder.decode(chunk, { stream: true }); if (diagnostic.length > 128 * 1024) { diagnostic = diagnostic.slice(0, 128 * 1024); break; } }
-        throw fault(`上游请求失败（HTTP ${response.status}），已保留进度。`, 'UPSTREAM_HTTP_ERROR', { status: response.status, rawDiagnostic: { source: 'native-agent', status: response.status, body: diagnostic } });
+        let diagnostic = '', truncated = false, readNote = ''; const decoder = new TextDecoder();
+        try {
+          for await (const chunk of response.body ?? []) { diagnostic += decoder.decode(chunk, { stream: true }); if (diagnostic.length > 128 * 1024) { diagnostic = diagnostic.slice(0, 128 * 1024); truncated = true; break; } }
+          if (!truncated) diagnostic += decoder.decode();
+        } catch (error) { readNote = `错误响应读取中断：${String(error.message || error).slice(0, 2048)}`; }
+        const headers = {};
+        for (const name of ['content-type', 'request-id', 'x-request-id', 'retry-after']) { const value = response.headers.get(name); if (value) headers[name] = value; }
+        throw fault(`上游请求失败（HTTP ${response.status}），已保留进度。`, 'UPSTREAM_HTTP_ERROR', { status: response.status, upstreamStatus: response.status, rawDiagnostic: { source: 'native-agent', status: response.status, method: 'POST', protocol: job.protocol, modelId: job.model, headers, body: diagnostic, truncated, readNote } });
       }
       let result;
       try { result = await nativeResponse(response, job.protocol, { signal, deferUnclassified: job.responsesProfile === 'codex', onText: async text => { state.partial.text += text; state.visibleText += text; await emit({ type: 'delta', text }); }, onReasoning: async text => emit({ type: 'reasoning', text }) }); }

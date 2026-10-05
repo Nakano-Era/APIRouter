@@ -83,6 +83,9 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
       return json(res, 200, result);
     }
     const endpoint = gatewayEndpoint(url.pathname, id, job.config.protocol ?? job.provider.protocol);
+    // Never attach a previous failed request's HTTP status to a later local
+    // validation error, a connection failure, or a successful response.
+    job.lastDiagnostic = null;
     if (req.method !== 'POST' || !endpoint || [...url.searchParams.keys()].some(key => key !== 'beta')) return json(res, 403, { error: { type: 'permission_error', message: 'Endpoint is not enabled for this job' } });
     if (++job.calls > 160) return json(res, 429, { error: { type: 'rate_limit_error', message: 'Per-job request limit reached' } });
     const body = await bodyJSON(req, 96 * 1024 * 1024);
@@ -103,21 +106,25 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     }
     const upstreamUrl = apiUrl(job.provider.baseUrl, endpoint) + url.search;
     const compatible = endpoint === 'responses' ? prepareResponsesRequest(job.provider, body, { sessionId: id }) : null;
-    const request = await publicRequest(upstreamUrl, { method: 'POST', headers: { ...gatewayHeaders(req.headers, job.provider), ...compatible?.headers }, body: JSON.stringify(compatible?.body ?? body), signal: job.controller.signal, timeoutMs: job.config.limits.timeoutSeconds * 1000 });
+    let request;
     try {
+      request = await publicRequest(upstreamUrl, { method: 'POST', headers: { ...gatewayHeaders(req.headers, job.provider), ...compatible?.headers }, body: JSON.stringify(compatible?.body ?? body), signal: job.controller.signal, timeoutMs: job.config.limits.timeoutSeconds * 1000 });
       const headers = { 'content-type': request.response.headers.get('content-type') || 'application/json', 'cache-control': 'no-store' };
       for (const name of ['request-id', 'x-request-id', 'retry-after']) { const value = request.response.headers.get(name); if (value) headers[name] = value; }
       res.writeHead(request.response.status, headers);
       if (!request.response.ok) {
+        job.lastDiagnostic = { source: 'upstream-http', status: request.response.status, method: 'POST', url: upstreamUrl, protocol: job.provider.protocol, modelId: body.model, headers, body: '', truncated: false, readNote: '沙箱网关捕获的上游原始错误响应；认证凭据已隐藏。', ...(compatible ? { requestShape: responseRequestShape(compatible.body, compatible.profile) } : {}) };
         let length = 0, truncated = false; const chunks = [];
-        for await (const chunk of request.response.body ?? []) {
+        try { for await (const chunk of request.response.body ?? []) {
           const remaining = 128 * 1024 - length;
           if (remaining <= 0) { truncated = true; break; }
           chunks.push(Buffer.from(chunk).subarray(0, remaining)); length += Math.min(chunk.length, remaining);
           if (chunk.length > remaining) { truncated = true; break; }
+        } } finally {
+          job.lastDiagnostic.body = redactCredentials(Buffer.concat(chunks).toString(), [job.provider.apiKey, job.jobToken]);
+          job.lastDiagnostic.truncated = truncated;
         }
         const raw = redactCredentials(Buffer.concat(chunks).toString(), [job.provider.apiKey, job.jobToken]);
-        job.lastDiagnostic = { source: 'upstream-http', status: request.response.status, method: 'POST', url: upstreamUrl, protocol: job.provider.protocol, modelId: body.model, headers, body: raw, truncated, readNote: '沙箱网关捕获的上游原始错误响应；认证凭据已隐藏。', ...(compatible ? { requestShape: responseRequestShape(compatible.body, compatible.profile) } : {}) };
         res.end(raw); return;
       }
       job.lastDiagnostic = null;
@@ -126,7 +133,13 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
         if (!res.write(chunk)) await new Promise(resolveDrain => { res.once('drain', resolveDrain); res.once('close', resolveDrain); });
       }
       res.end();
-    } finally { await request.cleanup(); }
+    } catch (error) {
+      const reason = request?.signal?.aborted ? request.signal.reason : error;
+      const raw = redactCredentials(String(reason?.message || reason).slice(0, 128 * 1024), [job.provider.apiKey, job.jobToken]);
+      if (job.lastDiagnostic?.source === 'upstream-http') job.lastDiagnostic.readNote += ` 错误响应读取中断：${raw}`;
+      else job.lastDiagnostic = { source: 'upstream-transport', status: null, code: reason?.name === 'TimeoutError' ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_CONNECTION_ERROR', method: 'POST', url: upstreamUrl, protocol: job.provider.protocol, modelId: body.model, body: raw, truncated: false };
+      throw error;
+    } finally { await request?.cleanup(); }
   }
 
   async function startJob(req, res) {
@@ -177,7 +190,15 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
           let event; try { event = JSON.parse(line); } catch { continue; }
           if (!['delta', 'reasoning', 'activity', 'usage', 'checkpoint', 'file', 'error', 'done'].includes(event.type)) continue;
           if (event.type === 'checkpoint') validateCheckpoint(event.state, { model: config.model, protocol: config.protocol });
-          if (event.type === 'error') event = { type: 'error', code: event.code, error: event.error, rawDiagnostic: job.lastDiagnostic ?? { status: null, protocol: 'claude-code', modelId: config.model, body: redactCredentials(event.diagnostic?.rawBody || event.error, [job.provider.apiKey, job.jobToken]), truncated: false } };
+          if (event.type === 'error') {
+            const raw = event.rawDiagnostic;
+            const workerStatus = Number.isInteger(event.upstreamStatus) ? event.upstreamStatus : Number.isInteger(event.status) ? event.status : null;
+            event = { type: 'error', code: event.code, error: redactCredentials(event.error || '工作任务未完成。', [job.provider.apiKey, job.jobToken]),
+              ...(workerStatus !== null ? { status: workerStatus } : {}),
+              rawDiagnostic: job.lastDiagnostic ?? { source: config.engine === 'native' ? 'native-agent' : 'claude-code', status: workerStatus, protocol: config.protocol, modelId: config.model,
+                body: redactCredentials(raw?.body || event.diagnostic?.rawBody || event.error, [job.provider.apiKey, job.jobToken]), truncated: raw?.truncated === true,
+                ...(typeof raw?.readNote === 'string' ? { readNote: redactCredentials(raw.readNote, [job.provider.apiKey, job.jobToken]) } : {}) } };
+          }
           if (event.type === 'delta' || event.type === 'reasoning') event.text = redactCredentials(event.text, [job.provider.apiKey, job.jobToken]);
           if (event.type === 'done') done = true;
           send(event);

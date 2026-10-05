@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { createRouter } from '../server/router.mjs';
+import { createRouter as buildRouter } from '../server/router.mjs';
 import { UpstreamError } from '../server/upstream.mjs';
+const createRouter = options => buildRouter({ wait: (ms, value, options) => sleep(Math.min(ms, 25), value, options), ...options });
 
 function fixture(t, channels = [{ id: 'a', priority: 10 }, { id: 'b', priority: 0 }]) {
   const db = new DatabaseSync(':memory:');
@@ -41,11 +42,11 @@ const selected = output => output.filter(item => item.type === 'selected').map(i
 const model = (store, id) => store.get('SELECT * FROM models WHERE id=?', id);
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 
-test('reasoning already shown is forwarded without splicing a second channel after failure', async t => {
+test('reasoning already shown does not disable configured retries or channel fallback', async t => {
   const store = fixture(t), output = [];
   const router = createRouter({ store, stream: async function* () { yield { type: 'reasoning', text: 'work in progress' }; throw failure(503); } });
   await assert.rejects(() => collect(router.run(input({})), output));
-  assert.deepEqual(selected(output), ['a']);
+  assert.deepEqual(selected(output), ['a', 'a', 'b', 'b']);
   assert.equal(output.find(event => event.type === 'reasoning').text, 'work in progress');
 });
 
@@ -66,7 +67,7 @@ test('routes only enabled equivalent models in priority order, preserving protoc
     yield { type: 'delta', text: 'Ready' };
     yield { type: 'usage', inputTokens: 5, outputTokens: 2 };
   } });
-  const output = await collect(router.run(input({ requestId: 'request-1' })));
+  const output = await collect(router.run(input({ requestId: 'request-1', retriesPerChannel: 0 })));
   assert.deepEqual(selected(output), ['a', 'b']);
   assert.equal(calls[0].provider.protocol, 'anthropic');
   assert.equal(calls[0].provider.authMode, 'bearer');
@@ -227,7 +228,7 @@ test('attempt budget is hard-clamped to one hundred upstream requests', async t 
   const store = fixture(t, Array.from({ length: 105 }, (_, i) => ({ id: String(i).padStart(2, '0') })));
   let count = 0;
   const router = createRouter({ store, stream: async function* () { count++; throw failure(429); } });
-  await assert.rejects(collect(router.run(input({ maxAttempts: 999 }))), { code: 'ROUTE_EXHAUSTED' });
+  await assert.rejects(collect(router.run(input({ maxAttempts: 999, retriesPerChannel: 0 }))), { code: 'ROUTE_EXHAUSTED' });
   assert.equal(count, 100);
 });
 
@@ -243,26 +244,16 @@ for (const code of ['UPSTREAM_CONNECTION_ERROR', 'UPSTREAM_TIMEOUT']) {
   });
 }
 
-for (const status of [401, 403, 404, 429]) {
-  test(`HTTP ${status} switches providers without retrying the same one`, async t => {
+for (const status of [400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504, 599]) {
+  test(`HTTP ${status} uses the complete configured retry budget before switching`, async t => {
     const store = fixture(t);
+    store.run('UPDATE models SET retries_override=3 WHERE id=?', 'a');
     const router = createRouter({ store, stream: async function* ({ model: candidate }) {
       if (candidate.id === 'a') throw failure(status);
       yield { type: 'delta', text: 'OK' };
     } });
-    assert.deepEqual(selected(await collect(router.run(input({ retriesPerChannel: 3 })))), ['a', 'b']);
-    assert.equal(model(store, 'a').failure_count, 1);
-  });
-}
-
-for (const status of [400, 413, 422]) {
-  test(`HTTP ${status} stops without failover or damaging channel health`, async t => {
-    const store = fixture(t);
-    const router = createRouter({ store, stream: async function* () { throw failure(status); } });
-    const result = [];
-    await assert.rejects(collect(router.run(input()), result), error => error.upstreamStatus === status);
-    assert.deepEqual(selected(result), ['a']);
-    assert.equal(model(store, 'a').failure_count, 0);
+    assert.deepEqual(selected(await collect(router.run(input({ maxAttempts: 1 })))), ['a', 'a', 'a', 'a', 'b']);
+    assert.equal(model(store, 'a').failure_count, 4);
   });
 }
 
@@ -275,14 +266,57 @@ test('local security/configuration errors never retry or poison channel health',
   assert.equal(model(store, 'a').failure_count, 0);
 });
 
-test('partial reply never switches providers or appends a second answer', async t => {
+test('partial reply retries then switches with continuation context and removes repeated prefixes', async t => {
   const store = fixture(t);
-  const router = createRouter({ store, stream: async function* () { yield { type: 'delta', text: 'Partial' }; throw failure(); } });
+  const prefix = 'A sufficiently long saved answer that must not be repeated.';
+  let calls = 0;
+  const router = createRouter({ store, stream: async function* (args) {
+    if (++calls === 1) { yield { type: 'delta', text: prefix }; throw failure(); }
+    assert.equal(args.context.continuation, true);
+    assert.equal(args.context.resumeText, prefix);
+    assert.ok(args.messages.some(message => message.role === 'assistant' && message.content === prefix));
+    if (args.provider.id === 'a') throw failure(400);
+    yield { type: 'delta', text: prefix + ' Remaining answer.' };
+  } });
   const result = [];
-  await assert.rejects(collect(router.run(input()), result), { code: 'UPSTREAM_HTTP_ERROR' });
+  await collect(router.run(input()), result);
+  assert.deepEqual(selected(result), ['a', 'a', 'b']);
+  assert.equal(result.filter(item => item.type === 'delta').map(item => item.text).join(''), prefix + ' Remaining answer.');
+  assert.equal(model(store, 'a').failure_count, 2);
+});
+
+for (const code of ['INVALID_UPSTREAM_RESPONSE', 'UPSTREAM_REDIRECT', 'UPSTREAM_RESPONSE_ERROR', 'UPSTREAM_STREAM_ERROR', 'UPSTREAM_INCOMPLETE', 'UPSTREAM_TRUNCATED_STREAM', 'EMPTY_UPSTREAM_OUTPUT', 'OUTPUT_LIMIT_REACHED', 'UPSTREAM_CONTENT_FILTER', 'UPSTREAM_RESPONSE_TOO_LARGE', 'UNSUPPORTED_TOOL_CALL', 'WORK_EXECUTION_FAILED', 'WORK_TURN_LIMIT']) {
+  test(`${code} uses explicit retries without requiring an HTTP status`, async t => {
+    const store = fixture(t, [{ id: 'a', threshold: 1 }]);
+    store.run('UPDATE models SET retries_override=2 WHERE id=?', 'a');
+    let calls = 0;
+    const router = createRouter({ store, stream: async function* () { calls++; throw new UpstreamError('Failure retained progress', code); } });
+    await assert.rejects(collect(router.run(input({ maxAttempts: 1 }))), /共 3 次/);
+    assert.equal(calls, 3);
+  });
+}
+
+test('each automatic retry has a fresh timeout while preserving previous output', async t => {
+  const store = fixture(t, [{ id: 'a', threshold: 1 }]);
+  store.run('UPDATE models SET retries_override=1 WHERE id=?', 'a');
+  let calls = 0;
+  const router = createRouter({ store, stream: async function* ({ signal, context }) {
+    if (++calls === 1) { yield { type: 'delta', text: 'Saved progress.' }; await sleep(10000, undefined, { signal }); }
+    assert.equal(signal.aborted, false); assert.equal(context.resumeText, 'Saved progress.');
+    yield { type: 'delta', text: ' Continued.' };
+  } });
+  const result = await collect(router.run(input({ attemptTimeoutMs: 50, maxAttempts: 1 })));
+  assert.equal(calls, 2);
+  assert.equal(result.filter(item => item.type === 'delta').map(item => item.text).join(''), 'Saved progress. Continued.');
+});
+
+test('zero retries preserves partial output but makes only the initial request', async t => {
+  const store = fixture(t, [{ id: 'a' }]); store.run('UPDATE models SET retries_override=0');
+  const result = [];
+  const router = createRouter({ store, stream: async function* () { yield { type: 'delta', text: 'partial' }; throw failure(500); } });
+  await assert.rejects(collect(router.run(input()), result), /共 1 次/);
   assert.deepEqual(selected(result), ['a']);
-  assert.equal(result.filter(item => item.type === 'delta').length, 1);
-  assert.equal(model(store, 'a').failure_count, 1);
+  assert.equal(result.filter(item => item.type === 'delta').map(item => item.text).join(''), 'partial');
 });
 
 test('caller cancellation is audited but never counted as a channel failure', async t => {
@@ -351,7 +385,7 @@ test('failed channels never fall back to a different route key', async t => {
   let count = 0;
   const router = createRouter({ store, stream: async function* () { count++; throw failure(429); } });
   await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
-  assert.equal(count, 1);
+  assert.equal(count, 2);
 });
 
 test('all channels cooling down are skipped without paid requests', async t => {
@@ -401,16 +435,18 @@ test('consumer stopping iteration releases a half-open probe without a health pe
 });
 
 
-test('Work tools commit the attempt before text and forbid failover on later outage', async t => {
+test('Work tools commit progress and pass safe continuation context on retry and failover', async t => {
   const store = fixture(t, [{ id:'a', protocol:'anthropic' }, { id:'b', protocol:'anthropic' }]);
   const called = [];
-  const router = createRouter({store,stream:async function* ({provider}) {
+  const router = createRouter({store,stream:async function* ({provider, context}) {
     called.push(provider.id);
+    if (called.length > 1) { assert.equal(context.continuation, true); assert.equal(context.committedTools, true); assert.equal(context.fallbackFrom.modelId, 'upstream-a'); }
+    if (provider.id === 'b') { yield {type:'delta',text:'Finished using saved file'}; return; }
     yield {type:'activity',label:'Writing file',committed:true};
     throw failure(503);
   }});
-  await assert.rejects(collect(router.run(input({mode:'work',requestId:'work-side-effect'}))), {upstreamStatus:503});
-  assert.deepEqual(called,['a']);
+  await collect(router.run(input({mode:'work',requestId:'work-side-effect'})));
+  assert.deepEqual(called,['a','a','b']);
 });
 
 test('Work accepts native API channels and still filters unsupported effort', async t => {
@@ -429,11 +465,11 @@ test('model versions fail over only within the selected version, including the u
   const store = fixture(t, [{ id: 'normal', priority: 100, variantName: '普通版' }, { id: 'smart-a', priority: 10, variantName: '高智商版' }, { id: 'smart-b', variantName: '高智商版' }, { id: 'legacy', priority: 200 }]);
   const calls = [];
   const router = createRouter({ store, stream: async function* ({ model }) { calls.push(model.id); if (model.id === 'smart-a') throw failure(429); yield { type: 'delta', text: '回答' }; } });
-  assert.deepEqual(selected(await collect(router.run(input({ variantName: '高智商版' })))), ['smart-a', 'smart-b']);
+  assert.deepEqual(selected(await collect(router.run(input({ variantName: '高智商版' })))), ['smart-a', 'smart-a', 'smart-b']);
   assert.deepEqual(selected(await collect(router.run(input()))), ['legacy']);
   assert.deepEqual(selected(await collect(router.run(input({ variantName: '普通版' })))), ['normal']);
   await assert.rejects(collect(router.run(input({ variantName: '不存在的版本' }))), { code: 'ROUTE_UNAVAILABLE' });
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 5);
   const output = [];
   await assert.rejects(collect(router.run(input({ variantName: '高智商版', candidateIds: ['normal'] })), output), { code: 'ROUTE_UNAVAILABLE' });
   assert.deepEqual(output, []);
@@ -448,14 +484,14 @@ test('a version assignment changed during routing is rechecked before failover',
     throw failure(429);
   } });
   await assert.rejects(collect(router.run(input({ variantName: '高智商版' }))), { code: 'ROUTE_EXHAUSTED' });
-  assert.deepEqual(calls, ['a']);
+  assert.deepEqual(calls, ['a', 'a']);
 });
 
 test('disabled provider failure protection ignores persisted cooldown and continues tracking errors without disabling', async t => {
   const store = fixture(t, [{ id: 'a', protection: 0, threshold: 1, failureCount: 9, cooldownUntil: '2099-01-01T00:00:00Z' }]);
   let calls = 0;
   const router = createRouter({ store, stream: async function* () { calls++; throw failure(429); } });
-  for (let attempt = 0; attempt < 3; attempt++) await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
+  for (let attempt = 0; attempt < 3; attempt++) await assert.rejects(collect(router.run(input({ retriesPerChannel: 0 }))), { code: 'ROUTE_EXHAUSTED' });
   assert.equal(calls, 3); assert.equal(model(store, 'a').failure_count, 12); assert.equal(model(store, 'a').cooldown_until, null);
 });
 
@@ -468,16 +504,16 @@ test('per-model failure protection can override either enabled or disabled provi
   assert.equal(model(store, 'b').cooldown_until, '2026-10-01T00:02:00.000Z');
   const events = [];
   await assert.rejects(collect(router.run(input()), events), { code: 'ROUTE_EXHAUSTED' });
-  assert.deepEqual(selected(events), ['a']);
+  assert.deepEqual(selected(events), ['a', 'a']);
 });
 
 test('per-model threshold and cooldown override provider defaults and allow recovery afterwards', async t => {
   const store = fixture(t, [{ id: 'a', threshold: 1, cooldownSeconds: 60, modelThreshold: 2, modelCooldownSeconds: 300 }]);
   let now = Date.parse('2026-10-01T00:00:00Z'), fail = true;
   const router = createRouter({ store, clock: () => now, stream: async function* () { if (fail) throw failure(429); yield { type: 'delta', text: '恢复' }; } });
-  await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
+  await assert.rejects(collect(router.run(input({ retriesPerChannel: 0 }))), { code: 'ROUTE_EXHAUSTED' });
   assert.equal(model(store, 'a').cooldown_until, null);
-  await assert.rejects(collect(router.run(input())), { code: 'ROUTE_EXHAUSTED' });
+  await assert.rejects(collect(router.run(input({ retriesPerChannel: 0 }))), { code: 'ROUTE_EXHAUSTED' });
   assert.equal(model(store, 'a').cooldown_until, '2026-10-01T00:05:00.000Z');
   await assert.rejects(collect(router.run(input())), { code: 'ROUTE_COOLDOWN' });
   now += 300_001; fail = false;

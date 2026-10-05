@@ -94,7 +94,11 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
         await emit(event);
       } });
     } catch (error) {
-      await emit({ type: 'error', code: error.code || 'WORK_EXECUTION_FAILED', error: String(error.message || '工作任务中断，已保留进度。'), diagnostic: { rawBody: error.rawDiagnostic?.body || error.message, source: 'native-agent' } });
+      await emit({ type: 'error', code: error.code || 'WORK_EXECUTION_FAILED', error: String(error.message || '工作任务中断，已保留进度。'),
+        ...(Number.isInteger(error.status) ? { status: error.status } : {}),
+        ...(Number.isInteger(error.upstreamStatus) ? { upstreamStatus: error.upstreamStatus } : {}),
+        ...(error.rawDiagnostic ? { rawDiagnostic: error.rawDiagnostic } : {}),
+        diagnostic: { rawBody: error.rawDiagnostic?.body || error.message, source: 'native-agent' } });
     } finally { await snapshot(); }
     await emit({ type: 'done' });
     return;

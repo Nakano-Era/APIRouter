@@ -106,12 +106,12 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
   const unsafeHandoff = () => new UpstreamError('工作任务已执行操作，但缺少可安全接续的执行记录；已有输出与文件已保存，请检查后继续。', 'WORK_FALLBACK_UNSAFE', 409);
   function resumeCheckpoint(context) {
     const saved = store.get('SELECT * FROM work_checkpoints WHERE assistant_id=? AND user_id=? AND chat_id=?', context.assistantId, context.userId, context.chatId);
-    if (context.fallback && context.fallbackFrom?.runtime === 'claude-code') {
+    if ((context.fallback || context.continuation) && context.fallbackFrom?.runtime === 'claude-code') {
       if (context.committedTools) throw unsafeHandoff();
       return null; // A previous native checkpoint cannot describe a later CLI run.
     }
-    if (context.fallback && context.committedTools && !saved) throw unsafeHandoff();
-    if (context.fallback && context.committedTools && saved) {
+    if ((context.fallback || context.continuation) && context.committedTools && !saved) throw unsafeHandoff();
+    if ((context.fallback || context.continuation) && context.committedTools && saved) {
       const state = JSON.parse(store.decrypt(saved.encrypted_state));
       if (!state.journal?.length && !state.pendingCalls?.length) throw unsafeHandoff();
     }
@@ -149,9 +149,10 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
     if (webSearch && !searchSettings().enabled) throw fault('管理员已关闭网络搜索，请关闭搜索选项后再试。', 400, 'WEB_SEARCH_DISABLED');
     const files = mode === 'work' ? store.all('SELECT path,body FROM work_artifacts WHERE chat_id=? AND user_id=? ORDER BY created_at DESC', context.chatId, context.userId).map(row => ({ path: `output/${row.path}`, data: Buffer.from(row.body).toString('base64') })) : [];
     let resumeState, resumeText = '';
+    if (mode === 'work' && context?.continuation && context.committedTools && (engine === 'claude-code' || !context.assistantId)) throw unsafeHandoff();
     if (mode === 'work' && context?.assistantId) {
       const assistant = ownedAssistant(context);
-      if (context.continuation && context.fallback && engine === 'claude-code' && (resumeCheckpoint(context) || context.committedTools)) throw unsafeHandoff();
+      if (context.continuation && engine === 'claude-code' && (context.committedTools || (context.fallback && resumeCheckpoint(context)))) throw unsafeHandoff();
       if (context.continuation && engine === 'native') {
         const checkpoint = resumeCheckpoint(context);
         if (checkpoint) {
@@ -194,12 +195,13 @@ export function createWorkService({ store, dataDir: _dataDir, runnerUrl = proces
           else if (event.type === 'usage') yield { type: 'usage', inputTokens: tokens(event.inputTokens), outputTokens: tokens(event.outputTokens) };
           else if (event.type === 'error') {
             const raw = event.rawDiagnostic;
-            // Only an actual HTTP response recorded by the broker's upstream
-            // gateway participates in channel retry/circuit-breaker decisions.
-            // A CLI exit code, Docker error or task budget is a local failure.
+            // The gateway, rather than a CLI exit code or a worker HTTP-looking
+            // message, identifies actual upstream HTTP/transport failures.
             const upstreamHttp = raw?.source === 'upstream-http' && raw.protocol === provider.protocol && raw.method === 'POST' &&
               Number.isInteger(raw.status) && raw.status >= 400 && raw.status <= 599 && typeof raw.url === 'string' && typeof raw.body === 'string';
-            executionError = new UpstreamError(String(event.error || '工作执行未完成，可继续接续。'), upstreamHttp ? 'UPSTREAM_HTTP_ERROR' : String(event.code || 'WORK_EXECUTION_FAILED'), 502, upstreamHttp ? raw.status : undefined);
+            const upstreamTransport = raw?.source === 'upstream-transport' && raw.protocol === provider.protocol && raw.method === 'POST' && typeof raw.url === 'string' && typeof raw.body === 'string';
+            const code = upstreamHttp ? 'UPSTREAM_HTTP_ERROR' : upstreamTransport ? (raw.code === 'UPSTREAM_TIMEOUT' ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_CONNECTION_ERROR') : String(event.code || 'WORK_EXECUTION_FAILED');
+            executionError = new UpstreamError(String(event.error || '工作执行未完成，可继续接续。'), code, 502, upstreamHttp ? raw.status : undefined);
             if (event.rawDiagnostic) executionError.rawDiagnostic = redactObject(event.rawDiagnostic, [provider.apiKey, runnerToken]);
           } else if (event.type === 'file' && mode === 'work') {
             yield { type: 'artifact', committed: true, artifact: saveArtifact(event.file, context, job.limits) };
