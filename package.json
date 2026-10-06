@@ -24,6 +24,7 @@
     "highlight.js": "^11.11.1",
     "ipaddr.js": "^2.5.0",
     "katex": "^0.16.47",
+    "libarchive-wasm": "1.2.0",
     "lucide-react": "^0.468.0",
     "mammoth": "^1.10.0",
     "multer": "^2.0.2",

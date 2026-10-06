@@ -5,7 +5,7 @@ import { join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import { createHash } from 'node:crypto';
-import { claudeArguments, validateJob, validateSkill, safeRelativePath, MAX_ARTIFACTS, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_TOTAL, MAX_JOB_BYTES, artifactPolicy, parseClaudeEvent } from './protocol.mjs';
+import { claudeArguments, validateJob, validateSkill, safeRelativePath, MAX_ARTIFACTS, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_TOTAL, MAX_JOB_BYTES, UPSTREAM_REQUEST_TIMEOUT_MS, artifactPolicy, parseClaudeEvent } from './protocol.mjs';
 
 export async function collectArtifacts(directory, limits = {}) {
   const directoryStat = await lstat(directory);
@@ -58,10 +58,11 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
   const job = validateJob(input);
   if (!/^http:\/\/gateway:3210\/proxy\/[a-f0-9]{32}$/.test(input.gateway) || !/^[A-Za-z0-9_-]{43}$/.test(input.jobToken)) throw new Error('Invalid per-job gateway');
   await mkdir(join(cwd, 'output'), { recursive: true });
+  await mkdir(join(cwd, 'input'), { recursive: true });
   for (const file of job.files) {
     const target = join(cwd, safeRelativePath(file.path));
     await mkdir(resolve(target, '..'), { recursive: true });
-    await writeFile(target, Buffer.from(file.data, 'base64'), { mode: 0o600, flag: 'wx' });
+    await writeFile(target, Buffer.from(file.data, 'base64'), { mode: file.path.startsWith('input/') ? 0o400 : 0o600, flag: 'wx' });
   }
   for (const skill of job.skills) {
     const checked = validateSkill(skill);
@@ -87,7 +88,7 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
   if (job.engine === 'native') {
     const execute = nativeRunner ?? (await import('./native-agent.mjs')).runNativeAgent;
     try {
-      await execute(job, { cwd, signal: AbortSignal.timeout(job.limits.timeoutSeconds * 1000), emit: async event => {
+      await execute(job, { cwd, signal: job.limits.timeoutSeconds > 0 ? AbortSignal.timeout(job.limits.timeoutSeconds * 1000) : new AbortController().signal, emit: async event => {
         // Save the workspace before acknowledging the corresponding tool journal.
         // A crash before this acknowledgement leaves a pending, never-replayed call.
         if (event.type === 'checkpoint') await snapshot();
@@ -111,7 +112,7 @@ export async function runWorker(input, { cwd = '/workspace', emit = event => pro
       ANTHROPIC_BASE_URL: input.gateway, ANTHROPIC_AUTH_TOKEN: input.jobToken,
       ANTHROPIC_DEFAULT_OPUS_MODEL: job.model, ANTHROPIC_DEFAULT_SONNET_MODEL: job.model, ANTHROPIC_DEFAULT_HAIKU_MODEL: job.model, CLAUDE_CODE_SUBAGENT_MODEL: job.model,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_AUTOUPDATER: '1', DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(job.maxOutputTokens), API_TIMEOUT_MS: String(job.limits.timeoutSeconds * 1000) },
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(job.maxOutputTokens), API_TIMEOUT_MS: String(UPSTREAM_REQUEST_TIMEOUT_MS) },
   });
   const exit = new Promise(resolveExit => { child.once('error', error => resolveExit({ code: null, error })); child.once('close', (code, signal) => resolveExit({ code, signal })); });
   const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch {} } };

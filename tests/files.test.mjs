@@ -68,14 +68,18 @@ test('rejects empty files, oversized raw inputs and excess extracted text', asyn
   await assert.rejects(upload(Buffer.from('a'.repeat(200_001)), 'long.txt'), (e) => e.status === 413 && /20 万/.test(e.message));
 });
 
-test('rejects binary masquerading, invalid UTF-8, and unsupported active formats', async () => {
+test('rejects malformed declared formats while retaining programs and SVG as inert attachments', async () => {
   await assert.rejects(upload(Buffer.from([0x4d, 0x5a, 0, 1, 2]), 'safe.txt'), /二进制/);
   await assert.rejects(upload(Buffer.from([0x66, 0x80, 0x6f]), 'invalid.txt'), /UTF-8/);
   await assert.rejects(upload(pdfFixture(), 'disguised.txt'), /二进制文档/);
   await assert.rejects(upload(Buffer.from('not really a pdf'), 'fake.pdf'), /PDF 文件签名/);
-  await assert.rejects(upload(Buffer.from('some program'), 'program.exe'), /暂不支持此文件类型/);
-  await assert.rejects(upload(Buffer.from('<svg onload="alert(1)"></svg>'), 'picture.svg'), /SVG/);
-  await assert.rejects(upload(Buffer.from('<svg onload="alert(1)"></svg>'), 'picture.txt'), /SVG/);
+  const program = await upload(Buffer.from('some program'), 'program.exe');
+  assert.equal(program.kind, 'file'); assert.equal(program.mime, 'application/octet-stream');
+  for (const name of ['picture.svg', 'picture.txt']) {
+    const svg = await upload(Buffer.from('<svg onload="alert(1)"></svg>'), name);
+    assert.equal(svg.kind, 'text'); assert.equal(svg.mime, 'text/plain');
+    assert.equal(svg.text, '<svg onload="alert(1)"></svg>');
+  }
 });
 
 test('uses actual image signatures and dimensions instead of declared MIME', async () => {

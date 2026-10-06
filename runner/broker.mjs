@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import { apiUrl, validateBaseUrl } from '../server/net.mjs';
-import { validateJob, dockerArguments, fault, validateCheckpoint, MAX_JOB_BYTES, MAX_WORK_EVENT_BYTES } from './protocol.mjs';
+import { validateJob, dockerArguments, fault, validateCheckpoint, MAX_JOB_BYTES, MAX_WORK_EVENT_BYTES, UPSTREAM_REQUEST_TIMEOUT_MS } from './protocol.mjs';
 import { safePublicRequest, redactCredentials } from './network.mjs';
 import { prepareResponsesRequest, responseRequestShape, responsesProfile } from '../server/responses-compat.mjs';
 import { createWebAccess } from './web-access.mjs';
@@ -108,7 +108,7 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     const compatible = endpoint === 'responses' ? prepareResponsesRequest(job.provider, body, { sessionId: id }) : null;
     let request;
     try {
-      request = await publicRequest(upstreamUrl, { method: 'POST', headers: { ...gatewayHeaders(req.headers, job.provider), ...compatible?.headers }, body: JSON.stringify(compatible?.body ?? body), signal: job.controller.signal, timeoutMs: job.config.limits.timeoutSeconds * 1000 });
+      request = await publicRequest(upstreamUrl, { method: 'POST', headers: { ...gatewayHeaders(req.headers, job.provider), ...compatible?.headers }, body: JSON.stringify(compatible?.body ?? body), signal: job.controller.signal, timeoutMs: UPSTREAM_REQUEST_TIMEOUT_MS });
       const headers = { 'content-type': request.response.headers.get('content-type') || 'application/json', 'cache-control': 'no-store' };
       for (const name of ['request-id', 'x-request-id', 'retry-after']) { const value = request.response.headers.get(name); if (value) headers[name] = value; }
       res.writeHead(request.response.status, headers);
@@ -161,8 +161,12 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
     const stopJob = () => { job.controller.abort(); docker(['rm', '-f', `ar-work-${job.id}`]).catch(() => {}); };
     const onClose = () => { if (!res.writableEnded) stopJob(); };
     res.once('close', onClose);
-    const timer = setTimeout(() => { send({ type: 'error', code: 'WORK_TIMEOUT', error: '任务达到沙箱时限，已停止。' }); stopJob(); res.end(); }, config.limits.timeoutSeconds * 1000);
-    timer.unref();
+    const timer = config.limits.timeoutSeconds > 0 ? setTimeout(() => { send({ type: 'error', code: 'WORK_TIMEOUT', error: '任务达到沙箱时限，已停止。' }); stopJob(); res.end(); }, config.limits.timeoutSeconds * 1000) : null;
+    timer?.unref();
+    // Keep the application-to-runner stream alive during long reasoning/tool
+    // steps. Empty NDJSON lines carry no model activity or task deadline.
+    const heartbeat = setInterval(() => { if (!res.destroyed && !res.writableEnded) res.write('\n'); }, 15_000);
+    heartbeat.unref();
     try {
       send({ type: 'activity', label: '正在启动隔离工作区', committed: false });
       await docker(['network', 'create', '--internal', '--label', 'apirouter.work.managed=1', job.network]);
@@ -209,7 +213,7 @@ export function createBroker({ token = process.env.WORK_RUNNER_TOKEN, image = pr
       if (!done) send({ type: 'error', code: 'WORKER_FAILED', error: '工作执行器异常退出，请管理员检查原始日志。', rawDiagnostic: job.lastDiagnostic ?? { status: null, protocol: 'claude-code', modelId: config.model, body: redactCredentials(stderr || outcome.error?.message || `Worker exit code ${outcome.code}`, [provider.apiKey, job.jobToken]), truncated: false } });
     } catch (error) {
       send({ type: 'error', code: error.code || 'WORKER_FAILED', error: '无法完成沙箱任务，请管理员检查运行配置。', rawDiagnostic: { body: redactCredentials(error.message, [provider.apiKey, job.jobToken]), protocol: 'claude-code', modelId: config.model, truncated: false } });
-    } finally { clearTimeout(timer); await cleanup(job); res.end(); }
+    } finally { clearTimeout(timer); clearInterval(heartbeat); await cleanup(job); res.end(); }
   }
 
   const server = createServer(async (req, res) => {

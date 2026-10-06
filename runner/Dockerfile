@@ -18,7 +18,7 @@ EXPOSE 3210
 CMD ["node", "runner/broker.mjs"]
 
 FROM node:24-bookworm-slim AS worker
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 python3-venv python3-pil python3-docx python3-openpyxl python3-reportlab git ripgrep bash && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 python3-venv python3-pil python3-docx python3-openpyxl python3-reportlab git ripgrep bash libarchive-tools zip unzip tar gzip bzip2 xz-utils zstd && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv --system-site-packages /opt/pythonenv \
     && /opt/pythonenv/bin/pip install --no-cache-dir python-pptx==1.0.2 XlsxWriter==3.2.9 typing-extensions==4.15.0
 WORKDIR /opt/apirouter

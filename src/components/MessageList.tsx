@@ -1,5 +1,5 @@
 import { Children, isValidElement, useEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, Check, Copy, Download, FileText, LoaderCircle, Pencil, Play, RotateCcw } from 'lucide-react';
+import { ArrowDown, Check, Copy, Download, FileArchive, FileText, LoaderCircle, Pencil, Play, RotateCcw } from 'lucide-react';
 import { defaultUrlTransform } from 'react-markdown';
 import MathMarkdown from './MathMarkdown';
 import type { Attachment, Message, Model, WorkArtifact } from '../types';
@@ -7,6 +7,7 @@ import Modal from './Modal';
 import WorkResults from './WorkResults';
 import ReasoningDetails from './ReasoningDetails';
 import ArtifactLink from './ArtifactLink';
+import { attachmentHint, attachmentLabel, isArchiveAttachment } from '../lib/attachments';
 function textOf(children: ReactNode): string { return Children.toArray(children).map(child => typeof child === 'string' || typeof child === 'number' ? String(child) : isValidElement<{children?:ReactNode}>(child) ? textOf(child.props.children) : '').join(''); }
 function CopyButton({ text, label = '复制', compact = true }: { text: string; label?: string; compact?: boolean }) {
   const [copied, setCopied] = useState(false); const [failed, setFailed] = useState(false);
@@ -14,7 +15,7 @@ function CopyButton({ text, label = '复制', compact = true }: { text: string; 
   return <button className={compact ? 'icon-button' : 'code-copy'} onClick={copy} aria-label={copied ? '已复制' : label} title={failed ? '复制失败，请手动选择文本' : copied ? '已复制' : label}>{copied ? <Check size={14}/> : <Copy size={14}/>} {!compact && (copied ? '已复制' : failed ? '请手动复制' : label)}</button>;
 }
 function CodeBlock({ children }: { children?: ReactNode }) { const first = Children.toArray(children)[0]; const cls = isValidElement<{className?:string}>(first) ? first.props.className || '' : ''; return <div className="code-block"><div className="code-header"><span>{cls.match(/language-([^\s]+)/)?.[1] || '代码'}</span><CopyButton text={textOf(children).replace(/\n$/,'')} compact={false}/></div><pre>{children}</pre></div>; }
-function Files({ files }: { files: Attachment[] }) { return files.length > 0 ? <div className="message-files">{files.map(file => <a className={`message-file ${file.kind === 'image' ? 'image-file' : ''}`} href={file.url} key={file.id} target="_blank" rel="noreferrer">{file.kind === 'image' ? <img src={file.url} alt={file.name} loading="lazy"/> : <><FileText size={21}/><span>{file.name}<small>{Math.max(1,Math.round(file.size/1024))} KB</small></span><Download size={14}/></>}</a>)}</div> : null; }
+function Files({ files }: { files: Attachment[] }) { return files.length > 0 ? <div className="message-files">{files.map(file => <a className={`message-file ${file.kind === 'image' ? 'image-file' : ''}`} href={file.url} key={file.id} title={attachmentHint(file)} download={file.kind === 'image' ? undefined : file.name} target="_blank" rel="noreferrer">{file.kind === 'image' ? <img src={file.url} alt={file.name} loading="lazy"/> : <>{isArchiveAttachment(file) ? <FileArchive size={21}/> : <FileText size={21}/>}<span>{file.name}<small>{attachmentLabel(file)} · {Math.max(1,Math.round(file.size/1024))} KB</small></span><Download size={14}/></>}</a>)}</div> : null; }
 export default function MessageList({ messages, models, generating, onRegenerate, onContinue, onEdit, loading, activity = [], artifacts = [] }: { messages: Message[]; models: Model[]; generating: boolean; onRegenerate: () => void; onContinue: (message: Message) => void; onEdit: (message: Message, content: string) => Promise<boolean>; loading: boolean; activity?: string[]; artifacts?: WorkArtifact[] }) {
   const viewport = useRef<HTMLDivElement>(null); const following = useRef(true); const [showDown, setShowDown] = useState(false); const [editing, setEditing] = useState<Message | null>(null); const [editText, setEditText] = useState(''); const [confirmRegenerate, setConfirmRegenerate] = useState(false);
   useEffect(() => { if (following.current && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight; }, [messages, generating, activity, artifacts]);

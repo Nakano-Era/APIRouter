@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { fork } from 'node:child_process';
 import { inflateRawSync } from 'node:zlib';
+import { archiveMime, extractArchive } from './archive-files.mjs';
 
 // Bounds are deliberately independent of the browser-provided MIME type.
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -15,8 +16,12 @@ const TEXT_EXTENSIONS = new Set([
   '.yaml', '.yml', '.xml', '.html', '.htm', '.css', '.scss', '.less', '.js',
   '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.py', '.ipynb', '.rb', '.rs', '.go',
   '.java', '.c', '.h', '.cpp', '.hpp', '.cs', '.php', '.sh', '.sql', '.toml',
-  '.ini', '.conf', '.vue', '.svelte', '.r', '.tex', '.dockerfile',
+  '.ini', '.conf', '.vue', '.svelte', '.r', '.tex', '.dockerfile', '.svg',
+  '.ps1', '.bat', '.cmd', '.kt', '.kts', '.swift', '.dart', '.lua', '.pl', '.ex', '.exs',
+  '.erl', '.hrl', '.clj', '.scala', '.gradle', '.properties', '.env', '.gitignore', '.lock',
+  '.rst', '.adoc', '.srt', '.vtt', '.ics', '.vcf', '.graphql', '.proto', '.cmake', '.nix',
 ]);
+const BINARY_EXTENSIONS = new Set(['.exe', '.dll', '.so', '.dylib', '.bin', '.dat', '.db', '.sqlite', '.sqlite3', '.wasm', '.class', '.jar', '.apk', '.dmg', '.iso', '.doc', '.xls', '.ppt', '.pptx', '.odt', '.ods', '.odp', '.epub', '.mp3', '.wav', '.ogg', '.m4a', '.flac', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.bmp', '.tif', '.tiff', '.heic', '.avif', '.ico', '.psd']);
 const DOCUMENT_MIMES = {
   '.pdf': 'application/pdf',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -121,9 +126,6 @@ function decodeText(buffer) {
   }
   if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f]/.test(text)) {
     throw uploadError('文件包含二进制内容，不能作为文本上传。');
-  }
-  if (/^\s*(?:<\?xml[^>]*>\s*)?<svg[\s>]/i.test(text)) {
-    throw uploadError('暂不支持 SVG，请转换为 PNG 或 JPEG。');
   }
   return boundedText(text);
 }
@@ -268,7 +270,7 @@ async function extractDocument(buffer, extension) {
   return boundedText(text.trim());
 }
 
-async function parseInProcess(buffer, extension) {
+async function parseInProcess(buffer, extension, name) {
   if (activeParsers >= MAX_ACTIVE_PARSERS) throw uploadError('当前正在处理其他文件，请稍后重试。', 429);
   activeParsers++;
   let parser;
@@ -296,7 +298,7 @@ async function parseInProcess(buffer, extension) {
       parser.once('exit', () => {
         complete(reject, uploadError('文件解析失败或超出资源限制，请拆分后重试。', 413));
       });
-      parser.send({ buffer, extension }, (error) => {
+      parser.send({ buffer, extension, name }, (error) => {
         if (error) complete(reject, uploadError('文件解析进程无法启动，请稍后重试。', 503));
       });
     });
@@ -313,20 +315,28 @@ export async function extractUpload({ buffer, originalname, mimetype }) {
   const name = safeName(originalname);
   const extension = path.extname(name).toLowerCase();
   const declaredMime = String(mimetype || '').split(';', 1)[0].trim().toLowerCase();
-  if (extension === '.svg' || declaredMime === 'image/svg+xml') throw uploadError('暂不支持 SVG，请转换为 PNG 或 JPEG。');
+  const archiveType = archiveMime(name);
+  if (archiveType) {
+    const text = await parseInProcess(buffer, extension, name);
+    return { name, mime: archiveType, size: buffer.length, kind: 'archive', text, buffer };
+  }
   const imageMime = sniffImage(buffer);
   if (imageMime) {
     if (IMAGE_EXTENSIONS[extension] !== imageMime) throw uploadError('图片扩展名与实际格式不一致。');
     return { name, mime: imageMime, size: buffer.length, kind: 'image', buffer };
   }
-  if (IMAGE_EXTENSIONS[extension] || declaredMime.startsWith('image/')) throw uploadError('图片格式或文件签名无效，仅支持 PNG、JPEG、WebP 和 GIF。');
+  if (IMAGE_EXTENSIONS[extension] || (Object.values(IMAGE_EXTENSIONS).includes(declaredMime) && !BINARY_EXTENSIONS.has(extension))) throw uploadError('图片格式或文件签名无效，仅支持 PNG、JPEG、WebP 和 GIF 直接识图。');
   if (DOCUMENT_MIMES[extension]) {
     if (extension === '.pdf' && !/^%PDF-\d\.\d/.test(buffer.toString('ascii', 0, 8))) throw uploadError('PDF 文件签名无效。');
     const text = await parseInProcess(buffer, extension);
     return { name, mime: DOCUMENT_MIMES[extension], size: buffer.length, kind: 'text', text, buffer };
   }
+  const rawFile = () => ({ name, mime: 'application/octet-stream', size: buffer.length, kind: 'file', buffer,
+    text: `附件 ${JSON.stringify(name)} 已保留原始文件（${buffer.length} 字节）。此格式没有可读取的文本预览。Chat 无法直接读取二进制内容，请使用 Work 在沙箱中检查原文件。不要声称已经读取了文件内容。` });
   if (!TEXT_EXTENSIONS.has(extension) && !['Dockerfile', 'Makefile'].includes(name)) {
-    throw uploadError('暂不支持此文件类型。请上传文本、PDF、DOCX、XLSX 或 PNG/JPEG/WebP/GIF 图片。');
+    if (BINARY_EXTENSIONS.has(extension)) return rawFile();
+    try { return { name, mime: 'text/plain', size: buffer.length, kind: 'text', text: decodeText(buffer), buffer }; }
+    catch { return rawFile(); }
   }
   if (/^%PDF-\d\.\d/.test(buffer.toString('ascii', 0, 8))
       || buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
@@ -339,10 +349,10 @@ export async function extractUpload({ buffer, originalname, mimetype }) {
 }
 
 if (process.argv[2] === '--extract-upload-parser' && process.send) {
-  process.once('message', async ({ buffer, extension }) => {
+  process.once('message', async ({ buffer, extension, name }) => {
     let message;
     try {
-      const text = await extractDocument(Buffer.from(buffer), extension);
+      const text = name && archiveMime(name) ? await extractArchive(Buffer.from(buffer), name) : await extractDocument(Buffer.from(buffer), extension);
       message = { ok: true, text };
     } catch (error) {
       message = {

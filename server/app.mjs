@@ -24,6 +24,7 @@ import { createAnnouncements } from './announcements.mjs';
 import { createApiExports } from './api-exports.mjs';
 import { createConfigTransfer } from './config-transfer.mjs';
 import { createInviteGroups } from './invite-groups.mjs';
+import { MAX_INPUT_FILES, MAX_INPUT_TOTAL } from '../runner/protocol.mjs';
 
 const protocols = new Set(['openai-chat', 'openai-responses', 'anthropic']);
 const effortLevels = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -271,12 +272,39 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
   app.delete('/api/files/:id', (req, res) => { const file = store.get('SELECT * FROM files WHERE id=? AND user_id=?', req.params.id, req.user.id); if (!file) throw fail(404, '文件不存在。'); for (const value of active.values()) if (value.userId === req.user.id) throw fail(409, '请先停止当前回复再删除附件。'); store.run('DELETE FROM files WHERE id=?', file.id); try { unlinkSync(join(dataDir, 'files', file.id)); } catch {} res.json({ ok: true }); });
   function attachmentIds(value, userId) { if (value === undefined) return []; if (!Array.isArray(value) || value.length > 5 || value.some(v => typeof v !== 'string')) throw fail(400, '每条消息最多添加 5 个附件。'); const ids = [...new Set(value)]; for (const fileId of ids) if (!store.get('SELECT id FROM files WHERE id=? AND user_id=?', fileId, userId)) throw fail(404, '附件不存在或不属于当前账号。'); return ids; }
   function validateContent(content, fileIds) { if (typeof content !== 'string' || Buffer.byteLength(content) > messageLimit || (!content.trim() && !fileIds.length)) throw fail(400, '请输入消息或添加附件；单条消息正文不能超过 32 MB。'); return content.trim(); }
-  function modelMessages(rows, userId, model) { let total = 0; const messages = rows.map(row => ({ role: row.role, content: row.content, attachments: JSON.parse(row.attachment_ids).map(fileId => {
-    const file = store.get('SELECT * FROM files WHERE id=? AND user_id=?', fileId, userId); if (!file) throw fail(400, '对话中的附件已删除，请编辑原消息移除附件后重试。');
-    if (file.kind === 'image' && !model.vision) throw fail(400, '该模型未启用图片输入，请选择支持图片的模型或联系管理员。');
-    total += file.kind === 'image' ? Math.ceil(file.size / 3) * 4 : Buffer.byteLength(file.text_content || '');
-    return { ...attachmentJSON(file), text: file.text_content || undefined, ...(file.kind === 'image' ? { dataUrl: `data:${file.mime};base64,${readFileSync(join(dataDir, 'files', file.id)).toString('base64')}` } : {}) };
-  }) })); total += messages.reduce((n, m) => n + Buffer.byteLength(m.content), 0); if (total > 32 * 1024 * 1024) throw fail(413, '完整对话及附件超过 32 MB 传输上限，请减少附件或新建对话；历史未被自动截断。'); return messages; }
+  function modelMessages(rows, userId, model, mode) {
+    let total = 0, originalBytes = 0;
+    const files = new Map();
+    // Validate the whole input before allocating raw attachment buffers. Repeated
+    // references reuse one attachment object and one base64 string per file ID.
+    const messages = rows.map(row => {
+      total += Buffer.byteLength(row.content);
+      const attachments = JSON.parse(row.attachment_ids).map(fileId => {
+        if (!files.has(fileId)) {
+          const file = store.get('SELECT * FROM files WHERE id=? AND user_id=?', fileId, userId);
+          if (!file) throw fail(400, '对话中的附件已删除，请编辑原消息移除附件后重试。');
+          if (file.kind === 'image' && !model.vision) throw fail(400, '该模型未启用图片输入，请选择支持图片的模型或联系管理员。');
+          if (mode === 'work') {
+            originalBytes += file.size;
+            if (originalBytes > MAX_INPUT_TOTAL || files.size + 1 > MAX_INPUT_FILES) throw fail(413, '本次 Work 输入原件超过 100 MB 或 100 个文件，请减少附件或新建对话。');
+          }
+          files.set(fileId, { ...attachmentJSON(file), text: file.text_content || undefined });
+        }
+        const file = files.get(fileId);
+        total += file.kind === 'image' ? Math.ceil(file.size / 3) * 4 : Buffer.byteLength(file.text || '');
+        return file;
+      });
+      if (total > 32 * 1024 * 1024) throw fail(413, '完整对话及附件超过 32 MB 传输上限，请减少附件或新建对话；历史未被自动截断。');
+      return { role: row.role, content: row.content, attachments };
+    });
+    for (const file of files.values()) {
+      if (mode !== 'work' && file.kind !== 'image') continue;
+      const original = readFileSync(join(dataDir, 'files', file.id)).toString('base64');
+      if (file.kind === 'image') file.dataUrl = `data:${file.mime};base64,${original}`;
+      if (mode === 'work') file.originalFile = { path: `input/${file.id}/${file.name}`, data: original };
+    }
+    return messages;
+  }
   async function generate(req, res, action) {
     const chat = ownedChat(req); ensureInactive(chat.id);
     const modelRow = usableModel(requiredText(req.body.modelId || chat.model_id || store.settings().defaultModelId, '模型', 100), req.user);
@@ -311,7 +339,7 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
       if (userIndex === -1) throw fail(400, '请先发送一条消息。');
       selected = selected.slice(0, userIndex + 1);
     }
-    const input = modelMessages(selected, req.user.id, model);
+    const input = modelMessages(selected, req.user.id, model, execution.mode);
     const assistantId = continuing ? tail.id : id(), requestId = id();
     const priorContent = continuing ? tail.content : '';
     const needsVision = input.some(message => message.attachments?.some(file => file.kind === 'image'));
@@ -401,7 +429,8 @@ export function createApp({ dataDir = resolve('./data'), setupToken: suppliedSet
         let attemptStartContent = content;
         appender = continuationAppender(content); splitter = reasoningSplitter(); reasoningStarted = false;
         const usesRunner = execution.mode === 'work' || compatible.some(row => row.runtime === 'claude-code');
-        const taskSeconds = usesRunner ? Math.min(1800, Math.max(30, Number(settings.workSettings?.timeoutSeconds) || 600)) + 60 : Math.min(21600, Math.max(60, Number(process.env.CHAT_TIMEOUT_SECONDS) || 3600));
+        const workTimeout = settings.workSettings?.timeoutSeconds;
+        const taskSeconds = usesRunner ? workTimeout === 0 ? 0 : Math.min(1800, Math.max(30, Number(workTimeout) || 600)) + 60 : Math.min(21600, Math.max(60, Number(process.env.CHAT_TIMEOUT_SECONDS) || 3600));
         store.run('UPDATE requests SET execution_route_key=?,execution_variant_name=?,execution_effort=? WHERE id=?', plan.target.routeKey, plan.target.variantName, plan.target.effort, requestId);
         let reportedInput = 0, reportedOutput = 0;
         attempted = true;

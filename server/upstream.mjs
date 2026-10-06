@@ -69,7 +69,7 @@ function prepareMessages(messages, model, protocol) {
           : protocol === 'openai-responses'
             ? { type: 'input_image', image_url: attachment.dataUrl, detail: 'auto' }
             : { type: 'image_url', image_url: { url: attachment.dataUrl } });
-      } else if (attachment.kind === 'text' && typeof attachment.text === 'string') {
+      } else if (['text', 'archive', 'file'].includes(attachment.kind) && typeof attachment.text === 'string') {
         blocks.push(textBlock(`\n<attachment name=${JSON.stringify(attachment.name ?? 'file')}>\n${attachment.text}\n</attachment>`));
       } else throw new UpstreamError('附件内容未解析，无法发送给模型。', 'INVALID_ATTACHMENT', 400);
     }

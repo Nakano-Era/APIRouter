@@ -1,8 +1,12 @@
 import path from 'node:path';
 
 export const DEFAULT_LIMITS = Object.freeze({ enabled: true, maxTurns: 20, timeoutSeconds: 600, memoryMb: 768, cpus: 1, maxBudgetUsd: 2, maxConcurrentJobs: 2, artifactTotalMb: 0, artifactMaxFiles: 0, userStorageMb: 0 });
-export const LIMIT_BOUNDS = Object.freeze({ maxTurns: [1, 80], timeoutSeconds: [30, 1800], memoryMb: [512, 4096], cpus: [0.25, 4], maxBudgetUsd: [0.1, 20], maxConcurrentJobs: [1, 4], artifactTotalMb: [0, 1048576], artifactMaxFiles: [0, 1000000], userStorageMb: [0, 1048576] });
+export const LIMIT_BOUNDS = Object.freeze({ maxTurns: [1, 80], timeoutSeconds: [0, 1800], memoryMb: [512, 4096], cpus: [0.25, 4], maxBudgetUsd: [0.1, 20], maxConcurrentJobs: [1, 4], artifactTotalMb: [0, 1048576], artifactMaxFiles: [0, 1000000], userStorageMb: [0, 1048576] });
 export const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
+export const MAX_INPUT_FILES = 100;
+export const MAX_INPUT_TOTAL = 100 * 1024 * 1024;
+// A single upstream request remains bounded when the overall job is unlimited.
+export const UPSTREAM_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 export const MAX_ARTIFACT_TOTAL = 0;
 export const MAX_ARTIFACTS = 0;
 // Transport limits bound one JSON allocation, independently of storage quotas.
@@ -23,6 +27,7 @@ export function validateLimits(input = {}, base = DEFAULT_LIMITS) {
     else {
       const [min, max] = LIMIT_BOUNDS[key];
       if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max || (!['cpus', 'maxBudgetUsd'].includes(key) && !Number.isInteger(value))) throw fault(`${key} 必须在 ${min}–${max} 之间。`);
+      if (key === 'timeoutSeconds' && value !== 0 && value < 30) throw fault('任务时限必须为 0（不限时）或 30–1800 秒。');
     }
     result[key] = value;
   }
@@ -44,6 +49,14 @@ export function safeRelativePath(value) {
   const parts = value.split('/');
   if (parts.some(part => !part || part === '.' || part === '..' || part.startsWith('.') || /[<>"|?*]/.test(part))) throw fault('工作区文件路径无效。');
   return parts.join('/');
+}
+
+// Uploaded names never become workspace configuration or collide with a
+// restored deliverable. The attachment ID isolates identically named uploads.
+export function safeInputPath(value) {
+  const checked = safeRelativePath(value), parts = checked.split('/');
+  if (parts.length !== 3 || parts[0] !== 'input' || !/^[A-Za-z0-9_-]{1,128}$/.test(parts[1])) throw fault('上传文件的工作区路径无效。');
+  return checked;
 }
 
 export function validateSkill(input, previous) {
@@ -85,18 +98,27 @@ export function validateJob(job) {
   if (!Array.isArray(job.skills) || job.skills.length > 10) throw fault('一次最多使用 10 项技能。');
   for (const skill of job.skills) validateSkill(skill);
   const limits = validateLimits(job.limits), policy = artifactPolicy(limits);
-  if (!Array.isArray(job.files) || (policy.count && job.files.length > policy.count)) throw fault(`工作文件数量超过管理员设置的 ${policy.count} 个上限。`);
-  let size = 0;
+  if (!Array.isArray(job.files)) throw fault('工作文件格式无效。');
+  if (job.mode !== 'work' && job.files.length) throw fault('文件沙箱仅在 Work 模式可用。');
+  let size = 0, outputCount = 0, inputSize = 0, inputCount = 0;
   const paths = new Set();
   for (const file of job.files) {
+    if (!file || typeof file !== 'object') throw fault('工作文件格式无效。');
     safeRelativePath(file.path);
+    const isInput = file.path.startsWith('input/');
+    if (isInput) safeInputPath(file.path);
+    else if (!file.path.startsWith('output/')) throw fault('工作文件必须位于 input 或 output 目录。');
     if (paths.has(file.path)) throw fault('工作文件路径重复。');
     paths.add(file.path);
     if (typeof file.data !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(file.data) || file.data.length > Math.ceil(MAX_ARTIFACT_BYTES * 4 / 3) + 4) throw fault('工作文件格式或大小无效。');
-    const decodedBytes = Buffer.from(file.data, 'base64').length;
+    const decoded = Buffer.from(file.data, 'base64'), decodedBytes = decoded.length;
+    if (decoded.toString('base64') !== file.data) throw fault('工作文件编码无效。');
     if (decodedBytes > MAX_ARTIFACT_BYTES) throw fault('单个工作文件超过 10 MB。');
-    size += decodedBytes;
+    if (isInput) { inputSize += decodedBytes; inputCount++; }
+    else { size += decodedBytes; outputCount++; }
+    if (inputCount > MAX_INPUT_FILES || inputSize > MAX_INPUT_TOTAL) throw fault('单次 Work 任务的原始附件最多 100 个、合计 100 MB。');
   }
+  if (policy.count && outputCount > policy.count) throw fault(`工作文件数量超过管理员设置的 ${policy.count} 个上限。`);
   if (policy.total && size > policy.total) throw fault(`工作文件总大小超过管理员设置的 ${limits.artifactTotalMb} MB 上限。`);
   if (job.images !== undefined && (!Array.isArray(job.images) || job.images.length > 5)) throw fault('一次最多发送 5 张图片。');
   for (const image of job.images ?? []) {

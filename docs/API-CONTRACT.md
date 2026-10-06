@@ -76,7 +76,7 @@ Chat = {id,title,modelId,mode:'chat'|'work',effort,skillIds:string[],
 Message = {id,role:'user'|'assistant',content,reasoning:string,modelId,createdAt,
            status:'complete'|'streaming'|'error'|'stopped',
            attachments:Attachment[],error:string|null}
-Attachment = {id,name,mime,size,kind:'image'|'text',url}
+Attachment = {id,name,mime,size,kind:'image'|'text'|'archive'|'file',url}
 ```
 
 Execution fields accepted when creating, updating, or generating a chat:
@@ -112,7 +112,11 @@ Displayed deltas are saved before emission, including when a connection fails or
 
 By default, a user can generate in four distinct chats at once (`MAX_CONCURRENT_PER_USER`, 1–32), subject to the global limit of ten (`MAX_CONCURRENT_CHATS`). Each chat permits one active generation; another request for the same chat is rejected until it finishes or stops. The Work runner has a separate default limit of two concurrent sandboxes.
 
-Uploads accept PNG/JPEG/WebP/GIF images, UTF-8 text/code, text PDFs, DOCX text, and XLSX cells. Limits are 10 MB per file and five files per request. PDF OCR, Office macros, and spreadsheet formula execution are not provided by upload parsing. Upload storage is limited to 200 MB and 500 files per user. See the deployment documentation for parsing boundaries.
+Uploads accept PNG/JPEG/WebP/GIF images, UTF-8 text/code, SVG source, text PDFs, DOCX text, XLSX cells, common archives, and original binary files. Files without a recognized extension may be detected as UTF-8 text or retained as binary originals. `archive` supplies an available directory/text preview to Chat; `file` supplies a notice that its binary contents were not parsed. Work can access the original file for further processing. Successfully uploading an archive or a binary original does not imply that Chat has read all of its contents. Non-image downloads, including SVG, use attachment disposition instead of inline execution.
+
+Common archive suffixes include ZIP, 7Z, RAR, TAR, TAR.GZ/TGZ/GZ, TAR.BZ2/TBZ/TBZ2/BZ2, TAR.XZ/TXZ/XZ and TAR.ZST/TZST/ZST. Preview bounds are 2000 entries, 30 MB expanded bytes, 200000 total characters and 40000 characters per text entry; entries larger than 256 KB are listed without text extraction. Raw BZ2/XZ, encrypted headers, split archives and unsupported variants may be retained with a preview-unavailable notice rather than fully parsed.
+
+Limits remain 10 MB per file and five files per request. PDF OCR, Office macros, and spreadsheet formula execution are not provided by upload parsing. Nested archives are not recursively expanded during upload. Malformed known formats and unsafe or oversized archive contents are rejected; preserving originals does not bypass resource bounds. Upload storage is limited to 200 MB and 500 files per user. See the deployment documentation for parsing boundaries.
 
 ### SSE events
 
@@ -299,7 +303,7 @@ Work settings responses are `{configured,...capabilities,settings:WorkSettings,l
 | --- | --- | --- |
 | `enabled` | `true` | Boolean |
 | `maxTurns` | 20 | 1–80 |
-| `timeoutSeconds` | 600 | 30–1800 |
+| `timeoutSeconds` | 600 | 0 (no total task deadline), or 30–1800 |
 | `memoryMb` | 768 | 512–4096 |
 | `cpus` | 1 | 0.25–4 |
 | `maxBudgetUsd` | 2 | 0.1–20 |
@@ -308,7 +312,7 @@ Work settings responses are `{configured,...capabilities,settings:WorkSettings,l
 | `artifactMaxFiles` | 0 | 0–1000000, per-conversation count; 0 = unlimited quota |
 | `userStorageMb` | 0 | 0–1048576, per-user Work storage; 0 = unlimited quota |
 
-Unknown settings are rejected. `maxBudgetUsd` applies only to the optional Claude Code execution budget; native execution enforces rounds/output/time/resources rather than an inferred USD amount. Neither is a prepaid balance reservation or a guarantee about third-party billing. Each explicit execution target gets an outer streaming deadline: configured runner timeout plus 60 seconds for runner-backed requests, or the direct-API default one hour (`CHAT_TIMEOUT_SECONDS`, 60–21600 seconds). Direct calls also have an independent inactivity timeout (`UPSTREAM_TIMEOUT_MS`, default 180000 ms) refreshed by received data. Reaching one target's deadline may advance a configured fallback; browser disconnect or manual stop cancels the whole request. Work job submission is integrated into chat generation; there is no public standalone `/jobs` API or durable background-task API. See [WORK.md](WORK.md) for runner deployment and sandbox boundaries.
+Unknown settings are rejected. `maxBudgetUsd` applies only to the optional Claude Code execution budget; native execution enforces rounds/output/time/resources rather than an inferred USD amount. Neither is a prepaid balance reservation or a guarantee about third-party billing. Each explicit execution target with a positive runner timeout gets an outer streaming deadline of that timeout plus 60 seconds. A runner-backed request with `timeoutSeconds:0` has no total task deadline; cancellation, model turns, individual upstream/tool timeouts and sandbox resource limits still apply. The direct-API default is one hour (`CHAT_TIMEOUT_SECONDS`, 60–21600 seconds). Direct calls also have an independent inactivity timeout (`UPSTREAM_TIMEOUT_MS`, default 180000 ms) refreshed by received data. Reaching one target's deadline may advance a configured fallback; browser disconnect or manual stop cancels the whole request. Work job submission is integrated into chat generation; there is no public standalone `/jobs` API or durable background-task API. See [WORK.md](WORK.md) for runner deployment and sandbox boundaries.
 
 ## Workspace settings, users, and invitations
 
